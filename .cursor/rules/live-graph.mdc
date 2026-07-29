@@ -1,0 +1,122 @@
+---
+description: BusChain Control Live Graph Contract — all audio edits stay hot/live
+globs: app/**/*.rs,engine/**/*.rs,plugins/**/*,README.md
+alwaysApply: false
+---
+
+# Live Graph Contract
+
+**All audio mutations go through the live PipeWire graph.**  
+The only intentional outsides are Tear down (recovery) and hard errors.
+
+## Entry point
+
+```rust
+state.commit(LiveChange::…);
+```
+
+Defined in `app/src/audio/live.rs`. Maps to worker commands → `buschain-engine` intents.
+
+## Engine first — no naked APIs
+
+**Never** add `pactl` / `pw-link` / `pw-cli` / `pipewire` spawns under `app/`.
+
+- New capability → extend `buschain_engine::contract::Intent` / `AudioBackend` in `engine/`.
+- App uses `crate::audio::engine_handle` or worker `Command::BindMasterClock` / graph shim.
+- See `engine/README.md` and `docs/ARCHITECTURE.md`.
+
+## Severity ladder
+
+1. `Levels` / `Level` — volume/mute
+2. `FxParams` — knobs / mix / **insert power** (Props on multi-node FX)
+3. `FxRewire` — add/remove/reorder (respawn one `buschain_fx_*` + exclusive routes)
+4. `EnsureTrack` / prune — one bus
+5. `Route` — destination/input **links only** (never respawn FX)
+6. `Reconcile` — idle ensure / cold bring-up / recovery
+7. Tear down — **ERROR RECOVERY ONLY**
+
+## Clock
+
+- `GraphClock` = Master HW rate/quantum after Apply (`session.performance`).
+- **DeviceCaps** from EnumFormat ∪ ALSA `Rates:` only — Custom dropdown ⊆ those rates (no phantom 192k).
+- Config **Apply audio settings** → `BindMasterClock`: force-rate/quantum → wait HW running match → push BusChain props → tear bridges/posts → `ClockBind` ForceRespawn FX + exclusive mic rewire.
+- Balanced Apply clears force-rate/quantum; Custom forces the selected capable rate.
+- Soft quantum → `clock.force-quantum = 0` (PipeWire may raise period); hard quantum locks `node.force-quantum`.
+- External rate mismatch → exclusive inbound `buschain_rs_*`; rest of chain stays at GraphClock. Never dual-path direct+bridge.
+- Outbound Master→HW never rate-bridged.
+
+## Sealed insert pipeline (engine owns the wire)
+
+```
+{bus}.monitor ──exclusive──► buschain_fx_{bus} (n0→n1→… black boxes)
+                                     │
+                                     ▼
+                              buschain_post_{bus}   (meter tap)
+                                     │
+                                     ▼  arm only after ready + ~200ms dwell
+                              Master / targets
+                                     │
+                              Master→HW (session barrier)
+```
+
+| Op | Engine intent | Forbidden |
+|----|---------------|-----------|
+| Power / knobs / mix | `PushFxControls` → Props | Respawn, unlink bus, mute `{bus}.monitor` |
+| Add / remove / reorder | `EnsureFxChain(Force)` | Touch other tracks; recreate app buses |
+| Cold bring-up / Full Apply | `ArmSession` (warm-adopt if graph already healthy) | App `pw-link` / last-resort dry while Building |
+| Route (HW / targets) | `arm_track_egress` after Wet (+ dwell) | Dry bypass while Building; arm Master→HW in app |
+| Mute / fader | Levels on outbound path | Mute/zero app-facing sink |
+
+### End-to-end track arming
+
+- **Building**: hold-only (`bus→buschain_hold` + feed FX). No `bus→dest` / `post→dest`.
+- **Dwell**: ~200ms continuous spine ready before arming wet egress (flap resets timer). Dry tracks use ~50ms existence check.
+- **Session barrier**: on cold `ArmSession`, keep Master→HW disarmed until Master spine ready **and** every unmuted non-master insert track is `Wet` or `Failed` (Failed+dry = resolved). Latch `speakers_armed` so idle reconcile does not re-silence.
+- **Warm adopt (UI restart)**: if live PW already matches Desired (buses, FX signature+spine, Master→HW), latch `speakers_armed` and Idempotent-reconcile — do **not** disarm or ForceRespawn. Fail closed → cold arm.
+- **Failed ensure**: `restore_dry` then arm dry (fail-open). Does not block the barrier forever.
+- App commits `DesiredState` + intents only — no naked disarm/arm via pactl/pw-link.
+
+- New FX capability → `EnsureFxChain` / `PushFxControls` / `ArmSession` in `engine/` first.
+- **Never** spawn `pipewire -c` or FX Props from `app/` — only `engine/backend/fx_chain.rs`.
+- `engine.chain_state(bus)` is the single wet/dry/failed source of truth.
+- v1: LADSPA inserts only (LV2/CLAP/VST3 scan stays; wiring waits on `InsertBackend`).
+- Keepalive `{bus}.monitor → buschain_hold` always preserved during wet switch.
+- Stereo: `channels=2`, `channel_map=front-left,front-right` on sinks.
+
+## GraphSupervisor
+
+`Engine::reconcile` owns continuous Desired↔live health (buses, levels, FX, preferred default). Master→HW repair only when `speakers_armed`. Cold Full Apply uses `ArmSession`. Idle worker ticks call `reconcile_light`. Nuclear reset is Config → Advanced only — never a primary UI verb.
+
+## Hard rules
+
+- Never move sink-inputs as a mixer side effect
+- Cold graph → auto bring-up; never prompt “click Apply”
+- Apps stay on `buschain_*` buses
+- Level by `expected_sink_name` — never leave create-mute@0
+- Never return happy dry when the insert rack is non-empty — surface `ChainState::Failed`
+- Never mute the app-facing null-sink; never open egress before dwell / barrier
+
+## Anti-patterns
+
+```rust
+// BAD — power rebuilds FX / PushFxParams → rewire_track_fx (YouTube pause)
+state.schedule_fx_rewire(id); // for bypass
+// BAD — mute {bus}.monitor or recreate buschain_track_* with apps attached
+// BAD — spawn filter-chain from app/
+std::process::Command::new("pipewire").args(["-c", …])
+
+// GOOD — Props power
+state.commit(LiveChange::FxParams { track_id }); // → PushFxControls
+
+// GOOD — add/remove/reorder
+state.commit(LiveChange::FxRewire { track_id }); // → EnsureFxChain(Force)
+
+// GOOD — listen / HW out
+state.commit(LiveChange::Route); // post→dest when Wet
+
+// BAD — naked CLI in app
+std::process::Command::new("pactl")…
+
+// GOOD — engine intent
+engine.apply(Intent::EnsureFxChain { … });
+```

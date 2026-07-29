@@ -1,0 +1,267 @@
+@prefix doap:  <http://usefulinc.com/ns/doap#> .
+@prefix foaf:  <http://xmlns.com/foaf/0.1/> .
+@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix units: <http://lv2plug.in/ns/extensions/units#> .
+@prefix pg:    <http://lv2plug.in/ns/ext/port-groups#> .
+@prefix atom:  <http://lv2plug.in/ns/ext/atom#> .
+
+<https://github.com/local/buschain_dn#denoiser>
+  a lv2:Plugin , lv2:DynamicsPlugin ;
+  doap:name "BusChain Denoiser" ;
+  doap:license <http://opensource.org/licenses/MIT> ;
+  lv2:project <https://github.com/local/buschain_dn> ;
+  lv2:optionalFeature lv2:hardRTCapable ;
+
+  rdfs:comment """
+Zero-latency, time-domain (no FFT) 6-band downward-expander denoiser.
+Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
+""" ;
+
+  lv2:port [
+    a lv2:AudioPort , lv2:InputPort ;
+    lv2:index 0 ;
+    lv2:symbol "in_l" ;
+    lv2:name "Input L"
+  ] , [
+    a lv2:AudioPort , lv2:InputPort ;
+    lv2:index 1 ;
+    lv2:symbol "in_r" ;
+    lv2:name "Input R"
+  ] , [
+    a lv2:AudioPort , lv2:OutputPort ;
+    lv2:index 2 ;
+    lv2:symbol "out_l" ;
+    lv2:name "Output L"
+  ] , [
+    a lv2:AudioPort , lv2:OutputPort ;
+    lv2:index 3 ;
+    lv2:symbol "out_r" ;
+    lv2:name "Output R"
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 4 ;
+    lv2:symbol "threshold" ;
+    lv2:name "Threshold" ;
+    lv2:default -48.0 ;
+    lv2:minimum -140.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db ;
+    rdfs:comment "Noise detection level. Raise (toward 0) for more reduction."
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 5 ;
+    lv2:symbol "range0" ;
+    lv2:name "Range Band 1" ;
+    lv2:default 8.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 6 ;
+    lv2:symbol "range1" ;
+    lv2:name "Range Band 2" ;
+    lv2:default 9.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 7 ;
+    lv2:symbol "range2" ;
+    lv2:name "Range Band 3" ;
+    lv2:default 7.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 8 ;
+    lv2:symbol "range3" ;
+    lv2:name "Range Band 4" ;
+    lv2:default 8.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 9 ;
+    lv2:symbol "range4" ;
+    lv2:name "Range Band 5" ;
+    lv2:default 12.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 10 ;
+    lv2:symbol "range5" ;
+    lv2:name "Range Band 6" ;
+    lv2:default 14.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 11 ;
+    lv2:symbol "freq_low" ;
+    lv2:name "Freq Low" ;
+    lv2:default 40.0 ;
+    lv2:minimum 20.0 ;
+    lv2:maximum 2000.0 ;
+    units:unit units:hz
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 12 ;
+    lv2:symbol "freq_high" ;
+    lv2:name "Freq High" ;
+    lv2:default 16000.0 ;
+    lv2:minimum 2000.0 ;
+    lv2:maximum 20000.0 ;
+    units:unit units:hz
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 13 ;
+    lv2:symbol "hf_bias" ;
+    lv2:name "HF Bias" ;
+    lv2:default 0.35 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0 ;
+    rdfs:comment "Pass HF harmonics/transients more easily (above ~1 kHz)."
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 14 ;
+    lv2:symbol "stereo_link" ;
+    lv2:name "Stereo Link" ;
+    lv2:default 0.85 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 15 ;
+    lv2:symbol "attack" ;
+    lv2:name "Attack" ;
+    lv2:default 2.5 ;
+    lv2:minimum 0.1 ;
+    lv2:maximum 50.0 ;
+    units:unit units:ms
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 16 ;
+    lv2:symbol "release" ;
+    lv2:name "Release" ;
+    lv2:default 120.0 ;
+    lv2:minimum 10.0 ;
+    lv2:maximum 1000.0 ;
+    units:unit units:ms
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 17 ;
+    lv2:symbol "knee" ;
+    lv2:name "Knee" ;
+    lv2:default 6.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 24.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 18 ;
+    lv2:symbol "ratio" ;
+    lv2:name "Ratio" ;
+    lv2:default 4.0 ;
+    lv2:minimum 1.0 ;
+    lv2:maximum 20.0
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 19 ;
+    lv2:symbol "hpf" ;
+    lv2:name "High-Pass Enable" ;
+    lv2:portProperty lv2:toggled ;
+    lv2:default 0.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 20 ;
+    lv2:symbol "lpf" ;
+    lv2:name "Low-Pass Enable" ;
+    lv2:portProperty lv2:toggled ;
+    lv2:default 0.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 21 ;
+    lv2:symbol "bypass" ;
+    lv2:name "Bypass" ;
+    lv2:portProperty lv2:toggled ;
+    lv2:default 0.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 22 ;
+    lv2:symbol "meter_in_peak" ;
+    lv2:name "Input Peak" ;
+    lv2:minimum -140.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 23 ;
+    lv2:symbol "meter_in_min" ;
+    lv2:name "Input Min" ;
+    lv2:minimum -140.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 24 ;
+    lv2:symbol "meter_gr0" ;
+    lv2:name "GR Band 1" ;
+    lv2:minimum -24.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 25 ;
+    lv2:symbol "meter_gr1" ;
+    lv2:name "GR Band 2" ;
+    lv2:minimum -24.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 26 ;
+    lv2:symbol "meter_gr2" ;
+    lv2:name "GR Band 3" ;
+    lv2:minimum -24.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 27 ;
+    lv2:symbol "meter_gr3" ;
+    lv2:name "GR Band 4" ;
+    lv2:minimum -24.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 28 ;
+    lv2:symbol "meter_gr4" ;
+    lv2:name "GR Band 5" ;
+    lv2:minimum -24.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] , [
+    a lv2:ControlPort , lv2:OutputPort ;
+    lv2:index 29 ;
+    lv2:symbol "meter_gr5" ;
+    lv2:name "GR Band 6" ;
+    lv2:minimum -24.0 ;
+    lv2:maximum 0.0 ;
+    units:unit units:db
+  ] .

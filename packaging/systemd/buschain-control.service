@@ -1,0 +1,20 @@
+# DEPRECATED — do not enable.
+#
+# BusChain Control is tray-resident: start with Hyprland
+#   exec-once = buschain-control --hidden
+# The UI process owns the PipeWire graph and embeds
+# $XDG_RUNTIME_DIR/buschain-control/daemon.sock for ctl/waybar.
+#
+# If an old unit is still enabled:
+#   systemctl --user disable --now buschain-control
+
+[Unit]
+Description=BusChain Control (deprecated — use Hyprland exec-once)
+ConditionPathExists=/nonexistent
+
+[Service]
+Type=simple
+ExecStart=/bin/false
+
+[Install]
+WantedBy=default.target

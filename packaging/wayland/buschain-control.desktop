@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=BusChain Control
+Comment=Tray-resident system mixer and PipeWire control surface
+Exec=buschain-control
+Icon=buschain-control
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupWMClass=buschain-control
+Keywords=pipewire;pulse;mixer;audio;tray;
+# Autostart via Hyprland: exec-once = buschain-control --hidden

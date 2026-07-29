@@ -1,0 +1,440 @@
+/* BusChain Control mixer — frosted Control Center
+ * Loaded at PRIORITY_USER so Adwaita/GTK themes cannot square everything. */
+
+* {
+  font-family: "SF Pro Text", "Inter", "Fira Sans", "Segoe UI", sans-serif;
+  font-size: 12px;
+  color: #f7f5ff;
+  outline: none;
+  -gtk-outline-radius: 0;
+}
+
+/* Kill theme square fills behind rounded chrome */
+window,
+window.background,
+notebook,
+notebook > stack,
+notebook > stack > *,
+scrolledwindow,
+scrolledwindow > viewport,
+viewport,
+viewport > *,
+.stream-scroll,
+.stream-scroll > *,
+.panel * {
+  background-image: none;
+}
+
+window,
+window.background {
+  background-color: transparent;
+  border-radius: 20px;
+  border: none;
+  box-shadow: none;
+}
+
+.panel {
+  background-color: alpha(#1a1b1f, 0.96);
+  border-radius: 20px;
+  border: 1px solid alpha(#f7f5ff, 0.10);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  margin: 6px;
+  padding: 14px 16px 16px 16px;
+}
+
+.title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.10em;
+  color: #f7f5ff;
+  padding: 0;
+}
+
+.subtitle {
+  font-size: 11px;
+  color: alpha(#f7f5ff, 0.42);
+  padding: 2px 0 0 0;
+}
+
+/* —— Buttons: kill theme chrome —— */
+button,
+button.flat,
+button.text-button,
+button.toggle,
+button:not(.suggested-action):not(.destructive-action) {
+  background-image: none;
+  background-color: alpha(#f7f5ff, 0.08);
+  border: none;
+  border-radius: 999px;
+  box-shadow: none;
+  text-shadow: none;
+  min-height: 0;
+  min-width: 0;
+  padding: 6px 12px;
+  color: alpha(#f7f5ff, 0.85);
+  outline: none;
+  -gtk-icon-shadow: none;
+  -gtk-icon-style: symbolic;
+}
+button:hover {
+  background-image: none;
+  background-color: alpha(#f7f5ff, 0.14);
+}
+button:active,
+button:checked {
+  background-image: none;
+  background-color: alpha(#f7f5ff, 0.18);
+}
+button:focus {
+  outline: none;
+  box-shadow: none;
+  border: none;
+}
+button image,
+button label {
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+  border: none;
+}
+
+button.close-btn {
+  min-width: 22px;
+  min-height: 22px;
+  max-width: 22px;
+  max-height: 22px;
+  padding: 0;
+  margin: 0;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: alpha(#f7f5ff, 0.55);
+  background-color: alpha(#f7f5ff, 0.08);
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+button.close-btn:hover {
+  background-color: alpha(#f7f5ff, 0.16);
+  color: #f7f5ff;
+}
+button.close-btn image,
+button.close-btn label {
+  margin: 0;
+  padding: 0;
+  -gtk-icon-transform: scale(0.72);
+}
+
+button.icon-btn {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: 999px;
+  background-color: alpha(#f7f5ff, 0.08);
+}
+button.icon-btn:hover {
+  background-color: alpha(#f7f5ff, 0.14);
+}
+button.icon-btn.active,
+button.icon-btn:checked {
+  background-color: alpha(#e08b84, 0.42);
+  color: #f7f5ff;
+}
+
+button.star-btn {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 12px;
+  background-color: alpha(#f7f5ff, 0.06);
+  color: alpha(#f7f5ff, 0.45);
+}
+button.star-btn:hover {
+  background-color: alpha(#f7f5ff, 0.12);
+  color: #f7f5ff;
+}
+button.star-btn.active,
+button.star-btn:checked {
+  background-color: alpha(#e6c35c, 0.28);
+  color: #ffe8a3;
+}
+
+button.use-btn {
+  padding: 5px 14px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background-color: alpha(#f7f5ff, 0.10);
+}
+button.use-btn:hover {
+  background-color: alpha(#f7f5ff, 0.16);
+}
+
+.hw-card {
+  background-color: alpha(#f7f5ff, 0.055);
+  background-image: none;
+  border-radius: 14px;
+  border: 1px solid transparent;
+  padding: 10px 12px;
+  margin: 4px 0 10px 0;
+  box-shadow: none;
+}
+
+.hw-label {
+  font-weight: 600;
+  font-size: 11px;
+  color: alpha(#f7f5ff, 0.50);
+  padding-bottom: 4px;
+}
+
+.stream-scroll {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 12px;
+  box-shadow: none;
+}
+.stream-scroll > viewport,
+.stream-scroll scrolledwindow,
+.stream-scroll viewport {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+.stream-scroll scrollbar {
+  background-color: transparent;
+  min-width: 3px;
+  min-height: 3px;
+  border: none;
+}
+.stream-scroll scrollbar slider {
+  background-color: alpha(#f7f5ff, 0.22);
+  border-radius: 4px;
+  min-width: 3px;
+  border: none;
+}
+
+.stream-card,
+.track-card,
+.device-card {
+  background-color: alpha(#f7f5ff, 0.055);
+  background-image: none;
+  border-radius: 14px;
+  border: 1px solid transparent;
+  padding: 10px 8px;
+  margin: 0 4px;
+  box-shadow: none;
+}
+.stream-card {
+  min-width: 78px;
+  max-width: 88px;
+}
+.stream-card:hover,
+.track-card:hover,
+.device-card:hover {
+  background-color: alpha(#f7f5ff, 0.09);
+}
+.stream-card.favorited,
+.stream-card.pinned {
+  border: 1px solid alpha(#e6c35c, 0.28);
+  background-color: alpha(#f7f5ff, 0.08);
+}
+
+.stream-name,
+.device-title {
+  font-weight: 600;
+  font-size: 11px;
+  color: #f7f5ff;
+}
+.stream-meta,
+.device-meta {
+  font-size: 10px;
+  color: alpha(#f7f5ff, 0.42);
+}
+.stream-pct {
+  font-size: 10px;
+  font-weight: 600;
+  color: alpha(#f7f5ff, 0.62);
+  padding-top: 2px;
+}
+
+.app-icon {
+  margin-bottom: 4px;
+}
+
+.fader-row {
+  margin-top: 4px;
+  background: transparent;
+  background-image: none;
+}
+
+/* Scales — soft slate, force round trough (incl. GTK3 contents/progress) */
+scale {
+  min-height: 112px;
+  min-width: 22px;
+  padding: 2px 0;
+  outline: none;
+  background: transparent;
+  background-image: none;
+}
+scale contents,
+scale trough,
+scale progress,
+scale highlight,
+scale fill {
+  border-radius: 999px;
+  border: none;
+  box-shadow: none;
+  background-image: none;
+}
+scale trough {
+  background-color: alpha(#f7f5ff, 0.12);
+  min-width: 5px;
+}
+scale highlight,
+scale fill,
+scale progress {
+  background-color: #a8b0be;
+}
+scale slider {
+  background-color: #f7f5ff;
+  background-image: none;
+  border: none;
+  border-radius: 999px;
+  min-width: 13px;
+  min-height: 13px;
+  margin: -4px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.40);
+}
+scale:hover trough {
+  background-color: alpha(#f7f5ff, 0.18);
+}
+scale:hover highlight,
+scale:hover fill,
+scale:hover progress {
+  background-color: #c0c7d2;
+}
+
+scale.horizontal {
+  min-height: 20px;
+  min-width: 140px;
+}
+scale.horizontal trough {
+  min-height: 5px;
+  min-width: 0;
+}
+
+levelbar,
+levelbar trough,
+levelbar block,
+levelbar block.empty,
+levelbar block.filled {
+  min-width: 5px;
+  border-radius: 999px;
+  border: none;
+  background-image: none;
+  box-shadow: none;
+}
+levelbar.vertical {
+  min-height: 112px;
+  min-width: 6px;
+  margin: 0 0 0 4px;
+}
+levelbar trough {
+  background-color: alpha(#f7f5ff, 0.10);
+}
+levelbar block.filled {
+  background-color: #8fd19e;
+}
+levelbar block.high {
+  background-color: #e6d08a;
+}
+levelbar block.full {
+  background-color: #e08b84;
+}
+
+.empty {
+  color: alpha(#f7f5ff, 0.42);
+  padding: 24px 12px;
+  font-size: 11px;
+}
+
+/* Notebook / tabs — transparent stack (avoids square inside rounded panel) */
+notebook,
+notebook.tabs,
+.tabs {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  margin-top: 6px;
+}
+notebook > stack,
+notebook.tabs > stack,
+.tabs stack,
+notebook > stack > box,
+notebook > stack > * {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+notebook.tabs > header,
+.tabs header {
+  background-color: alpha(#f7f5ff, 0.06);
+  background-image: none;
+  border: none;
+  border-radius: 12px;
+  padding: 3px;
+  margin-bottom: 10px;
+  box-shadow: none;
+}
+notebook.tabs > header > tabs,
+.tabs tabs {
+  background: transparent;
+  border: none;
+}
+notebook.tabs tab,
+.tabs tab {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 10px;
+  padding: 6px 14px;
+  margin: 0;
+  font-weight: 600;
+  font-size: 11px;
+  color: alpha(#f7f5ff, 0.50);
+  box-shadow: none;
+  min-width: 0;
+  min-height: 0;
+}
+notebook.tabs tab:hover,
+.tabs tab:hover {
+  background-color: alpha(#f7f5ff, 0.06);
+  color: alpha(#f7f5ff, 0.75);
+}
+notebook.tabs tab:checked,
+.tabs tab:checked {
+  background-color: alpha(#f7f5ff, 0.14);
+  background-image: none;
+  color: #f7f5ff;
+  box-shadow: none;
+}
+
+.device-card {
+  margin: 0 0 8px 0;
+  padding: 10px 12px;
+}
+.device-card.device-active {
+  border: 1px solid alpha(#f7f5ff, 0.20);
+  background-color: alpha(#f7f5ff, 0.09);
+}
+
+.section-hint {
+  font-size: 11px;
+  color: alpha(#f7f5ff, 0.42);
+  padding: 0 2px 8px 2px;
+}

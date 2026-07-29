@@ -1,0 +1,1316 @@
+//! Engine runtime — worker-facing handle.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+
+use crate::backend::{
+    ensure_clocked_route, link_is_live, read_signature, sink_exists, AudioBackend,
+    FilterChainRuntime, PipewireCliBackend,
+};
+use crate::clock::{
+    probe_master_hw_from_sinks, probe_sink_running_rate, resolve_profile, set_graph_force_clock,
+    wait_hw_running_rate, AudioPreset, DeviceCaps, GraphClock, PerformanceProfile,
+};
+use crate::contract::{ApplyReport, Intent};
+use crate::domain::{
+    fx_name_for_bus, post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
+    LinkSpec, NodeRole, NodeSpec, Props,
+};
+use crate::plan::DesiredState;
+use crate::pipeline;
+
+pub struct Engine {
+    backend: PipewireCliBackend,
+    desired: DesiredState,
+    last_clock: GraphClock,
+    fx: FilterChainRuntime,
+    /// Last Master HW sink name (for orphan wet probes after restart).
+    master_hw: Option<String>,
+    /// Debounce preferred-default reassert against WirePlumber.
+    last_default_assert: Option<Instant>,
+    /// Last applied Pulse monitor mute per bus — avoid pactl spam every idle tick.
+    applied_monitor_mute: HashMap<String, bool>,
+    /// Idle FX reconcile cadence counter (worker bumps via reconcile_light).
+    idle_fx_ticks: u32,
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        Self {
+            backend: PipewireCliBackend::new(),
+            desired: DesiredState::default(),
+            last_clock: GraphClock::default(),
+            fx: FilterChainRuntime::new(),
+            master_hw: None,
+            last_default_assert: None,
+            applied_monitor_mute: HashMap::new(),
+            idle_fx_ticks: 0,
+        }
+    }
+
+    /// Light Master HW switch: update Desired + relink Master→HW only.
+    /// Never ArmSession / ForceRespawn — that is what made device switches take minutes.
+    pub fn apply_master_hw_relink(&mut self, hw: &str) -> Result<ApplyReport> {
+        self.remember_master_hw(hw);
+        self.desired.set_master_hw(Some(hw.to_string()));
+        // Update Master FX chain dest if present so post→HW targets the new device.
+        if let Some(spec) = self.desired.fx_chains.get_mut("buschain_master") {
+            spec.dest = hw.to_string();
+        }
+        if let Some(eg) = self.desired.bus_egress.get_mut("buschain_master") {
+            *eg = vec![hw.to_string()];
+        }
+        let mut report = ApplyReport::default();
+        self.reconcile_master_and_default(&mut report)?;
+        if report.messages.is_empty() {
+            report.push(format!("master hw → {hw}"));
+        }
+        Ok(report)
+    }
+
+    pub fn remember_master_hw(&mut self, hw: &str) {
+        if !hw.is_empty() {
+            self.master_hw = Some(hw.to_string());
+            self.desired.set_master_hw(Some(hw.to_string()));
+        }
+    }
+
+    pub fn desired(&self) -> &DesiredState {
+        &self.desired
+    }
+
+    pub fn desired_mut(&mut self) -> &mut DesiredState {
+        &mut self.desired
+    }
+
+    pub fn clock(&self) -> &GraphClock {
+        &self.desired.clock
+    }
+
+    pub fn set_profile(&mut self, profile: &PerformanceProfile) {
+        let c = profile.graph_clock();
+        self.desired.set_clock(c.clone());
+        self.last_clock = c;
+    }
+
+    /// Force PipeWire graph clock, wait for Master HW, push BusChain props, drop helpers.
+    pub fn bind_master_clock_profile(
+        &mut self,
+        profile: PerformanceProfile,
+    ) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        let new_clock = profile.graph_clock();
+        let hw = if !profile.bound_device.is_empty() {
+            profile.bound_device.clone()
+        } else {
+            self.desired
+                .master_hw
+                .clone()
+                .or_else(|| self.master_hw.clone())
+                .unwrap_or_default()
+        };
+        if !hw.is_empty() {
+            self.remember_master_hw(&hw);
+        }
+
+        // Balanced / non-Custom: clear force so HW can settle at its preferred rate.
+        // Custom: force the selected capable rate (+ quantum unless soft).
+        let (force_rate, force_q) = match profile.preset {
+            AudioPreset::Custom => (
+                profile.sample_rate,
+                if profile.soft_quantum {
+                    0
+                } else {
+                    profile.quantum
+                },
+            ),
+            _ => (0, 0),
+        };
+        match set_graph_force_clock(force_rate, force_q) {
+            Ok(()) => {
+                crate::clock::invalidate_clock_probe_caches();
+                if force_rate > 0 {
+                    report.push(format!("force-rate {force_rate}"));
+                } else {
+                    report.push("force-rate cleared");
+                }
+            }
+            Err(e) => report.push(format!("force-rate: {e}")),
+        }
+
+        let want_rate = profile.sample_rate;
+        let hw_ok = if hw.is_empty() {
+            false
+        } else {
+            wait_hw_running_rate(&hw, want_rate, Duration::from_secs(3))
+        };
+        if hw.is_empty() {
+            report.push("no Master HW sink — binding BusChain clock only");
+        } else if hw_ok {
+            report.push(format!("HW running {want_rate} Hz"));
+        } else {
+            let live = probe_sink_running_rate(&hw)
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "?".into());
+            report.push(format!(
+                "WARN: HW still {live} Hz (wanted {want_rate}) — BusChain bound anyway"
+            ));
+        }
+
+        let changed = new_clock != self.last_clock;
+        self.desired.set_clock(new_clock.clone());
+
+        // Recreate app buses at GraphClock when running rate mismatches (stream migrate).
+        let bus_specs: Vec<NodeSpec> = self
+            .desired
+            .buses
+            .values()
+            .filter(|s| matches!(s.role, NodeRole::TrackBus | NodeRole::MasterBus))
+            .cloned()
+            .collect();
+        let mut migrated = 0u32;
+        for spec in bus_specs {
+            let name = spec.name.as_str().to_string();
+            let live = probe_sink_running_rate(&name);
+            if live != Some(new_clock.sample_rate) {
+                match self.backend.migrate_bus_clock(&spec, &new_clock) {
+                    Ok(()) => {
+                        migrated += 1;
+                        report.push(format!(
+                            "migrated {name} → {} Hz",
+                            new_clock.sample_rate
+                        ));
+                    }
+                    Err(e) => report.push(format!("migrate {name}: {e:#}")),
+                }
+            } else {
+                let props = Props::new()
+                    .set("node.latency", new_clock.node_latency_prop())
+                    .set("audio.rate", new_clock.sample_rate.to_string())
+                    .set("node.force-quantum", new_clock.quantum.to_string())
+                    .set(
+                        "node.lock-quantum",
+                        if new_clock.soft_quantum {
+                            "false"
+                        } else {
+                            "true"
+                        },
+                    );
+                let _ = self.backend.set_props(&name, &props);
+            }
+        }
+        if migrated > 0 {
+            report.push(format!("recreated {migrated} app bus(es) at GraphClock"));
+        }
+
+        // Drop inbound bridges + post helpers so Hotplug rebuilds at the new clock.
+        let _ = self.backend.teardown_rate_bridges();
+        self.desired.bridges.clear();
+        self.destroy_post_helpers(&mut report);
+
+        if changed {
+            report.push(format!(
+                "clock bound {} Hz q{}",
+                new_clock.sample_rate, new_clock.quantum
+            ));
+        } else {
+            report.push(format!(
+                "clock reasserted {} Hz q{}",
+                new_clock.sample_rate, new_clock.quantum
+            ));
+        }
+        self.last_clock = new_clock;
+        // Mark device_limited false in desired sense — profile already resolved.
+        let _ = profile;
+        Ok(report)
+    }
+
+    fn destroy_post_helpers(&mut self, report: &mut ApplyReport) {
+        let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
+        let mut n = 0u32;
+        for bus in buses {
+            let post = post_name_for_bus(&bus);
+            if sink_exists(&post) {
+                let _ = self.backend.destroy_node(&post);
+                n += 1;
+            }
+        }
+        // Also sweep any orphan posts not in desired buses.
+        if let Ok(names) = self.backend.list_sink_names() {
+            for name in names {
+                if name.starts_with("buschain_post_") {
+                    let _ = self.backend.destroy_node(&name);
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            report.push(format!("recreated {n} post helper(s) pending"));
+        }
+    }
+
+    pub fn probe_master_hw(&mut self, master_output: Option<&str>) -> DeviceCaps {
+        let snap = self.backend.snapshot().unwrap_or_default();
+        probe_master_hw_from_sinks(&snap.sinks, master_output)
+    }
+
+    pub fn apply(&mut self, intent: Intent) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        match intent {
+            Intent::EnsureBus { spec } => {
+                let clock = self.desired.clock.clone();
+                self.backend.ensure_node(&spec, &clock)?;
+                self.desired.ensure_bus(spec);
+                report.push("bus ensured");
+            }
+            Intent::SetRoute { link } => {
+                let clock = self.desired.clock.clone();
+                ensure_clocked_route(
+                    &mut self.backend,
+                    &link.source,
+                    &link.sink,
+                    &clock,
+                    &mut self.desired,
+                    link.exclusive,
+                )?;
+                report.push(format!("route {}→{}", link.source, link.sink));
+            }
+            Intent::SetLevels {
+                sink,
+                gain_db,
+                muted,
+            } => {
+                self.backend.set_levels(&sink, gain_db, muted)?;
+            }
+            Intent::PushProps { node, props } => {
+                self.backend.set_props(&node, &props)?;
+            }
+            Intent::BindMasterClock { profile } => {
+                let r = self.bind_master_clock_profile(profile)?;
+                for m in r.messages {
+                    report.push(m);
+                }
+            }
+            Intent::EnsureFxChain { spec, mode } => {
+                if spec.bus.as_str() == "buschain_master" && !spec.dest.is_empty() {
+                    self.remember_master_hw(&spec.dest);
+                }
+                let state = self.ensure_fx_chain(spec, mode)?;
+                match &state {
+                    ChainState::Wet(w) => {
+                        report.push(format!(
+                            "FX wet {} → {}",
+                            w.fx_sink, w.dest
+                        ));
+                    }
+                    ChainState::Dry => report.push("FX dry"),
+                    ChainState::Building => report.push("FX building"),
+                    ChainState::Failed(msg) => {
+                        return Err(anyhow!("FX chain failed: {msg}"));
+                    }
+                }
+            }
+            Intent::PushFxControls { bus, inserts } => {
+                self.push_fx_controls(bus.as_str(), inserts)?;
+                report.push(format!("FX controls pushed on {}", bus.as_str()));
+            }
+            Intent::TeardownFxChain { bus } => {
+                self.teardown_fx_chain(bus.as_str())?;
+                report.push(format!("FX torn down on {}", bus.as_str()));
+            }
+            Intent::Teardown => {
+                self.backend.teardown_links();
+                let _ = self.backend.teardown_rate_bridges();
+                self.fx.stop_all();
+                self.desired.clear_routes();
+                self.desired.bridges.clear();
+                self.desired.fx_chains.clear();
+                self.desired.bus_egress.clear();
+                self.desired.fx_failed.clear();
+                self.desired.speakers_armed = false;
+                report.push("engine teardown");
+            }
+            Intent::Recover => {
+                let r = self.reconcile()?;
+                for m in r.messages {
+                    report.push(m);
+                }
+            }
+            Intent::ArmSession { force_fx } => {
+                let r = self.arm_session(force_fx)?;
+                for m in r.messages {
+                    report.push(m);
+                }
+            }
+            Intent::BindDeviceClock {
+                device,
+                sample_rate,
+                quantum,
+                soft_quantum,
+                bind_buschain,
+            } => {
+                if bind_buschain {
+                    let profile = PerformanceProfile {
+                        preset: AudioPreset::Custom,
+                        sample_rate,
+                        quantum,
+                        soft_quantum,
+                        force_suspend_timeout_zero: true,
+                        bound_device: device.clone(),
+                        device_limited: false,
+                    };
+                    let r = self.bind_master_clock_profile(profile)?;
+                    for m in r.messages {
+                        report.push(m);
+                    }
+                } else {
+                    let force_q = if soft_quantum { 0 } else { quantum };
+                    match set_graph_force_clock(sample_rate, force_q) {
+                        Ok(()) => report.push(format!(
+                            "device force-rate {sample_rate} q{force_q} ({device})"
+                        )),
+                        Err(e) => report.push(format!("force-rate: {e}")),
+                    }
+                    if wait_hw_running_rate(&device, sample_rate, Duration::from_secs(3)) {
+                        report.push(format!("{device} running {sample_rate} Hz"));
+                    } else {
+                        let live = probe_sink_running_rate(&device)
+                            .or_else(|| crate::clock::probe_source_running_rate(&device))
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "?".into());
+                        report.push(format!(
+                            "WARN: {device} still {live} Hz (wanted {sample_rate})"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Continuous Desired↔live supervisor (buses, FX, Master→HW, default).
+    pub fn reconcile(&mut self) -> Result<ApplyReport> {
+        // After Tear down / cold desired with speakers still latched off: bring up
+        // sealed paths instead of idly disarming Master→HW forever.
+        // Prefer warm adopt when PW topology already matches Desired (UI restart).
+        if !self.desired.speakers_armed && !self.desired.buses.is_empty() {
+            return self.arm_session(true);
+        }
+        let mut report = self.reconcile_buses_and_levels()?;
+        self.reconcile_fx(&mut report);
+        self.reconcile_master_and_default(&mut report)?;
+        if report.messages.is_empty() {
+            report.push("reconcile ok");
+        }
+        Ok(report)
+    }
+
+    /// Idle tick: levels + Master HW + default. FX Idempotent retry every 3rd call
+    /// (~6s) so a single spawn miss doesn't leave inserts permanently dry.
+    pub fn reconcile_light(&mut self) -> Result<ApplyReport> {
+        if !self.desired.speakers_armed && !self.desired.buses.is_empty() {
+            return self.arm_session(true);
+        }
+        let mut report = self.reconcile_buses_and_levels()?;
+        // Drop orphan Custom-192k rate bridges after switching back to Balanced.
+        self.prune_stale_rate_bridges(&mut report);
+        // Every idle tick: kill parallel dry+post paths (chorus/echo).
+        self.prune_parallel_fx_routes(&mut report);
+        self.reconcile_master_and_default(&mut report)?;
+        self.idle_fx_ticks = self.idle_fx_ticks.wrapping_add(1);
+        if self.idle_fx_ticks % 3 == 0 {
+            self.reconcile_fx(&mut report);
+        }
+        if report.messages.is_empty() {
+            report.push("reconcile light ok");
+        }
+        Ok(report)
+    }
+
+    /// Exclusive routing hygiene — run often; cheap when already clean.
+    fn prune_parallel_fx_routes(&mut self, report: &mut ApplyReport) {
+        let chains: Vec<ChainSpec> = self.desired.fx_chains.values().cloned().collect();
+        for spec in chains {
+            let bus = spec.bus.as_str();
+            let dest = spec.dest.as_str();
+            if dest.is_empty() {
+                continue;
+            }
+            let from = format!("{bus}.monitor");
+            let post = post_name_for_bus(bus);
+            let post_mon = format!("{post}.monitor");
+            let fx = fx_name_for_bus(bus);
+            let dests = self.desired.egress_dests(bus);
+            let dest_refs: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
+            let allow_egress = if bus == "buschain_master" {
+                self.desired.speakers_armed
+            } else {
+                true
+            };
+
+            if self.chain_is_wet(bus) {
+                for d in &dests {
+                    if link_is_live(&from, d) {
+                        let _ = self.backend.unlink_raw(&from, d);
+                        report.push(format!("prune dry {bus}→{d} (wet exclusive)"));
+                    }
+                }
+                let mut allow: Vec<&str> = dest_refs.clone();
+                allow.push("buschain_hold");
+                let _ = self.backend.unlink_from_source_except(&post_mon, &allow);
+            } else if !spec.inserts.is_empty() {
+                // Feed restore first: spine_ok requires bus→fx. After restart the
+                // feed often drops while fx/post remain — pruning post→dest then
+                // traps the bus on hold (meters via hold, silence).
+                if sink_exists(&fx) && !link_is_live(&from, &fx) {
+                    let _ = self.backend.ensure_link_raw(&from, &fx);
+                    let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
+                    report.push(format!("restore {bus}→fx feed"));
+                }
+                let spine_now = pipeline::arm::spine_instant_ready(bus);
+                if spine_now && allow_egress {
+                    let mut missing = false;
+                    for d in &dests {
+                        if !d.is_empty() && !link_is_live(&post_mon, d) {
+                            missing = true;
+                            break;
+                        }
+                    }
+                    if missing {
+                        wake_sink_for_egress(&dests);
+                        match pipeline::arm::arm_track_egress(
+                            &mut self.backend,
+                            bus,
+                            true,
+                            &dests,
+                        ) {
+                            Ok(()) => report.push(format!("re-arm wet egress {bus}")),
+                            Err(e) => report.push(format!("re-arm {bus}: {e:#}")),
+                        }
+                    }
+                    for d in &dests {
+                        if link_is_live(&from, d) {
+                            let _ = self.backend.unlink_raw(&from, d);
+                        }
+                    }
+                } else if !sink_exists(&fx) {
+                    // Truly Building — no FX node yet; strip premature post→dest.
+                    let mut had_post = false;
+                    for d in &dests {
+                        if link_is_live(&post_mon, d) {
+                            had_post = true;
+                            break;
+                        }
+                    }
+                    if had_post || (!dest.is_empty() && link_is_live(&post_mon, dest)) {
+                        let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                        report.push(format!("prune orphan post {post}"));
+                    }
+                } else {
+                    // FX present but spine still settling — keep existing egress;
+                    // only drop dry parallel bus→dest.
+                    for d in &dests {
+                        if link_is_live(&from, &fx) && link_is_live(&from, d) {
+                            let _ = self.backend.unlink_raw(&from, d);
+                            report.push(format!("prune dry during FX build {bus}→{d}"));
+                        }
+                    }
+                }
+            } else if sink_exists(&post) {
+                // No inserts Desired but post linger — strip post outs.
+                let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                report.push(format!("prune orphan post {post}"));
+            }
+        }
+    }
+
+    fn prune_stale_rate_bridges(&mut self, report: &mut ApplyReport) {
+        let clock_rate = self.desired.clock.sample_rate;
+        let Ok(names) = self.backend.list_sink_names() else {
+            return;
+        };
+        let mut removed = 0u32;
+        for name in names {
+            if !name.starts_with("buschain_rs_") {
+                continue;
+            }
+            let live = crate::clock::probe_sink_running_rate(&name).unwrap_or(0);
+            if live != 0 && clock_rate != 0 && live != clock_rate {
+                let _ = self.backend.destroy_node(&name);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            let _ = self.backend.teardown_rate_bridges();
+            self.desired.bridges.clear();
+            report.push(format!("pruned {removed} stale rate-bridge(s)"));
+        }
+    }
+
+    fn reconcile_buses_and_levels(&mut self) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        let clock = self.desired.clock.clone();
+
+        let hold = NodeSpec {
+            name: crate::domain::NodeName::new("buschain_hold"),
+            description: "BusChainControl_Hold".into(),
+            role: NodeRole::Hold,
+            start_muted: true,
+        };
+        let _ = self.backend.ensure_node(&hold, &clock);
+
+        let bus_specs: Vec<NodeSpec> = self.desired.buses.values().cloned().collect();
+        for spec in bus_specs {
+            if let Err(e) = self.backend.ensure_node(&spec, &clock) {
+                report.push(format!("bus {}: {e:#}", spec.name.as_str()));
+                continue;
+            }
+            let name = spec.name.as_str().to_string();
+            let mon = format!("{name}.monitor");
+            let _ = self.backend.ensure_link_raw(&mon, "buschain_hold");
+            let level = self
+                .desired
+                .bus_levels
+                .get(&name)
+                .copied()
+                .unwrap_or_default();
+            let _ = self.backend.open_bus_gain(&name, level.gain_db);
+            let want_mute = level.mixer_mute;
+            let prev = self.applied_monitor_mute.get(&name).copied();
+            if prev != Some(want_mute) {
+                let _ = self.backend.gate_monitor(&name, want_mute);
+                self.applied_monitor_mute.insert(name.clone(), want_mute);
+            }
+        }
+        Ok(report)
+    }
+
+    fn reconcile_fx(&mut self, report: &mut ApplyReport) {
+        // Tear down live FX for buses that are no longer Desired-wet.
+        let keep: std::collections::HashSet<String> =
+            self.desired.fx_chains.keys().cloned().collect();
+        let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
+        for bus in buses {
+            if keep.contains(&bus) {
+                continue;
+            }
+            let fx = fx_name_for_bus(&bus);
+            if sink_exists(&fx) {
+                if let Err(e) = self.teardown_fx_chain(&bus) {
+                    report.push(format!("FX teardown {bus}: {e:#}"));
+                } else {
+                    report.push(format!("FX torn down {bus}"));
+                }
+            }
+        }
+
+        let chains: Vec<ChainSpec> = self.desired.fx_chains.values().cloned().collect();
+        for spec in chains {
+            let bus = spec.bus.as_str().to_string();
+            let dest = spec.dest.clone();
+            if spec.inserts.is_empty() {
+                // Inserts cleared — drop any leftover post→dest (echo source).
+                self.prune_orphan_post(&bus, &dest);
+                continue;
+            }
+            let fx = fx_name_for_bus(&bus);
+            if self.fx.spawn_in_backoff(&fx) {
+                // Still prune parallel dry+post while waiting — avoids chorus.
+                if !self.chain_is_wet(&bus) {
+                    self.prune_orphan_post(&bus, &dest);
+                }
+                continue;
+            }
+            // Idle must never ForceRespawn — ProbeOnly only.
+            match self.ensure_fx_chain(spec, ChainEnsureMode::ProbeOnly) {
+                Ok(ChainState::Wet(_)) => {
+                    // Exclusive: bus must not also feed dest.
+                    let from = format!("{bus}.monitor");
+                    if link_is_live(&from, &dest) {
+                        let _ = self.backend.unlink_raw(&from, &dest);
+                        report.push(format!("FX pruned dry {bus}→{dest}"));
+                    }
+                    report.push(format!("FX wet {bus}"));
+                }
+                Ok(ChainState::Failed(e)) => {
+                    // ProbeOnly fails when dest is missing even if spine is fine.
+                    // Restore bus→fx feed first (common after restart), then re-arm.
+                    let from = format!("{bus}.monitor");
+                    if sink_exists(&fx) && !link_is_live(&from, &fx) {
+                        let _ = self.backend.ensure_link_raw(&from, &fx);
+                        let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
+                        report.push(format!("FX {bus}: restored feed"));
+                    }
+                    if pipeline::arm::spine_instant_ready(&bus) {
+                        let dests = self.desired.egress_dests(&bus);
+                        let allow = bus != "buschain_master" || self.desired.speakers_armed;
+                        if allow && !dests.is_empty() {
+                            wake_sink_for_egress(&dests);
+                            if pipeline::arm::arm_track_egress(
+                                &mut self.backend,
+                                &bus,
+                                true,
+                                &dests,
+                            )
+                            .is_ok()
+                            {
+                                report.push(format!("FX {bus}: re-armed egress"));
+                            }
+                        }
+                    } else if !sink_exists(&fx) {
+                        self.prune_orphan_post(&bus, &dest);
+                    }
+                    if !e.contains("backoff") && !e.contains("not audible") {
+                        report.push(format!("FX {bus}: {e}"));
+                    }
+                }
+                Ok(_) => {
+                    // Building — only strip post when FX node is gone.
+                    if !sink_exists(&fx) {
+                        self.prune_orphan_post(&bus, &dest);
+                    }
+                }
+                Err(e) => {
+                    if !sink_exists(&fx) {
+                        self.prune_orphan_post(&bus, &dest);
+                    }
+                    report.push(format!("FX {bus}: {e:#}"));
+                }
+            }
+        }
+    }
+
+    /// Drop post.monitor→* when the spine is actually down. Never strip when the
+    /// FX→post path is healthy — missing dest is a re-arm case, not a prune case.
+    fn prune_orphan_post(&mut self, bus: &str, dest: &str) {
+        if pipeline::arm::spine_instant_ready(bus) {
+            return;
+        }
+        let post = post_name_for_bus(bus);
+        let post_mon = format!("{post}.monitor");
+        if dest.is_empty() {
+            let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+            return;
+        }
+        if link_is_live(&post_mon, dest) || sink_exists(&post) {
+            let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+        }
+    }
+
+    fn reconcile_master_and_default(&mut self, report: &mut ApplyReport) -> Result<()> {
+        if let Some(hw) = self
+            .desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone())
+        {
+            self.remember_master_hw(&hw);
+            let master = "buschain_master";
+            let from = format!("{master}.monitor");
+            let spine_ok = pipeline::arm::spine_instant_ready(master);
+            let want_wet = self.desired.fx_chains.contains_key(master);
+
+            // Session barrier: keep speakers silent until cold bring-up arms them.
+            if !self.desired.speakers_armed {
+                pipeline::arm::disarm_master_hw(&mut self.backend, &hw);
+                // Still assert preferred default below.
+            } else if want_wet {
+                // Wet Master repair must NOT be gated on spine_ok alone.
+                // spine_instant_ready requires master.monitor→fx; after restart that
+                // feed often drops while fx/post nodes remain. The old branch only
+                // restored links when spine_ok was already true → forever on
+                // buschain_hold (meters alive via hold/bus, audible silence).
+                let post = post_name_for_bus(master);
+                let post_mon = format!("{post}.monitor");
+                let fx = fx_name_for_bus(master);
+                if sink_exists(&fx) {
+                    let _ = self
+                        .backend
+                        .unlink_from_source_except(&from, &[&fx, "buschain_hold"]);
+                    if let Err(e) = self.backend.ensure_link_raw(&from, &fx) {
+                        report.push(format!("master→fx feed: {e:#}"));
+                    } else if !spine_ok {
+                        report.push("master→fx feed restored");
+                    }
+                    let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
+                    if link_is_live(&from, &hw) {
+                        let _ = self.backend.unlink_raw(&from, &hw);
+                    }
+                    // Fresh pw-link listing after feed restore (80ms cache otherwise
+                    // says spine still down and skips post→HW in the same tick).
+                    crate::backend::invalidate_probe_caches();
+                    let feed_ok = link_is_live(&from, &fx);
+                    let spine_now = feed_ok && pipeline::arm::spine_instant_ready(master);
+                    // Arm egress when feed is up and post exists — don't wait for a
+                    // flaky Pulse sink-input probe on a SUSPENDED helper.
+                    if feed_ok && sink_exists(&post) && !link_is_live(&post_mon, &hw) {
+                        wake_sink(&hw);
+                        let _ = self
+                            .backend
+                            .unlink_from_source_except(&post_mon, &[&hw, "buschain_hold"]);
+                        if let Err(e) = self.backend.ensure_link_raw(&post_mon, &hw) {
+                            report.push(format!("master post→HW: {e:#}"));
+                        } else {
+                            report.push(format!("master post→{hw} (re-armed)"));
+                            crate::backend::invalidate_probe_caches();
+                        }
+                    } else if !spine_now && feed_ok {
+                        report.push("master spine settling (feed up, waiting post)");
+                    }
+                } else {
+                    // FX node missing — hold only; never arm dry Master→HW (bypass).
+                    let _ = self
+                        .backend
+                        .unlink_from_source_except(&from, &["buschain_hold"]);
+                    let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
+                    if link_is_live(&from, &hw) {
+                        let _ = self.backend.unlink_raw(&from, &hw);
+                    }
+                }
+            } else {
+                // Dry Master: never leave orphan post→HW (parallel with master→HW =
+                // delayed double = chorus/echo). Prune post outs every idle pass.
+                let post = post_name_for_bus(master);
+                let post_mon = format!("{post}.monitor");
+                if link_is_live(&post_mon, &hw) || sink_exists(&post) {
+                    let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                }
+                if link_is_live(&from, &hw) {
+                    // Healthy dry Master→HW — leave master links alone (meter stability).
+                } else {
+                    wake_sink(&hw);
+                    let _ = self
+                        .backend
+                        .unlink_from_source_except(&from, &[&hw, "buschain_hold"]);
+                    if let Err(e) = self.backend.ensure_link_raw(&from, &hw) {
+                        report.push(format!("master→HW: {e:#}"));
+                    } else {
+                        report.push(format!("master→{hw} (re-armed)"));
+                    }
+                }
+            }
+        }
+
+        if let Some(pref) = self.desired.preferred_default.clone() {
+            let exists = self
+                .backend
+                .list_sink_names()
+                .map(|n| n.iter().any(|s| s == &pref))
+                .unwrap_or(false);
+            if exists {
+                let live = self.backend.default_sink_name();
+                if live.as_deref() != Some(pref.as_str()) {
+                    let due = self
+                        .last_default_assert
+                        .map(|t| t.elapsed() >= Duration::from_millis(500))
+                        .unwrap_or(true);
+                    if due {
+                        self.last_default_assert = Some(Instant::now());
+                        match self.backend.set_default_sink(&pref) {
+                            Ok(true) => report.push(format!("default→{pref}")),
+                            Ok(false) => {
+                                report.push(format!("default did not stick — retrying ({pref})"))
+                            }
+                            Err(e) => report.push(format!("default: {e:#}")),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ensure_fx_chain(
+        &mut self,
+        spec: ChainSpec,
+        mode: ChainEnsureMode,
+    ) -> Result<ChainState> {
+        if spec.bus.as_str() == "buschain_master" && !spec.dest.is_empty() {
+            self.remember_master_hw(&spec.dest);
+        }
+        let bus = spec.bus.as_str().to_string();
+        // Master→HW stays behind the session barrier until speakers_armed.
+        let arm_egress = if bus == "buschain_master" {
+            self.desired.speakers_armed
+        } else {
+            true
+        };
+        let clock = self.desired.clock.clone();
+        let state = pipeline::insert::ensure_fx_chain(
+            &mut self.fx,
+            &mut self.backend,
+            &clock,
+            &spec,
+            mode,
+            arm_egress,
+        )?;
+        if matches!(state, ChainState::Failed(_)) {
+            self.desired.fx_failed.insert(bus.clone());
+            return Ok(state);
+        }
+        self.desired.fx_failed.remove(&bus);
+        if spec.inserts.is_empty() {
+            self.desired.remove_fx_chain(spec.bus.as_str());
+        } else if state.is_wet() {
+            self.desired.ensure_fx_chain(spec);
+            // Multi-dest: arm every configured hop after primary wet land.
+            if arm_egress {
+                let dests = self.desired.egress_dests(&bus);
+                if dests.len() > 1 {
+                    let _ = pipeline::arm::arm_track_egress(
+                        &mut self.backend,
+                        &bus,
+                        true,
+                        &dests,
+                    );
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    /// True when live PipeWire already matches Desired (buses, FX spines, Master→HW).
+    /// Fail-closed — any mismatch means cold ArmSession.
+    pub fn session_graph_healthy(&self) -> bool {
+        if self.desired.buses.is_empty() {
+            return false;
+        }
+        let hw = self
+            .desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone())
+            .unwrap_or_default();
+
+        for bus in self.desired.buses.keys() {
+            if !sink_exists(bus) {
+                return false;
+            }
+            let dests = self.desired.egress_dests(bus);
+            if let Some(spec) = self.desired.fx_chains.get(bus) {
+                if spec.inserts.is_empty() {
+                    return false;
+                }
+                if !pipeline::arm::spine_instant_ready(bus) {
+                    return false;
+                }
+                let fx = fx_name_for_bus(bus);
+                if read_signature(&fx).as_deref() != Some(spec.signature().as_str()) {
+                    return false;
+                }
+                // Spines + signatures are enough for warm adopt. Missing post→dest
+                // (common after UI restart) must NOT force ForceRespawn — that left
+                // meters alive on hold for a minute while every FX helper respawned.
+                // adopt_live_session / reconcile_master re-arms egress link-only.
+                if bus == "buschain_master" {
+                    if hw.is_empty() {
+                        return false;
+                    }
+                } else if dests.iter().all(|d| d.is_empty()) {
+                    return false;
+                }
+            } else {
+                // Dry bus.
+                if !pipeline::arm::track_path_ready(bus, false, &dests) {
+                    return false;
+                }
+                let from = format!("{bus}.monitor");
+                if bus == "buschain_master" {
+                    if hw.is_empty() || !link_is_live(&from, &hw) {
+                        return false;
+                    }
+                } else {
+                    let mut linked = false;
+                    for d in &dests {
+                        if !d.is_empty() && link_is_live(&from, d) {
+                            linked = true;
+                            break;
+                        }
+                    }
+                    if !linked {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Warm restart: latch speakers and Idempotent-reconcile without disarm/ForceRespawn.
+    pub fn adopt_live_session(&mut self) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        report.push("warm adopt — graph already live");
+        self.desired.speakers_armed = true;
+        self.desired.fx_failed.clear();
+        let mut bus_report = self.reconcile_buses_and_levels()?;
+        report.messages.append(&mut bus_report.messages);
+        self.reconcile_fx(&mut report);
+        self.reconcile_master_and_default(&mut report)?;
+        report.push("speakers armed (adopted)");
+        Ok(report)
+    }
+
+    /// Cold bring-up / Full Apply: sealed disarm → spines → dwell → track arm → barrier → HW.
+    /// When the live graph already matches Desired, warm-adopts instead (UI restart).
+    pub fn arm_session(&mut self, force_fx: bool) -> Result<ApplyReport> {
+        if self.session_graph_healthy() {
+            return self.adopt_live_session();
+        }
+
+        let mut report = ApplyReport::default();
+        self.desired.speakers_armed = false;
+        self.desired.fx_failed.clear();
+
+        let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
+        for bus in &buses {
+            let keep_fx = self.desired.fx_chains.contains_key(bus);
+            pipeline::arm::disarm_track_egress(&mut self.backend, bus, keep_fx);
+        }
+        if let Some(hw) = self
+            .desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone())
+        {
+            pipeline::arm::disarm_master_hw(&mut self.backend, &hw);
+            report.push(format!("disarmed speakers ({hw})"));
+        }
+
+        let mut bus_report = self.reconcile_buses_and_levels()?;
+        report.messages.append(&mut bus_report.messages);
+
+        let mode = if force_fx {
+            ChainEnsureMode::ForceRespawn
+        } else {
+            ChainEnsureMode::Idempotent
+        };
+        let chains: Vec<ChainSpec> = self.desired.fx_chains.values().cloned().collect();
+        for spec in chains {
+            let bus = spec.bus.as_str().to_string();
+            match self.ensure_fx_chain(spec, mode) {
+                Ok(ChainState::Wet(_)) => report.push(format!("FX wet {bus}")),
+                Ok(ChainState::Failed(e)) => {
+                    if !e.contains("backoff") {
+                        report.push(format!("FX {bus} failed (dry): {e}"));
+                    }
+                }
+                Ok(ChainState::Dry) => report.push(format!("FX dry {bus}")),
+                Ok(ChainState::Building) => report.push(format!("FX building {bus}")),
+                Err(e) => report.push(format!("FX {bus}: {e:#}")),
+            }
+        }
+
+        // Dry (no-insert) tracks: short dwell then arm all egress hops.
+        for bus in &buses {
+            if bus == "buschain_master" {
+                continue;
+            }
+            if self.desired.fx_chains.contains_key(bus) {
+                continue;
+            }
+            let dests = self.desired.egress_dests(bus);
+            if !pipeline::arm::wait_dry_spine_stable(bus, pipeline::arm::DRY_DWELL) {
+                report.push(format!("dry {bus}: bus not ready"));
+                continue;
+            }
+            if let Err(e) =
+                pipeline::arm::arm_track_egress(&mut self.backend, bus, false, &dests)
+            {
+                report.push(format!("dry arm {bus}: {e:#}"));
+            } else {
+                report.push(format!("dry armed {bus}"));
+            }
+        }
+
+        // Wet tracks may have only armed primary dest — refresh multi-dest.
+        for bus in &buses {
+            if bus == "buschain_master" {
+                continue;
+            }
+            if !self.desired.fx_chains.contains_key(bus) {
+                continue;
+            }
+            if self.desired.fx_failed.contains(bus) {
+                let dests = self.desired.egress_dests(bus);
+                let _ = pipeline::arm::arm_track_egress(&mut self.backend, bus, false, &dests);
+                continue;
+            }
+            if pipeline::arm::spine_instant_ready(bus) || self.chain_is_wet(bus) {
+                let dests = self.desired.egress_dests(bus);
+                let _ = pipeline::arm::arm_track_egress(&mut self.backend, bus, true, &dests);
+            }
+        }
+
+        // Session barrier — wait for Master spine + unmuted insert tracks.
+        let mut cleared = false;
+        for _ in 0..80 {
+            if self.session_barrier_clear() {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !cleared {
+            report.push("session barrier timeout — arming speakers fail-open");
+        } else {
+            report.push("session barrier clear");
+        }
+
+        if let Some(hw) = self
+            .desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone())
+        {
+            let wet = pipeline::arm::spine_instant_ready("buschain_master")
+                && !self.desired.fx_failed.contains("buschain_master");
+            if let Err(e) = pipeline::arm::arm_master_hw(&mut self.backend, &hw, wet) {
+                report.push(format!("arm Master→HW: {e:#}"));
+            } else {
+                report.push(format!("armed Master→{hw}"));
+            }
+        }
+        self.desired.speakers_armed = true;
+        report.push("speakers armed");
+        // Second pass: restore feed + post→HW if cold arm left Master on hold
+        // (common when sink_has_input flaked during the barrier window).
+        crate::backend::invalidate_probe_caches();
+        self.reconcile_master_and_default(&mut report)?;
+        Ok(report)
+    }
+
+    /// Master spine ready + every unmuted non-master insert track is Wet or Failed.
+    pub fn session_barrier_clear(&mut self) -> bool {
+        // Master spine
+        let master_ok = if self.desired.fx_chains.contains_key("buschain_master") {
+            if self.desired.fx_failed.contains("buschain_master") {
+                sink_exists("buschain_master")
+            } else {
+                pipeline::arm::spine_instant_ready("buschain_master")
+                    || self.chain_is_wet("buschain_master")
+            }
+        } else {
+            pipeline::arm::dry_spine_instant_ready("buschain_master")
+        };
+        if !master_ok {
+            return false;
+        }
+
+        let chains: Vec<(String, bool)> = self
+            .desired
+            .fx_chains
+            .keys()
+            .filter(|b| b.as_str() != "buschain_master")
+            .map(|b| {
+                let muted = self
+                    .desired
+                    .bus_levels
+                    .get(b)
+                    .map(|l| l.mixer_mute)
+                    .unwrap_or(false);
+                (b.clone(), muted)
+            })
+            .collect();
+
+        for (bus, muted) in chains {
+            if muted {
+                continue;
+            }
+            if self.desired.fx_failed.contains(&bus) {
+                continue; // Failed + dry restored = resolved
+            }
+            if !(self.chain_is_wet(&bus) || pipeline::arm::spine_instant_ready(&bus)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn push_fx_controls(&mut self, bus: &str, inserts: Vec<InsertSlot>) -> Result<()> {
+        let fx_name = crate::domain::fx_name_for_bus(bus);
+        // Props-only — never pactl here. Existence is owns_live / .sig / last-resort
+        // sink_exists inside pipeline::insert::push_fx_controls.
+        pipeline::insert::push_fx_controls(&mut self.fx, &fx_name, &inserts)?;
+        if let Some(spec) = self.desired.fx_chains.get_mut(bus) {
+            spec.inserts = inserts;
+        }
+        Ok(())
+    }
+
+    /// Idle tick that skips Idempotent FX respawn (use when knobs just ran).
+    pub fn reconcile_light_no_fx(&mut self) -> Result<ApplyReport> {
+        if !self.desired.speakers_armed && !self.desired.buses.is_empty() {
+            return self.arm_session(true);
+        }
+        let mut report = self.reconcile_buses_and_levels()?;
+        self.prune_stale_rate_bridges(&mut report);
+        self.prune_parallel_fx_routes(&mut report);
+        self.reconcile_master_and_default(&mut report)?;
+        if report.messages.is_empty() {
+            report.push("reconcile light (no fx) ok");
+        }
+        Ok(report)
+    }
+
+    pub fn teardown_fx_chain(&mut self, bus: &str) -> Result<()> {
+        pipeline::insert::teardown_fx_chain(&mut self.fx, &mut self.backend, bus)?;
+        self.desired.remove_fx_chain(bus);
+        Ok(())
+    }
+
+    /// Probe wetness from live PW topology (works even if DesiredState was cleared on restart).
+    pub fn chain_state(&mut self, bus: &str) -> ChainState {
+        let (inserts_len, dest) = match self.desired.fx_chains.get(bus) {
+            Some(spec) if !spec.inserts.is_empty() => {
+                (spec.inserts.len(), spec.dest.clone())
+            }
+            _ => {
+                // Orphan / restart: treat existing FX sink as a candidate wet path.
+                let fx = crate::domain::fx_name_for_bus(bus);
+                if !crate::backend::sink_exists(&fx) {
+                    return ChainState::Dry;
+                }
+                let dest = if bus == "buschain_master" {
+                    self.master_hw
+                        .clone()
+                        .unwrap_or_else(|| "buschain_master".into())
+                } else {
+                    "buschain_master".into()
+                };
+                (1, dest)
+            }
+        };
+        // Master spine can be Wet before session barrier opens post→HW.
+        let require_dest = if bus == "buschain_master" {
+            self.desired.speakers_armed
+        } else {
+            true
+        };
+        pipeline::insert::probe_chain_state(
+            &mut self.fx,
+            bus,
+            inserts_len,
+            &dest,
+            require_dest,
+        )
+    }
+
+    /// True when bus.monitor → fx → post is carrying audio (meter / route gate).
+    pub fn chain_is_wet(&mut self, bus: &str) -> bool {
+        self.chain_state(bus).is_wet()
+    }
+
+    pub fn stop_all_fx(&mut self) {
+        self.fx.stop_all();
+        self.desired.fx_chains.clear();
+    }
+
+    /// Convenience: ensure null-sink with current clock (used by graph shim).
+    pub fn ensure_bus(
+        &mut self,
+        name: &str,
+        description: &str,
+        role: NodeRole,
+        start_muted: bool,
+    ) -> Result<()> {
+        self.apply(Intent::EnsureBus {
+            spec: NodeSpec {
+                name: crate::domain::NodeName::new(name),
+                description: description.into(),
+                role,
+                start_muted,
+            },
+        })?;
+        Ok(())
+    }
+
+    pub fn ensure_route(&mut self, source: &str, sink: &str, exclusive: bool) -> Result<()> {
+        self.apply(Intent::SetRoute {
+            link: LinkSpec {
+                source: source.into(),
+                sink: sink.into(),
+                exclusive,
+            },
+        })?;
+        Ok(())
+    }
+
+    pub fn disarm_track_egress(&mut self, bus: &str, keep_fx_feed: bool) {
+        pipeline::arm::disarm_track_egress(&mut self.backend, bus, keep_fx_feed);
+    }
+
+    pub fn arm_track_egress(&mut self, bus: &str, wet: bool, dests: &[String]) -> Result<()> {
+        pipeline::arm::arm_track_egress(&mut self.backend, bus, wet, dests)
+    }
+
+    pub fn ensure_link_raw(&mut self, source: &str, sink: &str) -> Result<()> {
+        self.backend.ensure_link_raw(source, sink)?;
+        Ok(())
+    }
+
+    pub fn unlink_raw(&mut self, source: &str, sink: &str) -> Result<()> {
+        self.backend.unlink_raw(source, sink)
+    }
+
+    pub fn unlink_from_source_except(&mut self, source: &str, allow: &[&str]) -> u32 {
+        self.backend.unlink_from_source_except(source, allow)
+    }
+
+    pub fn teardown_links(&mut self) {
+        self.backend.teardown_links();
+        let _ = self.backend.teardown_rate_bridges();
+    }
+
+    pub fn destroy_rate_bridges_only(&mut self) {
+        let _ = self.backend.teardown_rate_bridges();
+        self.desired.bridges.clear();
+    }
+
+    pub fn link_is_live(source: &str, sink: &str) -> bool {
+        crate::backend::link_is_live(source, sink)
+    }
+
+    pub fn resolve_profile(
+        preset: AudioPreset,
+        caps: &DeviceCaps,
+        custom_rate: Option<u32>,
+        custom_quantum: Option<u32>,
+        soft_quantum: bool,
+    ) -> PerformanceProfile {
+        resolve_profile(preset, caps, custom_rate, custom_quantum, soft_quantum)
+    }
+
+    pub fn filter_chain_clock_fragment(&self) -> String {
+        crate::backend::filter_chain_clock_props(&self.desired.clock)
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wake a PipeWire/Pulse sink that may have auto-suspended (USB idle, etc.).
+fn wake_sink(name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("pactl")
+        .args(["suspend-sink", name, "0"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn wake_sink_for_egress(dests: &[String]) {
+    for d in dests {
+        // Only wake real HW / non-buschain sinks; buschain_* buses stay hot via keepalive.
+        if d.is_empty() || d.starts_with("buschain_") {
+            continue;
+        }
+        wake_sink(d);
+    }
+}

@@ -1,0 +1,23 @@
+**/build/
+**/target/
+*.so
+*.o
+*.a
+.direnv/
+result
+result-*
+*~
+.DS_Store
+/target/
+
+# Local / secrets
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# AI agent dumps (local only — not tracked)
+/codedocs/
+

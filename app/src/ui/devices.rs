@@ -1,0 +1,528 @@
+use crate::app_state::AppState;
+use crate::audio::graph::DeviceNode;
+use crate::audio::live::LiveChange;
+use crate::audio::worker::Command;
+use crate::design::{self, Theme};
+use crate::session::DeviceClockConfig;
+use egui::RichText;
+use buschain_engine::{resolve_profile, AudioPreset};
+
+/// Per-device rate/quantum editor (Output / Input / Settings Master HW).
+pub fn draw_device_clock_panel(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    device: &DeviceNode,
+    is_source: bool,
+) {
+    let theme = state.theme;
+    let is_master_hw = !is_source
+        && state.session.master_output.as_deref() == Some(device.name.as_str());
+
+    // Caps are TTL-cached on AppState — never pw-dump/pactl every frame.
+    let caps = state.caps_for_device(&device.name, &device.description, is_source);
+    let live = device
+        .sample_rate
+        .or(caps.preferred_rate.nonzero())
+        .unwrap_or(48_000);
+
+    // Ensure prefs exist, clamped to caps.
+    {
+        let entry = state
+            .session
+            .device_clocks
+            .entry(device.name.clone())
+            .or_insert_with(|| DeviceClockConfig {
+                sample_rate: live,
+                quantum: state.session.performance.quantum.max(64),
+                soft_quantum: true,
+            });
+        let soft = entry.soft_quantum;
+        let resolved = resolve_profile(
+            AudioPreset::Custom,
+            &caps,
+            Some(entry.sample_rate),
+            Some(entry.quantum),
+            soft,
+        );
+        entry.sample_rate = resolved.sample_rate;
+        entry.quantum = resolved.quantum;
+    }
+
+    ui.add_space(4.0);
+    ui.separator();
+    ui.label(
+        RichText::new(if is_master_hw {
+            "Clock (Master HW out — Apply also binds BusChain graph)"
+        } else {
+            "Clock (PipeWire graph force-rate; shared across the card)"
+        })
+        .size(11.0)
+        .color(theme.text_dim()),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Live: {} Hz · Device rates: {}",
+            live,
+            if caps.rates.is_empty() {
+                "—".into()
+            } else {
+                caps.rates
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ))
+        .size(10.0)
+        .color(if device.sample_rate == Some(
+            state
+                .session
+                .device_clocks
+                .get(&device.name)
+                .map(|c| c.sample_rate)
+                .unwrap_or(live),
+        ) {
+            theme.accent()
+        } else {
+            theme.warning()
+        }),
+    );
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Rate").size(11.0).color(theme.text_dim()));
+        let rates = if caps.rates.is_empty() {
+            vec![live]
+        } else {
+            caps.rates.clone()
+        };
+        let mut rate = state
+            .session
+            .device_clocks
+            .get(&device.name)
+            .map(|c| c.sample_rate)
+            .unwrap_or(live);
+        if !rates.contains(&rate) {
+            rate = rates[0];
+        }
+        egui::ComboBox::from_id_salt(format!("dev_rate_{}", device.name))
+            .selected_text(format!("{rate}"))
+            .show_ui(ui, |ui| {
+                for r in &rates {
+                    ui.selectable_value(&mut rate, *r, format!("{r}"));
+                }
+            });
+
+        ui.label(RichText::new("Quantum").size(11.0).color(theme.text_dim()));
+        let mut q = state
+            .session
+            .device_clocks
+            .get(&device.name)
+            .map(|c| c.quantum)
+            .unwrap_or(256);
+        egui::ComboBox::from_id_salt(format!("dev_q_{}", device.name))
+            .selected_text(format!("{q}"))
+            .show_ui(ui, |ui| {
+                for qq in [64, 128, 256, 512, 1024, 2048] {
+                    if caps.allows_quantum(qq) {
+                        ui.selectable_value(&mut q, qq, format!("{qq}"));
+                    }
+                }
+            });
+
+        if let Some(entry) = state.session.device_clocks.get_mut(&device.name) {
+            if rate != entry.sample_rate || q != entry.quantum {
+                entry.sample_rate = rate;
+                entry.quantum = q;
+                state.dirty = true;
+            }
+        }
+    });
+
+    let mut soft = state
+        .session
+        .device_clocks
+        .get(&device.name)
+        .map(|c| c.soft_quantum)
+        .unwrap_or(true);
+    if ui
+        .checkbox(&mut soft, "Soft quantum (PipeWire may raise period under load)")
+        .changed()
+    {
+        if let Some(entry) = state.session.device_clocks.get_mut(&device.name) {
+            entry.soft_quantum = soft;
+            state.dirty = true;
+        }
+    }
+
+    ui.horizontal(|ui| {
+        let label = if is_master_hw {
+            "Apply clock + BusChain"
+        } else {
+            "Apply device clock"
+        };
+        if design::button(ui, &theme, label, true).clicked() {
+            state.apply_device_clock(&device.name, is_source);
+        }
+        let period = state
+            .session
+            .device_clocks
+            .get(&device.name)
+            .map(|c| {
+                if c.sample_rate > 0 {
+                    (c.quantum as f32 * 1000.0) / c.sample_rate as f32
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        ui.label(
+            RichText::new(format!("period {period:.2} ms"))
+                .size(10.0)
+                .color(theme.text_muted()),
+        );
+    });
+}
+
+trait NonZeroRate {
+    fn nonzero(self) -> Option<u32>;
+}
+impl NonZeroRate for u32 {
+    fn nonzero(self) -> Option<u32> {
+        if self > 0 {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
+    let theme = state.theme;
+    design::section_label(ui, &theme, "OUTPUT DEVICES — sinks");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Master HW out = speakers/headphones Master plays to (Scarlett, etc.).\n\
+             System default = where new apps play. Setting default to a BusChain track \
+             only sends apps *into* that track — Master still owns the path to hardware.",
+        )
+        .size(11.0)
+        .color(theme.text_muted()),
+    );
+    ui.add_space(4.0);
+
+    // Header uses the same resolver truth as the audio path.
+    let hw_label = state
+        .session
+        .master_output
+        .as_ref()
+        .map(|name| {
+            let desc = state
+                .session
+                .master_output_desc
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .unwrap_or(name.as_str());
+            format!("Master HW → {desc}")
+        })
+        .unwrap_or_else(|| "Master HW → (none)".into());
+    ui.label(
+        RichText::new(hw_label)
+            .size(11.0)
+            .color(theme.accent()),
+    );
+    if let Some(name) = &state.session.master_output {
+        ui.label(
+            RichText::new(name)
+                .size(10.0)
+                .monospace()
+                .color(theme.text_muted()),
+        );
+    }
+    let pref = state.session.preferred_default_sink.clone();
+    let live_def = state.snapshot.default_sink.clone();
+    let shown_def = pref.clone().or_else(|| live_def.clone());
+    if let Some(def) = &shown_def {
+        let stick = match (&pref, &live_def) {
+            (Some(p), Some(l)) if p == l => "ok",
+            (Some(_), Some(_)) => "applying…",
+            (Some(_), None) => "applying…",
+            _ => "",
+        };
+        ui.label(
+            RichText::new(format!("System default: {def} {stick}"))
+                .size(11.0)
+                .color(theme.text_dim()),
+        );
+    }
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut state.show_hidden_output, "Show hidden");
+        ui.label(
+            RichText::new("helpers: buschain_fx / post / hold")
+                .size(10.0)
+                .color(theme.text_muted()),
+        );
+    });
+    ui.add_space(4.0);
+
+    let active_hw = state.session.master_output.clone();
+    // Prefer session preference (set on click) so highlight updates this frame;
+    // live snapshot can lag a few seconds behind pactl.
+    let active_default = state
+        .session
+        .preferred_default_sink
+        .clone()
+        .or_else(|| state.snapshot.default_sink.clone());
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let sinks: Vec<_> = state
+            .snapshot
+            .sinks
+            .iter()
+            .filter(|s| {
+                if state.show_hidden_output {
+                    return true;
+                }
+                if s.name.starts_with("buschain_fx_")
+                    || s.name.starts_with("buschain_post_")
+                    || s.name.starts_with("buschain_mid_")
+                    || s.name.starts_with("buschain_rs_")
+                    || s.name == "buschain_hold"
+                {
+                    return false;
+                }
+                if s.name.starts_with("buschain_track_") {
+                    return state.session.tracks.iter().any(|t| {
+                        t.expected_sink_name() == s.name && t.virtual_output
+                    });
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        for sink in sinks {
+            let is_app_bus = sink.name == "buschain_master"
+                || sink.name.starts_with("buschain_track_");
+            let is_shadow = sink.name.starts_with("buschain_");
+            let is_active_hw = active_hw.as_deref() == Some(sink.name.as_str());
+            let is_active_def = active_default.as_deref() == Some(sink.name.as_str());
+
+            design::panel(ui, &theme, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(&sink.description)
+                                .size(13.0)
+                                .strong()
+                                .color(theme.text()),
+                        );
+                        ui.label(
+                            RichText::new(&sink.name)
+                                .size(10.0)
+                                .monospace()
+                                .color(theme.text_muted()),
+                        );
+                        if is_app_bus {
+                            ui.label(
+                                RichText::new("Mixer-owned bus — use strip fader / mute")
+                                    .size(10.0)
+                                    .color(theme.warning()),
+                            );
+                        } else if is_shadow {
+                            ui.label(
+                                RichText::new("BusChain helper (not a hardware device)")
+                                    .size(10.0)
+                                    .color(theme.warning()),
+                            );
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !is_shadow {
+                            let hw_btn = design::button(
+                                ui,
+                                &theme,
+                                "Master HW out",
+                                is_active_hw,
+                            )
+                            .on_hover_text(
+                                "Master bus plays to this device — applied live",
+                            );
+                            if hw_btn.clicked() {
+                                state.session.master_output = Some(sink.name.clone());
+                                state.session.master_output_desc =
+                                    Some(sink.description.clone());
+                                let _ = state.session.save();
+                                // Light relink only — clock bind is explicit Apply.
+                                state.worker.send(Command::SetMasterHw {
+                                    name: sink.name.clone(),
+                                    desc: Some(sink.description.clone()),
+                                });
+                                state.status = format!("Master HW out → {}", sink.description);
+                            }
+                        }
+                        let is_fx = sink.name.starts_with("buschain_fx_")
+                            || sink.name.starts_with("buschain_post_")
+                            || sink.name.starts_with("buschain_rs_")
+                            || sink.name == "buschain_hold";
+                        let is_hidden_track = sink.name.starts_with("buschain_track_")
+                            && !state.session.tracks.iter().any(|t| {
+                                t.expected_sink_name() == sink.name && t.virtual_output
+                            });
+                        let can_default = !is_fx && !is_hidden_track;
+                        if can_default {
+                            let def_btn = design::button(
+                                ui,
+                                &theme,
+                                "System default",
+                                is_active_def,
+                            )
+                            .on_hover_text(
+                                "Apps open onto this sink. Prefer a BusChain track bus \
+                                 or Master (not raw HW). Watchdog reasserts if WirePlumber fights.",
+                            );
+                            if def_btn.clicked() {
+                                if sink.name.starts_with("buschain_track_") {
+                                    if let Some(t) = state
+                                        .session
+                                        .tracks
+                                        .iter_mut()
+                                        .find(|t| t.expected_sink_name() == sink.name)
+                                    {
+                                        t.virtual_output = true;
+                                    }
+                                }
+                                state.session.preferred_default_sink = Some(sink.name.clone());
+                                // Optimistic UI — don't wait for the slow snapshot poll.
+                                state.snapshot.default_sink = Some(sink.name.clone());
+                                state
+                                    .worker
+                                    .send(Command::SetDefaultSink(sink.name.clone()));
+                                let _ = state.session.save();
+                                state.status =
+                                    format!("System default → {}", sink.description);
+                            }
+                        }
+                        if !is_app_bus {
+                            let mut mute = sink.mute;
+                            if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
+                                .changed()
+                            {
+                                state.worker.send(Command::SetSinkMute {
+                                    name: sink.name.clone(),
+                                    mute,
+                                });
+                            }
+                        }
+                    });
+                });
+                if is_app_bus {
+                    ui.label(
+                        RichText::new(format!(
+                            "Level from mixer · sink {}%{}",
+                            sink.volume_pct,
+                            if sink.mute { " (opening…)" } else { "" }
+                        ))
+                        .size(11.0)
+                        .color(theme.text_dim()),
+                    );
+                } else {
+                    // Hardware sinks: hard-cap at 100% (apps/tracks may boost).
+                    let mut vol = (sink.volume_pct as f32).min(100.0);
+                    if design::h_slider(ui, &theme, &mut vol, 0.0..=100.0, "Volume")
+                        .changed()
+                    {
+                        state.worker.send(Command::SetSinkVolume {
+                            name: sink.name.clone(),
+                            pct: vol.clamp(0.0, 100.0) as u32,
+                        });
+                    }
+                }
+                if !is_shadow {
+                    draw_device_clock_panel(ui, state, &sink, false);
+                }
+            });
+            ui.add_space(6.0);
+        }
+    });
+}
+
+pub fn draw_input_devices(ui: &mut egui::Ui, state: &mut AppState) {
+    let theme = state.theme;
+    design::section_label(ui, &theme, "INPUT DEVICES — sources");
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut state.show_hidden_recording, "Show hidden");
+    });
+    ui.add_space(4.0);
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let sources: Vec<_> = state
+            .snapshot
+            .sources
+            .iter()
+            .filter(|s| {
+                if state.show_hidden_recording {
+                    return true;
+                }
+                !s.name.starts_with("buschain_")
+            })
+            .cloned()
+            .collect();
+        for src in sources {
+            design::panel(ui, &theme, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(&src.description)
+                                .size(13.0)
+                                .strong()
+                                .color(theme.text()),
+                        );
+                        ui.label(
+                            RichText::new(&src.name)
+                                .size(10.0)
+                                .monospace()
+                                .color(theme.text_muted()),
+                        );
+                    });
+                    let is_def_src = state.snapshot.default_source.as_deref()
+                        == Some(src.name.as_str());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if design::button(ui, &theme, "System default", is_def_src).clicked() {
+                            state.snapshot.default_source = Some(src.name.clone());
+                            state
+                                .worker
+                                .send(Command::SetDefaultSource(src.name.clone()));
+                            state.status =
+                                format!("System default source → {}", src.description);
+                        }
+                        let mut mute = src.mute;
+                        if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
+                            .changed()
+                        {
+                            state.worker.send(Command::SetSourceMute {
+                                name: src.name.clone(),
+                                mute,
+                            });
+                        }
+                    });
+                });
+                let mut vol = (src.volume_pct as f32).min(100.0);
+                if design::h_slider(ui, &theme, &mut vol, 0.0..=100.0, "Volume")
+                    .changed()
+                {
+                    state.worker.send(Command::SetSourceVolume {
+                        name: src.name.clone(),
+                        pct: vol.clamp(0.0, 100.0) as u32,
+                    });
+                }
+                if !src.name.starts_with("buschain_") {
+                    draw_device_clock_panel(ui, state, &src, true);
+                }
+            });
+            ui.add_space(6.0);
+        }
+    });
+}

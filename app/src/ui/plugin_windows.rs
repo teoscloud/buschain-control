@@ -1,0 +1,179 @@
+//! In-app plugin editor windows (never separate OS/viewport instances).
+//! Multiple editors may be open; order is oldest → newest. Esc closes newest.
+
+use egui::{Align2, Key, Vec2};
+use uuid::Uuid;
+
+use crate::app_state::AppState;
+use crate::audio::plugin::ui_spec_for_ref;
+use crate::ui::mixer::draw_plugin_params;
+
+/// Preferred window size so content fits without scroll/resize (per plugin UI).
+fn preferred_size(label: &str) -> Vec2 {
+    match label {
+        "buschain_eq8" => Vec2::new(520.0, 560.0),
+        "buschain_softclip" => Vec2::new(480.0, 420.0),
+        "buschain_overdrive" => Vec2::new(520.0, 480.0),
+        "buschain_denoiser" => Vec2::new(560.0, 520.0),
+        "buschain_pitch" => Vec2::new(420.0, 320.0),
+        "buschain_gate" => Vec2::new(420.0, 360.0),
+        "buschain_compressor" | "buschain_limiter" => Vec2::new(480.0, 420.0),
+        _ => Vec2::new(480.0, 400.0),
+    }
+}
+
+/// Draw every open plugin editor as an egui `Window` inside the main app.
+pub fn draw_plugin_windows(ctx: &egui::Context, state: &mut AppState) {
+    let keys: Vec<(Uuid, Uuid)> = state
+        .plugin_windows
+        .iter()
+        .map(|w| (w.track_id, w.slot_id))
+        .collect();
+
+    let mut close: Vec<(Uuid, Uuid)> = Vec::new();
+    let mut toggle_fs: Option<(Uuid, Uuid)> = None;
+    let mut focus: Option<(Uuid, Uuid)> = None;
+
+    // Esc closes the latest-selected editor (vec end), not all of them.
+    let esc = !keys.is_empty()
+        && !ctx.wants_keyboard_input()
+        && ctx.input(|i| i.key_pressed(Key::Escape));
+    if esc {
+        if let Some(&(tid, sid)) = keys.last() {
+            close.push((tid, sid));
+        }
+    }
+
+    for (stack_idx, (track_id, slot_id)) in keys.into_iter().enumerate() {
+        if close.iter().any(|(t, s)| *t == track_id && *s == slot_id) {
+            continue;
+        }
+        let Some(win_idx) = state
+            .plugin_windows
+            .iter()
+            .position(|w| w.track_id == track_id && w.slot_id == slot_id)
+        else {
+            continue;
+        };
+        let fullscreen = state.plugin_windows[win_idx].fullscreen;
+
+        let Some((track_idx, insert_idx)) = state.find_insert(track_id, slot_id) else {
+            close.push((track_id, slot_id));
+            continue;
+        };
+
+        let (title, label) = {
+            let plug = &state.session.tracks[track_idx].inserts[insert_idx];
+            let name = ui_spec_for_ref(plug)
+                .map(|s| s.title.to_string())
+                .unwrap_or_else(|| plug.id.id.clone());
+            let label = ui_spec_for_ref(plug)
+                .map(|s| s.label.to_string())
+                .unwrap_or_else(|| plug.id.id.clone());
+            let track_name = state.session.tracks[track_idx].name.clone();
+            (format!("{name} — {track_name}"), label)
+        };
+
+        let want = preferred_size(&label);
+        // Unique id per open so egui doesn't restore a tiny previous size.
+        let open_gen = state.plugin_windows[win_idx].open_gen;
+        let id = egui::Id::new(("buschain_plugin_win", track_id, slot_id, open_gen));
+        let mut open = true;
+        let cascade = stack_idx as f32 * 28.0;
+
+        let mut win = egui::Window::new(&title)
+            .id(id)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(!fullscreen)
+            .default_size(want)
+            .min_size(want)
+            .default_pos([72.0 + cascade, 72.0 + cascade])
+            .hscroll(false)
+            .vscroll(false);
+
+        if fullscreen {
+            let screen = ctx.screen_rect();
+            win = win
+                .anchor(Align2::LEFT_TOP, [0.0, 0.0])
+                .fixed_size(screen.size())
+                .constrain(true);
+        } else {
+            win = win.constrain(true);
+        }
+
+        let mut interacted = false;
+        let fs_clicked = win
+            .show(ctx, |ui| {
+                // No "PLUGIN" chrome — content starts with the plugin's own header
+                // (e.g. PARAMETRIC EQ). Size to preferred so nothing is clipped.
+                ui.set_min_size(want);
+                let mut fs = false;
+                if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Enter)) {
+                    fs = true;
+                }
+                // Click / drag inside marks this editor as latest-selected.
+                if ui.input(|i| i.pointer.any_pressed() || i.pointer.any_down())
+                    && ui.ui_contains_pointer()
+                {
+                    interacted = true;
+                }
+                if let Some((ti, ii)) = state.find_insert(track_id, slot_id) {
+                    draw_plugin_params(ui, state, ti, ii);
+                }
+                ui.allocate_space(ui.available_size_before_wrap());
+                fs
+            })
+            .map(|r| {
+                if r.response.clicked()
+                    || r.response.drag_started()
+                    || r.response.has_focus()
+                    || r.response.gained_focus()
+                {
+                    interacted = true;
+                }
+                r.inner.unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        if interacted {
+            focus = Some((track_id, slot_id));
+        }
+        if fs_clicked {
+            toggle_fs = Some((track_id, slot_id));
+        }
+        if !open {
+            close.push((track_id, slot_id));
+        }
+    }
+
+    for (tid, sid) in close {
+        state.close_plugin_window(tid, sid);
+    }
+    if let Some((tid, sid)) = focus {
+        // Only bump if still open (not closed this frame).
+        if state
+            .plugin_windows
+            .iter()
+            .any(|w| w.track_id == tid && w.slot_id == sid)
+        {
+            state.focus_plugin_window(tid, sid);
+        }
+    }
+    if let Some((tid, sid)) = toggle_fs {
+        state.toggle_plugin_fullscreen(tid, sid);
+    }
+}
+
+/// Drop windows whose inserts/tracks no longer exist.
+pub fn prune_plugin_windows(state: &mut AppState) {
+    let stale: Vec<(Uuid, Uuid)> = state
+        .plugin_windows
+        .iter()
+        .filter(|w| state.find_insert(w.track_id, w.slot_id).is_none())
+        .map(|w| (w.track_id, w.slot_id))
+        .collect();
+    for (tid, sid) in stale {
+        state.close_plugin_window(tid, sid);
+    }
+}

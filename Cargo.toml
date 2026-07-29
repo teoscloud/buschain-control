@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["app", "engine", "control"]
+default-members = ["app", "control"]
+
+[profile.release]
+lto = true
+codegen-units = 1
