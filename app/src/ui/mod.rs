@@ -145,39 +145,47 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
 fn draw_graph_loading_overlay(ctx: &egui::Context, state: &AppState) {
     let theme = state.theme;
     let screen = ctx.screen_rect();
-    egui::Area::new(egui::Id::new("graph_loading_overlay"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(screen.min)
+    // Paint dimmer on a layer — never allocate full-screen in an Area (that
+    // grew the viewport on startup and left a blank band under the mixer).
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("graph_loading_dim"),
+    ));
+    painter.rect_filled(
+        screen,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(12, 14, 18, 200),
+    );
+    let msg = if state.status.starts_with("Loading audio graph") {
+        state.status.as_str()
+    } else {
+        "Loading audio graph — starting FX racks…"
+    };
+    egui::Window::new("graph_loading_msg")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgba_unmultiplied(22, 26, 34, 240))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(20, 16))
+                .stroke(egui::Stroke::new(1.0_f32, theme.border_soft())),
+        )
         .show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::hover());
-            let painter = ui.painter();
-            painter.rect_filled(
-                rect,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(12, 14, 18, 200),
+            ui.set_max_width(420.0);
+            ui.label(
+                egui::RichText::new(msg)
+                    .size(15.0)
+                    .color(theme.text()),
             );
-            let msg = if state.status.starts_with("Loading audio graph") {
-                state.status.as_str()
-            } else {
-                "Loading audio graph — starting FX racks…"
-            };
-            let galley = painter.layout_no_wrap(
-                msg.to_string(),
-                egui::FontId::proportional(16.0),
-                theme.text(),
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("App is awake — PipeWire helpers can take a few seconds.")
+                    .size(12.0)
+                    .color(theme.text_muted()),
             );
-            let pos = rect.center() - galley.size() * 0.5;
-            painter.galley(pos, galley, theme.text());
-            let sub = painter.layout_no_wrap(
-                "App is awake — PipeWire helpers can take a few seconds.".to_string(),
-                egui::FontId::proportional(12.0),
-                theme.text_muted(),
-            );
-            let sub_pos = egui::pos2(
-                rect.center().x - sub.size().x * 0.5,
-                pos.y + 28.0,
-            );
-            painter.galley(sub_pos, sub, theme.text_muted());
         });
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
 }

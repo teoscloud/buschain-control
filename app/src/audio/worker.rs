@@ -23,6 +23,50 @@ struct FxEnsureDone {
     result: Result<String, String>,
 }
 
+/// After structural ensure: take rack order/membership from the job snapshot,
+/// overlay fresher mix/bypass/params already patched into `last_session`.
+fn merge_ensure_track(
+    last_session: &mut Option<Session>,
+    done: &Session,
+    track_id: uuid::Uuid,
+) {
+    let Some(from_t) = done.tracks.iter().find(|t| t.id == track_id) else {
+        return;
+    };
+    let Some(into) = last_session.as_mut() else {
+        *last_session = Some(done.clone());
+        return;
+    };
+    let fresher: HashMap<uuid::Uuid, crate::audio::plugin::PluginRef> = into
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .map(|t| t.inserts.iter().map(|p| (p.slot_id, p.clone())).collect())
+        .unwrap_or_default();
+    if let Some(into_t) = into.tracks.iter_mut().find(|t| t.id == track_id) {
+        into_t.inserts = from_t
+            .inserts
+            .iter()
+            .map(|p| {
+                if let Some(old) = fresher.get(&p.slot_id) {
+                    let mut m = p.clone();
+                    m.params = old.params.clone();
+                    m.mix = old.mix;
+                    m.bypass = old.bypass;
+                    m
+                } else {
+                    p.clone()
+                }
+            })
+            .collect();
+        if from_t.sink_name.is_some() {
+            into_t.sink_name = from_t.sink_name.clone();
+        }
+    } else {
+        into.tracks.push(from_t.clone());
+    }
+}
+
 fn spawn_fx_ensure_thread(job_rx: Receiver<FxEnsureJob>, done_tx: Sender<FxEnsureDone>) {
     thread::Builder::new()
         .name("buschain-fx-ensure".into())
@@ -500,6 +544,65 @@ fn sync_engine_clock(session: &Session) {
     crate::audio::engine_handle::sync_profile(&session.performance);
 }
 
+/// Quiet Props retry after rebuild/topology defer (no UI status spam).
+struct PropsRetry {
+    inserts: Vec<buschain_engine::InsertSlot>,
+    after: Instant,
+    attempts: u8,
+}
+
+fn flush_props_retries(props_retry: &mut HashMap<String, PropsRetry>) {
+    let due: Vec<String> = props_retry
+        .iter()
+        .filter(|(_, r)| Instant::now() >= r.after)
+        .map(|(b, _)| b.clone())
+        .collect();
+    for bus in due {
+        let Some(retry) = props_retry.remove(&bus) else {
+            continue;
+        };
+        match crate::audio::insert_map::push_bus_controls(&bus, retry.inserts.clone()) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let deferred = msg.contains("rebuilding")
+                    || msg.contains("props deferred")
+                    || msg.contains("not found");
+                if deferred && retry.attempts < 8 {
+                    props_retry.insert(
+                        bus,
+                        PropsRetry {
+                            inserts: retry.inserts,
+                            after: Instant::now()
+                                + Duration::from_millis(120 + u64::from(retry.attempts) * 40),
+                            attempts: retry.attempts + 1,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn schedule_props_retry(
+    props_retry: &mut HashMap<String, PropsRetry>,
+    bus: String,
+    inserts: Vec<buschain_engine::InsertSlot>,
+) {
+    let attempts = props_retry.get(&bus).map(|r| r.attempts).unwrap_or(0);
+    if attempts >= 8 {
+        return;
+    }
+    props_retry.insert(
+        bus,
+        PropsRetry {
+            inserts,
+            after: Instant::now() + Duration::from_millis(120 + u64::from(attempts) * 40),
+            attempts: attempts + 1,
+        },
+    );
+}
+
 fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let mut fx = FilterChainRuntime::new();
     // Last session seen by the worker — used for idle GraphSupervisor ticks.
@@ -509,6 +612,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let mut last_cmd_at = Instant::now();
     // Buses currently mixer-muted — volume drags skip the heavy gate path.
     let mut muted_buses: HashMap<String, bool> = HashMap::new();
+    let mut props_retry: HashMap<String, PropsRetry> = HashMap::new();
     let (fx_job_tx, fx_job_rx) = mpsc::channel::<FxEnsureJob>();
     let (fx_done_tx, fx_done_rx) = mpsc::channel::<FxEnsureDone>();
     spawn_fx_ensure_thread(fx_job_rx, fx_done_tx);
@@ -531,6 +635,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
 
     loop {
+        flush_props_retries(&mut props_retry);
         // Drain completed async FX ensures (Props kept running while they worked).
         while let Ok(done) = fx_done_rx.try_recv() {
             let total = done.queued_at.elapsed().as_millis();
@@ -548,12 +653,42 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
             match done.result {
                 Ok(message) => {
                     fx_auto_retried.remove(&done.track_id);
-                    last_session = Some(done.session.clone());
-                    // Push knobs once rebuild gate settles — recovers from deferred Props.
-                    let _ = crate::audio::insert_map::push_track_controls(
+                    // Adopt Done topology for this track, keep fresher knobs/power
+                    // already patched into last_session during the ensure window.
+                    // Wholesale replace used to revive stale Bypass/knobs (and wipe
+                    // other tracks' in-flight Props).
+                    merge_ensure_track(
+                        &mut last_session,
                         &done.session,
                         done.track_id,
                     );
+                    let push_ok = if let Some(cur) = last_session.as_ref() {
+                        crate::audio::insert_map::push_track_controls(cur, done.track_id)
+                    } else {
+                        crate::audio::insert_map::push_track_controls(
+                            &done.session,
+                            done.track_id,
+                        )
+                    };
+                    if push_ok.is_ok() {
+                        if let Some(t) = done.session.tracks.iter().find(|t| t.id == done.track_id)
+                        {
+                            props_retry.remove(&t.expected_sink_name());
+                        }
+                    } else if let Some((bus, inserts)) = last_session
+                        .as_ref()
+                        .and_then(|s| {
+                            crate::audio::insert_map::ladspa_slots_for(s, done.track_id)
+                        })
+                        .or_else(|| {
+                            crate::audio::insert_map::ladspa_slots_for(
+                                &done.session,
+                                done.track_id,
+                            )
+                        })
+                    {
+                        schedule_props_retry(&mut props_retry, bus, inserts);
+                    }
                     let _ = tx.send(Event::SessionApplied {
                         session: done.session,
                         message,
@@ -592,6 +727,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                         &mut fx,
                         &mut last_session,
                         &mut muted_buses,
+                        &mut props_retry,
                         &tx,
                         &fx_job_tx,
                     ) {
@@ -617,7 +753,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                             }
                             let batch = coalesce_commands(batch);
                             last_cmd_at = Instant::now();
-                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &tx, &fx_job_tx) {
+                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
                                 return;
                             }
                             continue;
@@ -636,7 +772,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                                 }
                                 let batch = coalesce_commands(batch);
                                 last_cmd_at = Instant::now();
-                                if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &tx, &fx_job_tx)
+                                if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx)
                                 {
                                     return;
                                 }
@@ -657,7 +793,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                             }
                             let batch = coalesce_commands(batch);
                             last_cmd_at = Instant::now();
-                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &tx, &fx_job_tx) {
+                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
                                 return;
                             }
                             continue;
@@ -683,7 +819,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                         }
                         let batch = coalesce_commands(batch);
                         last_cmd_at = Instant::now();
-                        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &tx, &fx_job_tx) {
+                        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
                             return;
                         }
                         continue;
@@ -701,7 +837,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
         }
         let batch = coalesce_commands(batch);
         last_cmd_at = Instant::now();
-        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &tx, &fx_job_tx) {
+        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
             return;
         }
     }
@@ -713,6 +849,7 @@ fn process_command_batch(
     mut fx: &mut FilterChainRuntime,
     last_session: &mut Option<Session>,
     muted_buses: &mut HashMap<String, bool>,
+    props_retry: &mut HashMap<String, PropsRetry>,
     tx: &Sender<Event>,
     fx_job_tx: &Sender<FxEnsureJob>,
 ) -> bool {
@@ -914,17 +1051,22 @@ fn process_command_batch(
                     }
                     // Hot path: no status spam on success (UI/layout cost every tick).
                     // Lock-free of Engine ForceRespawn (see engine_handle::push_fx_controls).
-                    let r = crate::audio::insert_map::push_bus_controls(&bus, inserts);
+                    let r = crate::audio::insert_map::push_bus_controls(&bus, inserts.clone());
                     match r {
-                        Ok(_) => span.end_ok(),
+                        Ok(_) => {
+                            props_retry.remove(&bus);
+                            span.end_ok();
+                        }
                         Err(e) => {
                             let msg = format!("{e:#}");
                             span.end(format!("skip {msg}"));
-                            // Rebuild / A/B miss — keep wet cache; do not storm status/retries.
+                            // Rebuild / A/B / topology miss — quiet retry, no status spam.
                             let deferred = msg.contains("rebuilding")
                                 || msg.contains("props deferred")
                                 || msg.contains("not found");
-                            if !deferred {
+                            if deferred {
+                                schedule_props_retry(props_retry, bus, inserts);
+                            } else {
                                 crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
                                 let _ = tx.send(Event::Status(format!(
                                     "Live params skipped ({msg})"
@@ -935,21 +1077,32 @@ fn process_command_batch(
                 }
                 Command::PushFxParams { session, track_id } => {
                     *last_session = Some(session.clone());
-                    if let Err(e) =
-                        crate::audio::insert_map::push_track_controls(&session, track_id)
-                    {
-                        let msg = format!("{e:#}");
-                        let deferred = msg.contains("rebuilding")
-                            || msg.contains("props deferred")
-                            || msg.contains("not found");
-                        if !deferred {
+                    match crate::audio::insert_map::push_track_controls(&session, track_id) {
+                        Ok(_) => {
                             if let Some(t) = session.tracks.iter().find(|t| t.id == track_id) {
-                                let bus = t.expected_sink_name();
-                                crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
+                                props_retry.remove(&t.expected_sink_name());
                             }
-                            let _ = tx.send(Event::Status(format!(
-                                "Live params skipped ({msg})"
-                            )));
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            let deferred = msg.contains("rebuilding")
+                                || msg.contains("props deferred")
+                                || msg.contains("not found");
+                            if deferred {
+                                if let Some((bus, inserts)) =
+                                    crate::audio::insert_map::ladspa_slots_for(&session, track_id)
+                                {
+                                    schedule_props_retry(props_retry, bus, inserts);
+                                }
+                            } else {
+                                if let Some(t) = session.tracks.iter().find(|t| t.id == track_id) {
+                                    let bus = t.expected_sink_name();
+                                    crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
+                                }
+                                let _ = tx.send(Event::Status(format!(
+                                    "Live params skipped ({msg})"
+                                )));
+                            }
                         }
                     }
                 }

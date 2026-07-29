@@ -572,10 +572,15 @@ pub fn push_insert_controls(fx_name: &str, inserts: &[InsertSlot]) -> Result<()>
     // Props are index-mapped (`n0`, `n1`, …). If Desired order/count ≠ live `.sig`,
     // a remove/reorder push onto the old gen briefly writes the next plugin's
     // Bypass=0 onto the removed (often powered-off) slot — audible until cutover.
+    // Missing `.sig` is also defer — orphan helpers must not accept indexed Props.
     let want = inserts_signature(inserts);
-    if let Some(have) = read_signature(fx_name) {
-        if have != want {
+    match read_signature(fx_name) {
+        Some(have) if have == want => {}
+        Some(_) => {
             return Err(anyhow!("FX topology mismatch — props deferred"));
+        }
+        None => {
+            return Err(anyhow!("FX signature missing — props deferred"));
         }
     }
     let span = crate::fx_trace::span("PushFxControls");
@@ -645,28 +650,13 @@ fn spawn_pipewire_conf(
     let _ = set_sink_volume(post_name, 100);
     let _ = set_sink_mute(post_name, false);
 
-    // Post can be SUSPENDED until the first out-stream lands — give it time.
-    // Keep this short: worker HOL behind a 4s poll is what made knobs feel dead.
-    let deadline = std::time::Instant::now() + Duration::from_millis(800);
-    let mut next_nudge = std::time::Instant::now();
-    // One invalidate after stop — do NOT clear every loop (pactl stampede → 400ms timeouts).
+    // Prefer process liveness over pactl/pw-link polls (those timeout ~400ms and
+    // stretched every spawn to 500–800ms under launch load).
+    let t_spawned = std::time::Instant::now();
+    let deadline = t_spawned + Duration::from_millis(350);
+    let mut next_nudge = t_spawned;
     super::cli::invalidate_probe_caches();
     while std::time::Instant::now() < deadline {
-        if sink_exists(fx_name) {
-            let _ = set_sink_volume(fx_name, 100);
-            let _ = set_sink_mute(fx_name, false);
-            if sink_has_input(post_name)
-                || super::link::link_is_live(&format!("{fx_name}_out"), post_name)
-            {
-                warm_node_id_cache(fx_name);
-                super::cli::invalidate_probe_caches();
-                return Ok(());
-            }
-            if std::time::Instant::now() >= next_nudge {
-                let _ = nudge_fx_out_to_post(fx_name, post_name);
-                next_nudge = std::time::Instant::now() + Duration::from_millis(150);
-            }
-        }
         if let Some((_, child)) = runtime.children.iter_mut().find(|(n, _)| n == fx_name) {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -681,7 +671,19 @@ fn spawn_pipewire_conf(
                 Err(e) => return Err(anyhow!("filter-chain wait: {e}")),
             }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        // Child alive ≥80ms: accept — out→post nudge is best-effort.
+        if runtime.owns_live(fx_name) && t_spawned.elapsed() >= Duration::from_millis(80) {
+            let _ = set_sink_volume(fx_name, 100);
+            let _ = set_sink_mute(fx_name, false);
+            let _ = nudge_fx_out_to_post(fx_name, post_name);
+            warm_node_id_cache(fx_name);
+            return Ok(());
+        }
+        if std::time::Instant::now() >= next_nudge {
+            let _ = nudge_fx_out_to_post(fx_name, post_name);
+            next_nudge = std::time::Instant::now() + Duration::from_millis(120);
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
 
     let log = fs::read_to_string(&log_path).unwrap_or_default();

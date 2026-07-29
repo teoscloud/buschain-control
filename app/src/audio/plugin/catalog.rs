@@ -1101,3 +1101,35 @@ static SPECS: &[PluginUiSpec] = &[
         params: GATE,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_catalog_plugin_has_power_port() {
+        // Insert power only writes Bypass/Enable — missing ports = silent no-op
+        // (the buschain_eq8 regression). Keep both accepted (gate uses Enable).
+        for spec in SPECS {
+            let has_power = spec
+                .params
+                .iter()
+                .any(|p| p.key == "Bypass" || p.key == "Enable");
+            assert!(
+                has_power,
+                "{} ({}) has no Bypass/Enable port — power toggle will no-op",
+                spec.title, spec.label
+            );
+        }
+    }
+
+    #[test]
+    fn known_labels_match_specs() {
+        for label in KNOWN_LABELS {
+            assert!(
+                ui_spec_for(label).is_some(),
+                "KNOWN_LABELS entry `{label}` missing from SPECS"
+            );
+        }
+    }
+}

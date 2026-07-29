@@ -25,7 +25,7 @@ use crate::fx_gen::{
     staging_fx, staging_pair, staging_post,
 };
 use crate::pipeline::arm::{
-    arm_track_egress, arm_track_egress_soft_cutover, arm_wet_ab_cutover, disarm_track_egress_ex,
+    arm_track_egress, arm_wet_ab_cutover, disarm_track_egress_ex,
     spine_instant_ready, wait_spine_stable, WET_DWELL,
 };
 
@@ -513,7 +513,10 @@ fn ensure_cold_respawn(
 
     if arm_egress && !dest.is_empty() {
         let dests = vec![dest.clone()];
-        if let Err(e) = arm_track_egress_soft_cutover(backend, bus, &dests) {
+        let t_arm = std::time::Instant::now();
+        // RebuildSilence gates the bus monitor — dry cork isn't audible, so the
+        // soft-cutover poll loop (8× link_is_live @ ~400ms) is pure waste here.
+        if let Err(e) = arm_track_egress(backend, bus, true, &dests) {
             runtime.mark_spawn_failed(&fx_name);
             if !runtime.owns_live(&fx_name) {
                 let _ = restore_dry(backend, runtime, &plan, true);
@@ -523,18 +526,7 @@ fn ensure_cold_respawn(
                 "post→dest arm failed — restored dry: {e:#}"
             )));
         }
-        let link_wet = link_is_live(&plan.post_monitor(), dest.as_str())
-            && spine_named(runtime, &from, &fx_name, &post_name);
-        if !path_audible(&plan, true) && !link_wet {
-            runtime.mark_spawn_failed(&fx_name);
-            if !runtime.owns_live(&fx_name) {
-                let _ = restore_dry(backend, runtime, &plan, true);
-            }
-            ensure_span.end(format!("audible FAIL {fx_name}"));
-            return Ok(ChainState::Failed(
-                "exclusive wet arm failed — restored dry".into(),
-            ));
-        }
+        crate::fx_trace::log("ForceRespawn.arm", &fx_name, t_arm.elapsed().as_millis());
     }
 
     let _ = fx_out;
@@ -569,17 +561,19 @@ pub fn ensure_fx_chain(
 
     ensure_post_bus(backend, &fx_clock, &plan)?;
 
-    // Signature may live on either A/B generation after a warm cutover.
-    let sig_ok = [&fx_name, &canonical_fx(bus), &staging_fx(bus)]
-        .into_iter()
-        .any(|fx| {
-            (runtime.owns_live(fx) || sink_exists(fx))
-                && read_signature(fx).as_deref() == Some(want_sig.as_str())
-        });
+    // Live generation only — a stale other-gen `.sig` must not skip ForceRespawn.
+    let sig_ok = (runtime.owns_live(&fx_name) || sink_exists(&fx_name))
+        && sink_exists(plan.post_sink.as_str())
+        && read_signature(&fx_name).as_deref() == Some(want_sig.as_str());
     let audible = path_audible(&plan, arm_egress);
-    // Spine without post→dest still counts as wet helper for Probe/Idempotent —
-    // egress re-arm is reconcile's job. Avoids false Failed → dry bypass on every track.
-    let helper_wet = sig_ok && (audible || spine_instant_ready(bus));
+    // Probe/Idempotent: matching `.sig` + fx/post sinks is enough — audible/spine
+    // probes false-negative under launch load and forced cold respawn of every
+    // track. Egress re-arm stays reconcile's job. ForceRespawn still requires
+    // a real spine/audible check (or owns_live soft-accept inside cold/A/B).
+    let helper_wet = sig_ok
+        && (audible
+            || spine_instant_ready(bus)
+            || mode != ChainEnsureMode::ForceRespawn);
 
     if mode == ChainEnsureMode::ProbeOnly {
         if helper_wet {

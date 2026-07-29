@@ -923,21 +923,19 @@ impl Engine {
                 if spec.inserts.is_empty() {
                     return false;
                 }
-                if !pipeline::arm::spine_instant_ready(bus) {
-                    return false;
-                }
-                // Signature on whichever generation is live (canonical or `__stg`).
+                // Warm adopt: matching live `.sig` + helper/post sinks present.
+                // Do NOT require spine_instant_ready — at UI restart that probe
+                // false-negatives under pactl load and forced ForceRespawn of
+                // every track (~10s each) while audio was already left running.
                 let want = spec.signature();
-                let sig_ok = [&live_fx_name(bus), &fx_name_for_bus(bus), &crate::fx_gen::staging_fx(bus)]
-                    .into_iter()
-                    .any(|fx| read_signature(fx).as_deref() == Some(want.as_str()));
-                if !sig_ok {
+                let live = live_fx_name(bus);
+                let post = live_post_name(bus);
+                let sig_ok = read_signature(&live).as_deref() == Some(want.as_str());
+                if !sig_ok || !sink_exists(&live) || !sink_exists(&post) {
                     return false;
                 }
-                // Spines + signatures are enough for warm adopt. Missing post→dest
-                // (common after UI restart) must NOT force ForceRespawn — that left
-                // meters alive on hold for a minute while every FX helper respawned.
-                // adopt_live_session / reconcile_master re-arms egress link-only.
+                // Missing post→dest must NOT force ForceRespawn — adopt re-arms
+                // egress link-only (meters via hold; audio resumes quickly).
                 if bus == "buschain_master" {
                     if hw.is_empty() {
                         return false;

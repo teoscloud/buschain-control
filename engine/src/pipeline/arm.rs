@@ -212,17 +212,13 @@ pub fn arm_track_egress_soft_cutover(
         backend.ensure_link_raw(&post_mon, d)?;
     }
 
-    // Drop dry only after post→dest sticks (brief poll — don't HOL the worker).
+    // Drop dry after one cheap check — never 8× link_is_live (each can burn
+    // CLI_TIMEOUT under load and made ForceRespawn look like ~10s "wet").
     for d in dests {
         if d.is_empty() {
             continue;
         }
-        for _ in 0..8 {
-            if link_is_live(&post_mon, d) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        let _ = link_is_live(&post_mon, d);
         let _ = backend.unlink_raw(&from, d);
     }
     let _ = backend.unlink_from_source_except(&from, &[fx.as_str(), "buschain_hold"]);
@@ -264,12 +260,8 @@ pub fn arm_wet_ab_cutover(
         if d.is_empty() {
             continue;
         }
-        for _ in 0..8 {
-            if link_is_live(&new_mon, d) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        // One probe max — A/B already muted the new post before linking.
+        let _ = link_is_live(&new_mon, d);
         // Drop old first while new is still muted — exclusive cutover.
         let _ = backend.unlink_raw(&old_mon, d);
     }

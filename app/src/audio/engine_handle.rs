@@ -144,20 +144,16 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             }
             eng.desired_mut().set_bus_egress(&bus, dests.clone());
 
-            if let Some(spec) =
-                crate::audio::insert_map::chain_spec_for_track(session, track.id, hw_sink)
-            {
+            if let Some(mut spec) = crate::audio::insert_map::chain_spec_for_track(
+                session,
+                track.id,
+                &crate::audio::insert_map::primary_fx_dest(session, track.id, hw_sink),
+            ) {
                 if !spec.inserts.is_empty() {
-                    let dest = if track.kind.is_master() {
-                        hw_sink.to_string()
-                    } else {
-                        dests
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "buschain_master".into())
-                    };
-                    let mut spec = spec;
-                    spec.dest = dest;
+                    // Dest already set by primary_fx_dest; keep in lockstep with egress.
+                    if let Some(d) = dests.first() {
+                        spec.dest = d.clone();
+                    }
                     eng.desired_mut().ensure_fx_chain(spec);
                 }
             }
@@ -223,6 +219,11 @@ pub fn arm_session(session: &Session, hw_sink: &str, force_fx: bool) -> anyhow::
 /// that is what made every track "skip" plugins after A/B.
 pub fn arm_track_egress(bus: &str, wet: bool) -> anyhow::Result<()> {
     with_engine(|eng| {
+        // Master→HW stays behind the session barrier (ensure_fx_chain already
+        // honors this; rewire_track_fx must not punch through).
+        if bus == "buschain_master" && !eng.desired().speakers_armed {
+            return Ok(());
+        }
         let dests = eng.desired().egress_dests(bus);
         if wet {
             let helper = buschain_engine::any_gen_live(bus) || eng.chain_is_wet(bus);

@@ -1749,14 +1749,17 @@ pub fn apply_session(
     let mut fx_count = 0u32;
     let mut warnings: Vec<String> = Vec::new();
 
-    // Full: input/keepalive only — ArmSession owns FX spawn + sealed egress.
+    // Full: light prepare only — ArmSession owns FX + egress. The old path called
+    // rewire_track_route → fx_path_audible (engine + pw-link storms) per track and
+    // burned ~minute before the first ForceRespawn log line appeared.
+    crate::audio::engine_handle::sync_desired_from_session(session, &hw_sink);
+
     // Hotplug/Route: links + Props only — NEVER ForceRespawn (that starved knobs
     // whenever wet probes flapped). Structural FX = RewireTrackFx / ClockBind.
     // ClockBind: ForceRespawn every insert rack so FX/post match the new GraphClock.
     for id in ids {
         let result = match kind {
-            ApplyKind::Full => rewire_track_route(session, id, &hw_sink, false)
-                .map(|m| (false, m)),
+            ApplyKind::Full => prepare_track_for_arm(session, id).map(|m| (false, m)),
             ApplyKind::Hotplug => {
                 // Links + Props only — NEVER ForceRespawn (wet flaps stole minutes).
                 let msg = rewire_track_route(session, id, &hw_sink, false)?;
@@ -1802,11 +1805,13 @@ pub fn apply_session(
         }
     }
 
-    // Full Apply: warm-adopt when PW graph already matches session; else sealed cold arm.
+    // Full Apply: warm-adopt when PW graph already matches session; else sealed arm.
+    // force_fx=false → Idempotent (only rebuild tracks that aren't already wet).
+    // force_fx=true ForceRespawn'd every rack on UI restart (~10s×N under CLI load).
     // Hotplug / ClockBind: supervisor repair (ClockBind ForceRespawns FX in the loop above).
     let supervisor = match kind {
         ApplyKind::Full => {
-            crate::audio::engine_handle::arm_session(session, &hw_sink, true)
+            crate::audio::engine_handle::arm_session(session, &hw_sink, false)
         }
         ApplyKind::Hotplug | ApplyKind::ClockBind => {
             crate::audio::engine_handle::reconcile(session, &hw_sink)
@@ -1860,6 +1865,34 @@ pub fn hotplug_track_fx(
     rewire_track_fx(session, fx, track_id)
 }
 
+/// Full-apply prepare: keepalive + input only — no wet probes / arm storms.
+fn prepare_track_for_arm(session: &mut Session, track_id: uuid::Uuid) -> Result<String> {
+    let (is_master, bus, input_source) = {
+        let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
+            return Err(anyhow!("track not found"));
+        };
+        let sources = list_sources().unwrap_or_default();
+        (
+            track.kind.is_master(),
+            track.expected_sink_name(),
+            resolve_input_source(track, &sources),
+        )
+    };
+    let _ = ensure_bus_keepalive(&bus);
+    if let Some(src) = &input_source {
+        if !is_master {
+            let _ = ensure_loopback(src, &bus, MONITOR_LATENCY_MS);
+        }
+    }
+    if let Some(t) = session.tracks.iter_mut().find(|t| t.id == track_id) {
+        t.sink_name = Some(bus.clone());
+        if let Some(src) = input_source {
+            t.input_source = Some(src);
+        }
+    }
+    Ok(format!("Prepare {bus}"))
+}
+
 /// Destination / input links.
 ///
 /// When `allow_fx_ensure` is false (caller already ran `rewire_track_fx`), this
@@ -1890,8 +1923,10 @@ pub fn rewire_track_route(
 
     // Helper alive (canonical or `__stg`) counts as FX present even if post→dest
     // briefly flaps — otherwise every track dry-bypassed plugins after A/B.
+    // Prefer any_gen_live / sink presence — never fx_path_audible here (that
+    // path holds the engine mutex + pw-link storms and made Hotplug feel dead).
     let helper_live = buschain_engine::any_gen_live(&bus);
-    let mut has_fx = !inserts.is_empty() && (fx_path_audible(&bus) || helper_live);
+    let mut has_fx = !inserts.is_empty() && helper_live;
     let mut warnings = Vec::new();
     // Route/Hotplug must never ForceRespawn — only RewireTrackFx / ClockBind.
     if allow_fx_ensure && !inserts.is_empty() && !has_fx {
@@ -2045,11 +2080,10 @@ pub fn rewire_track_fx(
         }
     }
 
-    let dest = if is_master {
-        hw_sink.clone()
-    } else {
-        master_name.to_string()
-    };
+    // Keep Desired egress in sync before cutover so multi-target / track→track
+    // racks arm the correct primary dest (not always Master).
+    crate::audio::engine_handle::sync_desired_from_session(session, &hw_sink);
+    let dest = crate::audio::insert_map::primary_fx_dest(session, track_id, &hw_sink);
 
     let mode = buschain_engine::ChainEnsureMode::ForceRespawn;
     let fx_result =
@@ -2057,6 +2091,7 @@ pub fn rewire_track_fx(
 
     // Always re-assert wet post→dest after ensure. Skipping Master used to leave
     // dry bus→HW after idle reconcile chased the wrong A/B generation.
+    // arm_track_egress honors speakers_armed for Master (session barrier).
     if is_master {
         crate::audio::engine_handle::remember_master_hw(&hw_sink);
     }

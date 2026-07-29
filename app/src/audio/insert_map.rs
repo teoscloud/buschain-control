@@ -107,6 +107,40 @@ pub fn controls_only_slots(track: &Track) -> Vec<InsertSlot> {
         .collect()
 }
 
+/// Primary wet egress for a track's FX chain (Master→HW or first output target).
+pub fn primary_fx_dest(session: &Session, track_id: uuid::Uuid, hw_sink: &str) -> String {
+    let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
+        return "buschain_master".into();
+    };
+    if track.kind.is_master() {
+        return hw_sink.to_string();
+    }
+    let master_id = session.master_id();
+    let bus = track.expected_sink_name();
+    let mut targets = track.output_targets.clone();
+    if targets.is_empty() || track.listen {
+        if let Some(mid) = master_id {
+            if !targets.contains(&mid) {
+                targets.push(mid);
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    for tid in targets {
+        if master_id == Some(tid) {
+            return "buschain_master".into();
+        }
+        if let Some(t) = session.tracks.iter().find(|t| t.id == tid) {
+            let dest = t.expected_sink_name();
+            if dest != bus {
+                return dest;
+            }
+        }
+    }
+    "buschain_master".into()
+}
+
 pub fn chain_spec_for_track(session: &Session, track_id: uuid::Uuid, dest: &str) -> Option<ChainSpec> {
     let track = session.tracks.iter().find(|t| t.id == track_id)?;
     let bus = track.expected_sink_name();

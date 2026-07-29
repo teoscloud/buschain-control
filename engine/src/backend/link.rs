@@ -223,8 +223,9 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
     // Prefer native links — remove any leftover Pulse loopback for this pair first.
     unload_legacy_loopback(source, sink);
 
+    // Two tries — 8× CLI_TIMEOUT under load made every ensure_link cost seconds.
     let mut last_err = None;
-    for _ in 0..8 {
+    for _ in 0..2 {
         match try_link(source, sink) {
             Ok(()) => {
                 if let Ok(mut g) = OWNED.lock() {
@@ -236,7 +237,7 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
             }
             Err(e) => last_err = Some(e),
         }
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
     // Fallback: Pulse module-loopback (reliable with null-sinks).

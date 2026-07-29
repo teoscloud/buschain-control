@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::backend::sink_exists;
+use crate::backend::{find_node_id_by_name, sink_exists};
 use crate::domain::{fx_name_for_bus, post_name_for_bus};
 
 #[derive(Clone)]
@@ -52,18 +52,33 @@ fn claimed_post(bus: &str) -> String {
         .unwrap_or_else(|| canonical_post(bus))
 }
 
+fn gen_present(fx: &str) -> bool {
+    // Node-id first — pactl short-sinks false-negatives under ForceRespawn storms
+    // used to flip live gen to the wrong A/B slot while the claimed helper was fine.
+    find_node_id_by_name(fx).is_some() || sink_exists(fx)
+}
+
 /// Heal pointer if claimed generation is gone but the other slot is alive.
 pub fn heal_live_gen(bus: &str) {
     let claimed = claimed_fx(bus);
-    if sink_exists(&claimed) {
+    let can = canonical_fx(bus);
+    let stg = staging_fx(bus);
+    // Never flip mid-rebuild — Props/heal racing A/B is what chased the dead gen.
+    if crate::fx_busy::is_rebuilding(&claimed)
+        || crate::fx_busy::is_rebuilding(&can)
+        || crate::fx_busy::is_rebuilding(&stg)
+    {
+        return;
+    }
+    if gen_present(&claimed) {
         return;
     }
     let (alt_fx, alt_post) = if is_staging_name(&claimed) {
-        (canonical_fx(bus), canonical_post(bus))
+        (can, canonical_post(bus))
     } else {
-        (staging_fx(bus), staging_post(bus))
+        (stg, staging_post(bus))
     };
-    if sink_exists(&alt_fx) {
+    if gen_present(&alt_fx) {
         set_live_gen(bus, &alt_fx, &alt_post);
         crate::fx_trace::log("AbHeal", &alt_fx, 0);
     }
