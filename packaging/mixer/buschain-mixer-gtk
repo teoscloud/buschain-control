@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Local / nix-develop launcher for the GTK layer-shell mixer.
+# Packaged installs use the wrapped binary from packaging/nix/gtk-mixer.nix instead.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$ROOT/legacy/buschain-mixer.py"
+CSS="$ROOT/legacy/style.css"
+
+if [[ ! -f "$PY" ]]; then
+  echo "buschain-mixer-gtk: missing $PY" >&2
+  exit 1
+fi
+
+export BUSCHAIN_CONTROL_MIXER_CSS="${BUSCHAIN_CONTROL_MIXER_CSS:-$CSS}"
+exec python3 "$PY" "$@"

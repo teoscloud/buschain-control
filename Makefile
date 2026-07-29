@@ -35,15 +35,15 @@ dev-shell:
 rebuild:
 	./scripts/dev rebuild
 
-# Default local path: single cargo run, in-process graph (instant knobs).
+# Default local path: plain cargo run (bootstraps plugins + ctl).
 daemon:
 	./scripts/dev daemon
 
 ui run:
-	./scripts/dev run
+	cargo run -p buschain-control
 
 ctl:
-	./scripts/dev ctl -- $(ARGS)
+	cargo run -p buschain-tools --bin buschain-ctl -- $(ARGS)
 
 mixer:
 	./scripts/dev mixer

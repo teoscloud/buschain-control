@@ -840,9 +840,8 @@ fn serve_loop(state: Arc<Mutex<DaemonState>>, listener: std::os::unix::net::Unix
             let snap = graph::refresh_snapshot();
             let mut g = state.lock().unwrap();
             g.snapshot = snap;
-            if g.cmds.is_embedded() {
-                g.session = Session::load();
-            }
+            // Embedded: UI owns the live session (commands update it). Reloading
+            // disk every tick fought unsaved edits and lagged behind toggles.
             g.soft_bind();
         }
 

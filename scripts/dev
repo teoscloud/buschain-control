@@ -1,28 +1,21 @@
 #!/usr/bin/env bash
-# Local BusChain Control development — one cargo run, no flake rebuild.
+# Thin wrapper — prefer plain `cargo run` from the repo root (nix develop).
 #
-#   ./scripts/dev              # stop leftover daemon → cargo run (in-process)
-#   ./scripts/dev --hidden     # same, start withdrawn to tray
-#   ./scripts/dev ui           # same
-#   ./scripts/dev daemon       # optional legacy headless daemon
-#   ./scripts/dev stop
+#   cargo run                 # tray + graph + IPC; builds plugins + buschain-ctl
+#   cargo run -- --hidden     # same, withdrawn to tray
+#   cargo ctl -- status       # alias → buschain-ctl
+#
+# This script remains for stop/shell/daemon helpers.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-export LADSPA_PATH="$ROOT/plugins/buschain-denoiser/build:$ROOT/plugins/buschain-gate/build:$ROOT/plugins/buschain-builtins/build:${LADSPA_PATH:-}"
-export LV2_PATH="$ROOT/plugins/buschain-denoiser/build:$ROOT/plugins/buschain-gate/build:$ROOT/plugins/buschain-builtins/build:${LV2_PATH:-}"
-export BUSCHAIN_CONTROL_DAEMON="${BUSCHAIN_CONTROL_DAEMON:-$CARGO_TARGET_DIR/debug/buschain-daemon}"
-export BUSCHAIN_CONTROL_CTL="${BUSCHAIN_CONTROL_CTL:-$CARGO_TARGET_DIR/debug/buschain-ctl}"
-export BUSCHAIN_CONTROL_MIXER="${BUSCHAIN_CONTROL_MIXER:-$ROOT/packaging/mixer/legacy/buschain-mixer.py}"
-export BUSCHAIN_CONTROL_MIXER_CSS="${BUSCHAIN_CONTROL_MIXER_CSS:-$ROOT/packaging/mixer/legacy/style.css}"
 export PATH="$CARGO_TARGET_DIR/debug:$PATH"
 
 SOCK="${XDG_RUNTIME_DIR:-/tmp}/buschain-control/daemon.sock"
 
-# Flags like --hidden belong to the app, not the script subcommand.
 if [[ "${1:-}" == -* ]]; then
   cmd="run"
 else
@@ -30,15 +23,7 @@ else
   shift || true
 fi
 
-stop_system_unit() {
-  if systemctl --user is-active --quiet buschain-control.service 2>/dev/null; then
-    echo "→ stopping leftover systemd buschain-control.service"
-    systemctl --user stop buschain-control.service || true
-  fi
-}
-
 kill_local_daemons() {
-  # Packaged + cargo headless daemons that would steal the socket.
   pkill -x buschain-daemon 2>/dev/null || true
   pkill -f '/buschain-daemon' 2>/dev/null || true
   pkill -f 'target/.*/buschain-daemon' 2>/dev/null || true
@@ -46,33 +31,15 @@ kill_local_daemons() {
   rm -f "$SOCK"
 }
 
-ensure_plugins() {
-  if [[ ! -f plugins/buschain-builtins/build/buschain_builtins.so ]] \
-    && [[ ! -f plugins/buschain-denoiser/build/buschain_denoiser.so ]]; then
-    echo "→ building LADSPA plugins"
-    make -C "$ROOT" plugins
-  fi
-}
-
 case "$cmd" in
   shell|nix)
     exec nix develop "$ROOT" -c "$SHELL"
     ;;
   rebuild|build)
-    ensure_plugins
-    cargo build -p buschain-control -p buschain-tools
+    make -C "$ROOT" plugins
+    exec cargo build -p buschain-control -p buschain-tools
     ;;
   run|ui|app|"")
-    # One process: UI + audio worker + embedded IPC (matches production).
-    stop_system_unit
-    kill_local_daemons
-    ensure_plugins
-    if [[ -S "$SOCK" ]] || pgrep -x buschain-daemon >/dev/null 2>&1; then
-      echo "⚠ daemon/socket still alive after kill — dual-supervisor risk ($SOCK)" >&2
-    fi
-    echo "→ cargo run -p buschain-control"
-    echo "   (leftover daemon stopped; socket cleared; in-process is default)"
-    # Filter deprecated --inprocess (now the only production path).
     filtered=()
     for a in "$@"; do
       [[ "$a" == "--inprocess" ]] && continue
@@ -81,40 +48,45 @@ case "$cmd" in
     exec cargo run -p buschain-control -- "${filtered[@]}"
     ;;
   daemon|d)
-    stop_system_unit
     kill_local_daemons
-    ensure_plugins
-    cargo build -p buschain-tools --bin buschain-daemon
-    echo "→ legacy headless daemon on $SOCK"
     exec cargo run -p buschain-tools --bin buschain-daemon
     ;;
   ctl)
     exec cargo run -p buschain-tools --bin buschain-ctl -- "$@"
     ;;
   mixer)
+    # Needs gi + gtk-layer-shell — use `nix develop` (or packaged buschain-mixer-gtk).
+    export BUSCHAIN_CONTROL_MIXER_CSS="${BUSCHAIN_CONTROL_MIXER_CSS:-$ROOT/packaging/mixer/legacy/style.css}"
+    if [[ -z "${BUSCHAIN_CONTROL_CTL:-}" && -x "$CARGO_TARGET_DIR/debug/buschain-ctl" ]]; then
+      export BUSCHAIN_CONTROL_CTL="$CARGO_TARGET_DIR/debug/buschain-ctl"
+    fi
     exec python3 "$ROOT/packaging/mixer/legacy/buschain-mixer.py" "$@"
     ;;
   stop)
     kill_local_daemons
     if systemctl --user is-enabled --quiet buschain-control.service 2>/dev/null; then
-      echo "→ disabling leftover systemd buschain-control.service"
       systemctl --user disable --now buschain-control.service || true
+    fi
+    # Also quit a leftover tray/debug binary if requested via STOP_UI=1
+    if [[ "${STOP_UI:-}" == "1" ]]; then
+      pkill -x buschain-control 2>/dev/null || true
     fi
     echo "Stopped leftover headless daemons / old user unit."
     ;;
   help|-h|--help)
     cat <<'EOF'
-BusChain Control — local vendor workflow
+BusChain Control — local workflow
 
-  ./scripts/dev              # ONE cargo run (in-process + embedded IPC)
-  ./scripts/dev --hidden     # start withdrawn to tray
-  ./scripts/dev ui           # same as default run
-  ./scripts/dev daemon       # optional legacy headless daemon
-  ./scripts/dev ctl -- status
-  ./scripts/dev stop         # kill daemons + disable old user unit
-  ./scripts/dev shell        # nix develop
+  Preferred:
+    nix develop
+    cargo run              # plugins + buschain-ctl + tray app
+    cargo run -- --hidden
+    cargo ctl -- status
 
-Production matches this: Hyprland `exec-once = buschain-control --hidden`.
+  Helpers (this script):
+    ./scripts/dev stop
+    ./scripts/dev shell
+    ./scripts/dev daemon   # legacy headless only
 EOF
     ;;
   *)

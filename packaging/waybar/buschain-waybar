@@ -6,14 +6,63 @@
 # the in-panel HW slider. Scroll hot path = pactl only; daemon sync is background.
 set -euo pipefail
 
+# Resolve ctl: env override → local cargo builds → PATH.
+# Waybar's environment usually has no nix develop PATH, so prefer checkout bins.
+if [[ -z "${BUSCHAIN_CONTROL_CTL:-}" ]]; then
+  for _c in \
+    "${HOME}/Projects/buschain-control/target/debug/buschain-ctl" \
+    "${HOME}/Projects/buschain-control/target/release/buschain-ctl" \
+    "buschain-ctl"
+  do
+    if [[ "$_c" == /* && -x "$_c" ]]; then
+      BUSCHAIN_CONTROL_CTL="$_c"
+      break
+    elif [[ "$_c" != /* ]] && command -v "$_c" >/dev/null 2>&1; then
+      BUSCHAIN_CONTROL_CTL="$(command -v "$_c")"
+      break
+    fi
+  done
+fi
 CTL="${BUSCHAIN_CONTROL_CTL:-buschain-ctl}"
+
+# Resolve GTK mixer: nix-wrapped bin (has gi). Hyprland waybar PATH is often
+# thin — also check ~/.local/bin. Bare checkout launcher needs nix develop.
+if [[ -z "${BUSCHAIN_CONTROL_MIXER:-}" ]]; then
+  for _m in \
+    "buschain-mixer-gtk" \
+    "buschain-mixer" \
+    "${HOME}/.local/bin/buschain-mixer-gtk" \
+    "${HOME}/.local/bin/buschain-mixer"
+  do
+    if [[ "$_m" == /* && -x "$_m" ]]; then
+      BUSCHAIN_CONTROL_MIXER="$_m"
+      break
+    elif [[ "$_m" != /* ]] && command -v "$_m" >/dev/null 2>&1; then
+      BUSCHAIN_CONTROL_MIXER="$(command -v "$_m")"
+      break
+    fi
+  done
+fi
+if [[ -n "${BUSCHAIN_CONTROL_MIXER:-}" && -z "${BUSCHAIN_CONTROL_MIXER_CSS:-}" ]]; then
+  _mix_dir="$(dirname "$BUSCHAIN_CONTROL_MIXER")"
+  if [[ -f "$_mix_dir/legacy/style.css" ]]; then
+    BUSCHAIN_CONTROL_MIXER_CSS="$_mix_dir/legacy/style.css"
+  elif [[ -f "$_mix_dir/style.css" ]]; then
+    BUSCHAIN_CONTROL_MIXER_CSS="$_mix_dir/style.css"
+  elif [[ -f "${HOME}/Projects/buschain-control/packaging/mixer/legacy/style.css" ]]; then
+    BUSCHAIN_CONTROL_MIXER_CSS="${HOME}/Projects/buschain-control/packaging/mixer/legacy/style.css"
+  fi
+fi
+
 RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/buschain-control"
+SOCK="$RUNTIME/daemon.sock"
 CACHE="$RUNTIME/waybar.json"
 STATE="$RUNTIME/waybar.state"
 LOCK="$RUNTIME/waybar-vol.lock"
 mkdir -p "$RUNTIME"
 
 OFFLINE='{"text":"vol —","tooltip":"buschain-control not running (start tray app)","class":"offline"}'
+NOCTL='{"text":"vol —","tooltip":"buschain-ctl missing — run ./scripts/dev (builds ctl for waybar)","class":"offline"}'
 
 step_once() {
   # Master HW: 5% steps, snap through 100, hard-capped at 100% (no boost).
@@ -100,7 +149,18 @@ json_field() {
   printf '%s' "$json" | sed -n "s/.*\"${key}\":\"\\([^\"]*\\)\".*/\\1/p" | head -1
 }
 
+ctl_available() {
+  if [[ "$CTL" == /* ]]; then
+    [[ -x "$CTL" ]]
+  else
+    command -v "$CTL" >/dev/null 2>&1
+  fi
+}
+
 refresh_from_daemon() {
+  if ! ctl_available; then
+    return 2
+  fi
   local json
   json="$("$CTL" status 2>/dev/null || true)"
   [[ -n "$json" ]] || return 1
@@ -161,7 +221,9 @@ nudge() {
     write_state
     write_cache
     # Sync daemon cache off the hot path (do not wait).
-    "$CTL" hw-vol set "$PCT" >/dev/null 2>&1 &
+    if ctl_available; then
+      "$CTL" hw-vol set "$PCT" >/dev/null 2>&1 &
+    fi
   ) 9>"$LOCK"
 }
 
@@ -182,7 +244,12 @@ case "${1:-status}" in
     if refresh_from_daemon; then
       cat "$CACHE"
     else
-      echo "$OFFLINE"
+      rc=$?
+      if ((rc == 2)) && [[ -S "$SOCK" ]]; then
+        echo "$NOCTL"
+      else
+        echo "$OFFLINE"
+      fi
     fi
     ;;
   up)
@@ -196,13 +263,39 @@ case "${1:-status}" in
     [[ -f "$CACHE" ]] && cat "$CACHE" || true
     ;;
   popup)
-    # Prefer Quickshell panel, then egui via ctl/tray launcher (GTK not on hot path).
-    if [[ -x "${HOME}/.config/quickshell/scripts/qs-mixer-toggle.sh" ]]; then
-      "${HOME}/.config/quickshell/scripts/qs-mixer-toggle.sh" >/dev/null 2>&1 || true
-    elif command -v qs >/dev/null 2>&1 && qs ipc call mixer toggle >/dev/null 2>&1; then
-      true
-    else
-      "$CTL" popup playback >/dev/null 2>&1 || true
+    # GTK first when a wrapped mixer is available (thin waybar PATH → ~/.local/bin).
+    # Then ctl (tray owns QS → GTK → egui). Then egui binary offline.
+    opened=0
+    if [[ "${BUSCHAIN_CONTROL_USE_GTK_MIXER:-1}" != "0" && -n "${BUSCHAIN_CONTROL_MIXER:-}" ]]; then
+      BUSCHAIN_CONTROL_CTL="$CTL" \
+      BUSCHAIN_CONTROL_MIXER_CSS="${BUSCHAIN_CONTROL_MIXER_CSS:-}" \
+        "$BUSCHAIN_CONTROL_MIXER" --toggle >/dev/null 2>&1 &
+      opened=1
+    fi
+    if ((opened == 0)) && ctl_available && [[ -S "$SOCK" ]]; then
+      if BUSCHAIN_CONTROL_MIXER="${BUSCHAIN_CONTROL_MIXER:-}" \
+         BUSCHAIN_CONTROL_MIXER_CSS="${BUSCHAIN_CONTROL_MIXER_CSS:-}" \
+         BUSCHAIN_CONTROL_USE_GTK_MIXER="${BUSCHAIN_CONTROL_USE_GTK_MIXER:-1}" \
+         "$CTL" popup playback >/dev/null 2>&1; then
+        opened=1
+      fi
+    fi
+    if ((opened == 0)); then
+      for bin in \
+        "${HOME}/Projects/buschain-control/target/debug/buschain-control" \
+        "${HOME}/Projects/buschain-control/target/release/buschain-control" \
+        "buschain-control"
+      do
+        if [[ "$bin" == /* && -x "$bin" ]]; then
+          env BUSCHAIN_CONTROL_SKIP_BOOTSTRAP=1 "$bin" --popup playback >/dev/null 2>&1 &
+          opened=1
+          break
+        elif [[ "$bin" != /* ]] && command -v "$bin" >/dev/null 2>&1; then
+          env BUSCHAIN_CONTROL_SKIP_BOOTSTRAP=1 "$bin" --popup playback >/dev/null 2>&1 &
+          opened=1
+          break
+        fi
+      done
     fi
     ;;
   *)

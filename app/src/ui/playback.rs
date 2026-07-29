@@ -87,10 +87,12 @@ pub fn draw_playback(ui: &mut egui::Ui, state: &mut AppState) {
                         .tracks
                         .iter()
                         .filter(|t| t.kind.is_master() || t.virtual_output)
-                        .filter_map(|t| {
-                            t.sink_name
-                                .as_ref()
-                                .map(|s| (t.name.clone(), s.clone()))
+                        .map(|t| {
+                            let sink = t
+                                .sink_name
+                                .clone()
+                                .unwrap_or_else(|| t.expected_sink_name());
+                            (t.name.clone(), sink)
                         })
                         .collect();
                     for (name, sink) in &track_sinks {
@@ -108,12 +110,22 @@ pub fn draw_playback(ui: &mut egui::Ui, state: &mut AppState) {
                         .sinks
                         .iter()
                         .filter(|s| {
-                            !s.name.starts_with("buschain_fx_")
-                                && !s.name.starts_with("buschain_post_")
-                                && !s.name.starts_with("buschain_mid_")
-                                && !s.name.starts_with("buschain_rs_")
-                                && s.name != "buschain_hold"
+                            if s.name.starts_with("buschain_fx_")
+                                || s.name.starts_with("buschain_post_")
+                                || s.name.starts_with("buschain_mid_")
+                                || s.name.starts_with("buschain_rs_")
+                                || s.name == "buschain_hold"
+                                || s.name.starts_with("shadow_")
+                            {
+                                return false;
+                            }
+                            // Hide non-virtual track buses (same rule as Output).
+                            if s.name.starts_with("buschain_track_")
                                 && !track_sink_set.contains(s.name.as_str())
+                            {
+                                return false;
+                            }
+                            !track_sink_set.contains(s.name.as_str())
                         })
                         .map(|s| s.name.clone())
                         .collect();

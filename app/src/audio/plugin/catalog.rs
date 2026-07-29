@@ -38,6 +38,16 @@ pub fn normalize_label(id: &str) -> &str {
     let id = id.trim();
     // listplugins lines like "buschain_compressor (392012/0)"
     let head = id.split_whitespace().next().unwrap_or(id);
+    let head = head.strip_prefix("ladspa:").unwrap_or(head);
+    // Pre-rebrand sessions stored shadow_* LADSPA labels.
+    let head = head.strip_prefix("shadow_").map(|rest| {
+        for known in KNOWN_LABELS {
+            if known.strip_prefix("buschain_") == Some(rest) {
+                return *known;
+            }
+        }
+        head
+    }).unwrap_or(head);
     for known in KNOWN_LABELS {
         if head == *known || head.contains(known) || id.contains(known) {
             return known;

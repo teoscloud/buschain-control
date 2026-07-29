@@ -1,0 +1,4 @@
+# Local aliases — `cargo run` is the primary workflow (see app/src/dev_bootstrap.rs).
+[alias]
+ctl = ["run", "-p", "buschain-tools", "--bin", "buschain-ctl", "--"]
+tools = ["build", "-p", "buschain-tools"]

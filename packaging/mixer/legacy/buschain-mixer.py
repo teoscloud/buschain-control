@@ -28,7 +28,6 @@ except (ValueError, ImportError):
 
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
-CTL = os.environ.get("BUSCHAIN_CONTROL_CTL", "buschain-ctl")
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "buschain-control"
 PID_FILE = RUNTIME / "mixer.pid"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "buschain-control"
@@ -41,7 +40,7 @@ STYLE_CANDIDATES = [
     Path(__file__).resolve().parent / "style.css",
 ]
 
-CARD_W = 80
+CARD_W = 64
 DB_MIN, DB_MAX = -48.0, 12.0
 VOL_STEP = 5
 VOL_MAX = 150.0  # apps + mixer tracks may boost
@@ -49,15 +48,39 @@ HW_VOL_MAX = 100.0  # Master HW / device sinks — no boost
 VOL_SNAP = 100.0
 
 
+def resolve_ctl() -> str:
+    """Waybar/Hyprland often have a thin PATH — prefer env + checkout bins."""
+    env = os.environ.get("BUSCHAIN_CONTROL_CTL")
+    if env and Path(env).is_file():
+        return env
+    home = Path.home()
+    for cand in (
+        home / "Projects/buschain-control/target/debug/buschain-ctl",
+        home / "Projects/buschain-control/target/release/buschain-ctl",
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return env or "buschain-ctl"
+
+
+CTL = resolve_ctl()
+
+
 def ctl_async(*args: str) -> None:
     def _run() -> None:
-        subprocess.run([CTL, *args], capture_output=True, text=True, check=False)
+        try:
+            subprocess.run([CTL, *args], capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            pass
 
     threading.Thread(target=_run, daemon=True).start()
 
 
 def ctl(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([CTL, *args], capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run([CTL, *args], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess([CTL, *args], returncode=127, stdout="", stderr="")
 
 
 def fetch_state() -> dict:
@@ -318,6 +341,42 @@ def _bind_scale_scroll(scale: Gtk.Scale, vol_max: float = VOL_MAX) -> None:
     scale.connect("button-release-event", on_release)
 
 
+def _bind_hscroll_wheel(scroll: Gtk.ScrolledWindow) -> None:
+    """Playback / Tracks strip rows: mouse wheel pans horizontally by default."""
+    scroll.add_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+
+    def on_scroll(_w, event) -> bool:
+        hadj = scroll.get_hadjustment()
+        if hadj is None:
+            return False
+        page = float(hadj.get_page_increment() or 0.0)
+        step = page * 0.35 if page > 0 else float(hadj.get_step_increment() or 80.0)
+        if step < 40.0:
+            step = 80.0
+        dx = 0.0
+        if event.direction == Gdk.ScrollDirection.SMOOTH:
+            dx_raw = float(getattr(event, "delta_x", 0.0) or 0.0)
+            dy_raw = float(getattr(event, "delta_y", 0.0) or 0.0)
+            if abs(dx_raw) >= abs(dy_raw) and abs(dx_raw) >= 0.1:
+                dx = dx_raw * step
+            elif abs(dy_raw) >= 0.1:
+                # Vertical wheel → horizontal pan (touchpads send dy).
+                dx = dy_raw * step
+            else:
+                return False
+        elif event.direction in (Gdk.ScrollDirection.UP, Gdk.ScrollDirection.LEFT):
+            dx = -step
+        elif event.direction in (Gdk.ScrollDirection.DOWN, Gdk.ScrollDirection.RIGHT):
+            dx = step
+        else:
+            return False
+        upper = hadj.get_upper() - hadj.get_page_size()
+        hadj.set_value(max(hadj.get_lower(), min(hadj.get_value() + dx, upper)))
+        return True
+
+    scroll.connect("scroll-event", on_scroll)
+
+
 class Mixer(Gtk.Window):
     def __init__(self) -> None:
         super().__init__(title="BusChain Control")
@@ -340,7 +399,6 @@ class Mixer(Gtk.Window):
         self._out_fp: tuple | None = None
         self._in_fp: tuple | None = None
         self._stream_widgets: dict[str, dict] = {}
-        self._meter_peaks: dict[str, float] = {}
         self._vol_timers: dict[str, int] = {}
         self._favorites = load_favorites()
         self._tracks_cache: list[dict] = []
@@ -394,7 +452,6 @@ class Mixer(Gtk.Window):
 
         self.refresh()
         GLib.timeout_add(1600, self._tick)
-        GLib.timeout_add(50, self._meter_tick)
 
     def _on_key(self, _w, event) -> bool:
         if event.keyval == Gdk.KEY_Escape:
@@ -422,27 +479,6 @@ class Mixer(Gtk.Window):
     def _tick(self) -> bool:
         if not self._building and not self._interacting:
             self.refresh()
-        return True
-
-    def _meter_tick(self) -> bool:
-        for key, w in self._stream_widgets.items():
-            meter = w.get("meter")
-            scale = w.get("scale")
-            mute = w.get("mute")
-            if meter is None or scale is None:
-                continue
-            muted = mute.get_active() if mute is not None else False
-            vol = (scale.get_value() / 150.0) if not muted else 0.0
-            prev = self._meter_peaks.get(key, 0.0)
-            h = abs(hash(key)) % 7
-            target = vol * (0.35 + 0.65 * (0.5 + 0.5 * h / 6.0))
-            if muted or vol <= 0.01:
-                peak = prev * 0.72
-            else:
-                peak = max(prev * 0.88, target)
-            peak = min(1.0, peak)
-            self._meter_peaks[key] = peak
-            meter.set_value(peak)
         return True
 
     def _bump_interact(self, ms: int = 700) -> None:
@@ -541,20 +577,13 @@ class Mixer(Gtk.Window):
         scale.set_value(min(float(vol_ui), vol_max))
         scale.set_draw_value(False)
         scale.set_vexpand(True)
+        scale.get_style_context().add_class("stream-fader")
         _bind_scale_scroll(scale, vol_max=vol_max)
         scale.connect("value-changed", on_vol)
         fader_row.pack_start(scale, False, False, 0)
-
-        meter = Gtk.LevelBar.new_for_interval(0.0, 1.0)
-        meter.set_mode(Gtk.LevelBarMode.CONTINUOUS)
-        meter.set_orientation(Gtk.Orientation.VERTICAL)
-        meter.set_inverted(True)
-        meter.add_offset_value("high", 0.75)
-        meter.add_offset_value("full", 0.92)
-        meter.set_value(0.0)
-        fader_row.pack_start(meter, False, False, 0)
         card.pack_start(fader_row, True, True, 0)
 
+        # Live volume % (updates on drag + daemon refresh) — replaces the old side meter.
         pct = Gtk.Label(label=f"{int(min(vol_ui, vol_max))}%", xalign=0.5)
         pct.get_style_context().add_class("stream-pct")
         scale.connect(
@@ -577,9 +606,7 @@ class Mixer(Gtk.Window):
             "scale": scale,
             "mute": mute,
             "pct": pct,
-            "meter": meter,
         }
-        self._meter_peaks.setdefault(key, 0.0)
         return card
 
     def _rebuild_playback(self, state: dict) -> None:
@@ -660,6 +687,7 @@ class Mixer(Gtk.Window):
         scroll.set_max_content_width(560)
         scroll.set_min_content_height(210)
         scroll.get_style_context().add_class("stream-scroll")
+        _bind_hscroll_wheel(scroll)
         streams = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         scroll.add(streams)
         self.play_box.pack_start(scroll, True, True, 0)
@@ -783,6 +811,7 @@ class Mixer(Gtk.Window):
         scroll.set_max_content_width(560)
         scroll.set_min_content_height(260)
         scroll.get_style_context().add_class("stream-scroll")
+        _bind_hscroll_wheel(scroll)
         strips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         scroll.add(strips)
         self.tracks_box.pack_start(scroll, True, True, 0)

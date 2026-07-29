@@ -123,6 +123,12 @@ pub fn post_name_for_bus(bus: &str) -> String {
 }
 
 /// Normalize LADSPA labels the same way the app catalog does.
-pub fn normalize_ladspa_label(id: &str) -> &str {
-    id.strip_prefix("ladspa:").unwrap_or(id)
+/// Rewrites pre-rebrand `shadow_*` labels to `buschain_*`.
+pub fn normalize_ladspa_label(id: &str) -> String {
+    let id = id.strip_prefix("ladspa:").unwrap_or(id).trim();
+    if let Some(rest) = id.strip_prefix("shadow_") {
+        format!("buschain_{rest}")
+    } else {
+        id.to_string()
+    }
 }

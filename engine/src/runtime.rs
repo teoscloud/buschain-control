@@ -759,8 +759,26 @@ impl Engine {
                     } else if !spine_now && feed_ok {
                         report.push("master spine settling (feed up, waiting post)");
                     }
+                } else if self.desired.fx_failed.contains(master) {
+                    // FX ensure failed (e.g. legacy plugin labels) — fail-open dry
+                    // Master→HW so system audio is not stuck on hold forever.
+                    let post = post_name_for_bus(master);
+                    let post_mon = format!("{post}.monitor");
+                    if link_is_live(&post_mon, &hw) || sink_exists(&post) {
+                        let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                    }
+                    wake_sink(&hw);
+                    let _ = self
+                        .backend
+                        .unlink_from_source_except(&from, &[&hw, "buschain_hold"]);
+                    if let Err(e) = self.backend.ensure_link_raw(&from, &hw) {
+                        report.push(format!("master→HW (FX failed, dry): {e:#}"));
+                    } else {
+                        report.push(format!("master→{hw} (FX failed — dry fail-open)"));
+                    }
+                    let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                 } else {
-                    // FX node missing — hold only; never arm dry Master→HW (bypass).
+                    // FX node missing mid-build — hold only; never arm dry Master→HW.
                     let _ = self
                         .backend
                         .unlink_from_source_except(&from, &["buschain_hold"]);

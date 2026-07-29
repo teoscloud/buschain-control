@@ -14,6 +14,8 @@ pub use fx_chain::{
 
 pub use link::{ensure_link, link_is_live, teardown_buschain_links, unlink};
 
+pub use null_sink::push_description;
+
 use anyhow::{anyhow, Context, Result};
 
 use crate::clock::{probe_endpoint_caps, probe_sink_running_rate, EndpointCaps, GraphClock};
@@ -211,7 +213,7 @@ impl AudioBackend for PipewireCliBackend {
     fn teardown_rate_bridges(&mut self) -> Result<()> {
         let sinks = list_devices("sinks")?;
         for s in sinks {
-            if s.name.starts_with("buschain_rs_") {
+            if s.name.starts_with("buschain_rs_") || s.name.starts_with("shadow_rs_") {
                 let _ = null_sink::unload_named_null_sink(&s.name);
             }
         }

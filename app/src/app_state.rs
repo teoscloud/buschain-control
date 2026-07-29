@@ -1006,6 +1006,23 @@ impl AppState {
         }
     }
 
+    /// Keep runtime `sink_name` in sync whenever PW lists our buses (every snapshot).
+    fn sync_bus_names_from_snapshot(&mut self) {
+        let mut changed = false;
+        for track in &mut self.session.tracks {
+            let name = track.expected_sink_name();
+            if self.snapshot.sinks.iter().any(|s| s.name == name) {
+                if track.sink_name.as_deref() != Some(name.as_str()) {
+                    track.sink_name = Some(name);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.meter_targets_sig = 0;
+        }
+    }
+
     fn try_reattach_from_snapshot(&mut self) {
         if self.reattach_attempted {
             return;
@@ -1033,14 +1050,12 @@ impl AppState {
                 self.status = report.join();
             }
         }
-        let mut n = 0usize;
-        for track in &mut self.session.tracks {
-            let name = track.expected_sink_name();
-            if self.snapshot.sinks.iter().any(|s| s.name == name) {
-                track.sink_name = Some(name);
-                n += 1;
-            }
-        }
+        let n = self
+            .session
+            .tracks
+            .iter()
+            .filter(|t| t.sink_name.is_some())
+            .count();
         if n > 0 {
             self.status = format!(
                 "Reattached {n} existing BusChain bus(es) — audio left running from last session"
@@ -1076,6 +1091,7 @@ impl AppState {
                         self.status = s.status.clone();
                     }
                     self.snapshot = s;
+                    self.sync_bus_names_from_snapshot();
                     self.try_reattach_from_snapshot();
                 }
                 Event::Status(s) => {

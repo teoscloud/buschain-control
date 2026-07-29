@@ -166,8 +166,13 @@ pub fn load_slug(slug: &str) -> Result<Session> {
     if session.name.is_empty() {
         session.name = slug.to_string();
     }
-    session.normalize();
+    let dirty = session.normalize();
     session.clamp_performance_to_device();
+    if dirty {
+        // Persist shadow_* → buschain_* insert migrations so FX conf never reloads dead labels.
+        let slug = session.slug.clone();
+        let _ = save_session_as(&mut session, &slug, None);
+    }
     Ok(session)
 }
 
@@ -180,7 +185,7 @@ pub fn load_active() -> Session {
             let mut s = Session::default();
             s.slug = "default".into();
             s.name = "Default".into();
-            s.normalize();
+            let _ = s.normalize();
             s
         }
     }
@@ -195,6 +200,7 @@ pub fn save_session_as(session: &mut Session, slug: &str, name: Option<&str>) ->
     } else if session.name.is_empty() {
         session.name = slug.clone();
     }
+    session.prune_for_persist();
     session.touch_saved_at();
     let path = session_path(&slug);
     if let Some(parent) = path.parent() {

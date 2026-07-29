@@ -3,6 +3,7 @@ use crate::audio::plugin::{
     apply_denoiser_preset, denoiser_preset_names, plugin_ref_with_defaults, ui_spec_for_ref,
     ParamKind, PluginFormat, PluginId,
 };
+use crate::audio::worker::Command;
 use crate::design::{self, Theme};
 use egui::{Color32, RichText, Sense, Vec2};
 use uuid::Uuid;
@@ -443,11 +444,26 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Name").size(11.0).color(theme.text_dim()));
-        if ui
-            .text_edit_singleline(&mut state.session.tracks[track_idx].name)
-            .changed()
-        {
+        let resp = ui.text_edit_singleline(&mut state.session.tracks[track_idx].name);
+        if resp.changed() {
             state.dirty = true;
+            // Optimistic Output label + push PW device.description (stale Track_N otherwise).
+            let bus = state.session.tracks[track_idx].expected_sink_name();
+            let desc = if state.session.tracks[track_idx].kind.is_master() {
+                "BusChainControl_Master".into()
+            } else {
+                format!(
+                    "BusChainControl_{}",
+                    state.session.tracks[track_idx].name.replace(' ', "_")
+                )
+            };
+            if let Some(s) = state.snapshot.sinks.iter_mut().find(|s| s.name == bus) {
+                s.description = desc.clone();
+            }
+            state.worker.send(Command::SetBusDescription {
+                name: bus,
+                description: desc,
+            });
         }
     });
 
@@ -467,13 +483,36 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .checkbox(&mut virt, "Virtual output device")
             .on_hover_text(
                 "When on, this track appears as a system sink (apps / default / Move to). \
-                 When off, it stays an internal bus only.",
+                 When off, BusChain hides it from Output / Move to (bus still exists for routing).",
             )
             .changed()
         {
             state.session.tracks[track_idx].virtual_output = virt;
+            let bus = state.session.tracks[track_idx].expected_sink_name();
+            let desc = format!(
+                "BusChainControl_{}",
+                state.session.tracks[track_idx].name.replace(' ', "_")
+            );
             state.dirty = true;
             let _ = state.session.save();
+            // Keep worker last_session aligned so idle reconcile doesn't clobber the flag.
+            state
+                .worker
+                .send(Command::ApplyLevels(state.session.clone()));
+            state.worker.send(Command::Refresh);
+            // Optimistic Output row — don't wait for the snapshot round-trip.
+            if virt {
+                if !state.snapshot.sinks.iter().any(|s| s.name == bus) {
+                    state.snapshot.sinks.push(crate::audio::graph::DeviceNode {
+                        index: 0,
+                        name: bus,
+                        description: desc,
+                        volume_pct: 100,
+                        mute: false,
+                        sample_rate: None,
+                    });
+                }
+            }
             state.status = if virt {
                 "Virtual output enabled for track".into()
             } else {

@@ -1,14 +1,26 @@
-// Drop into waybar config "modules-right" as "custom/buschain-control"
-// and merge this object under "custom/buschain-control":
+// BusChain Control — Waybar custom module
+//
+// 1. Add "custom/buschain-control" to modules-left or modules-right.
+// 2. Merge this object into your waybar config.
+// 3. Paste packaging/waybar/style.css into your style.css (or restyle).
+// 4. Start the tray: buschain-control --hidden
+//
+// Prefer PATH names after a packaged install / Home Manager module.
+// For a git checkout without install, use absolute paths to
+//   <checkout>/packaging/waybar/buschain-waybar
+//
+// Click → popup (GTK layer-shell panel by default) · scroll → Master HW volume.
 {
-  "format": "{}",
-  "return-type": "json",
-  "exec": "buschain-waybar status",
-  "interval": 3,
-  "signal": 9,
-  "exec-on-event": true,
-  "on-click": "buschain-waybar popup",
-  "on-scroll-up": "buschain-waybar up",
-  "on-scroll-down": "buschain-waybar down",
-  "tooltip": true
+  "custom/buschain-control": {
+    "format": "{}",
+    "return-type": "json",
+    "exec": "buschain-waybar status",
+    "interval": 3,
+    "signal": 9,
+    "exec-on-event": true,
+    "on-click": "buschain-waybar popup",
+    "on-scroll-up": "buschain-waybar up",
+    "on-scroll-down": "buschain-waybar down",
+    "tooltip": true
+  }
 }

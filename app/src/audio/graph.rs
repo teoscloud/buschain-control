@@ -860,11 +860,20 @@ fn collect_buschain_modules(loopbacks_only: bool) -> Vec<String> {
         let shadowy = args.contains("buschain_")
             || args.contains("BusChainControl")
             || args.contains("shadow.audio")
-            || args.contains("media.name=buschain-control");
+            || args.contains("shadow-audio")
+            || args.contains("shadow-fx")
+            || args.contains("ShadowAudio")
+            || args.contains("sink_name=shadow_")
+            || args.contains("media.name=buschain-control")
+            || args.contains("media.name=shadow-audio")
+            || args.contains("media.name=shadow-fx");
         let legacy_loop = name == "module-loopback"
             && (args.contains("buschain_master")
                 || args.contains("buschain_track_")
-                || args.contains("buschain_fx_"));
+                || args.contains("buschain_fx_")
+                || args.contains("shadow_master")
+                || args.contains("shadow_track_")
+                || args.contains("shadow_fx_"));
         let unload = if loopbacks_only {
             (name == "module-loopback" && (shadowy || legacy_loop))
                 || (name == "module-ladspa-sink" && shadowy)
@@ -914,6 +923,112 @@ pub fn teardown_buschain_graph() -> Result<String> {
     std::thread::sleep(std::time::Duration::from_millis(60));
     Ok(format!(
         "Tore down PW links + {unloaded} BusChain Control module(s). System audio clean — next live edit auto bring-up the mixer."
+    ))
+}
+
+/// True for pre-rebrand Shadow Audio nodes (`shadow_*` / ShadowAudio_*).
+pub fn is_legacy_shadow_sink(name: &str) -> bool {
+    name.starts_with("shadow_")
+}
+
+fn buschain_counterpart(shadow_name: &str) -> Option<String> {
+    if let Some(rest) = shadow_name.strip_prefix("shadow_") {
+        Some(format!("buschain_{rest}"))
+    } else {
+        None
+    }
+}
+
+/// Move apps off legacy `shadow_*` sinks onto matching `buschain_*` buses, then unload
+/// every Shadow Audio Pulse module. Safe to call repeatedly (no-op when clean).
+pub fn teardown_legacy_shadow_graph() -> Result<String> {
+    let sinks = list_sinks().unwrap_or_default();
+    let legacy: Vec<_> = sinks
+        .iter()
+        .filter(|s| is_legacy_shadow_sink(&s.name))
+        .cloned()
+        .collect();
+    if legacy.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut moved = 0u32;
+    let inputs = list_sink_inputs().unwrap_or_default();
+    for si in &inputs {
+        let cur = if is_legacy_shadow_sink(&si.sink_or_source) {
+            si.sink_or_source.clone()
+        } else {
+            si.sink_or_source
+                .parse::<u32>()
+                .ok()
+                .and_then(|idx| sinks.iter().find(|s| s.index == idx).map(|s| s.name.clone()))
+                .unwrap_or_default()
+        };
+        if !is_legacy_shadow_sink(&cur) {
+            continue;
+        }
+        let dest = buschain_counterpart(&cur)
+            .filter(|d| sink_exists(d))
+            .unwrap_or_else(|| "buschain_master".into());
+        if sink_exists(&dest)
+            && move_sink_input_if_needed(si.index, &dest, &si.sink_or_source).unwrap_or(false)
+        {
+            moved += 1;
+        }
+    }
+
+    // Drop PW links that still touch shadow_* endpoints.
+    if let Ok(out) = std::process::Command::new("pw-link").arg("-l").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut cur_out: Option<String> = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("  |-> ") {
+                if let Some(src) = cur_out.as_ref() {
+                    if src.contains("shadow_") || rest.contains("shadow_") {
+                        pairs.push((src.clone(), rest.trim().to_string()));
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("  |<- ") {
+                if let Some(dst) = cur_out.as_ref() {
+                    if dst.contains("shadow_") || rest.contains("shadow_") {
+                        pairs.push((rest.trim().to_string(), dst.clone()));
+                    }
+                }
+            } else if !line.starts_with(' ') && line.contains(':') {
+                cur_out = Some(line.trim().to_string());
+            }
+        }
+        for (s, d) in pairs {
+            let _ = run_ok("pw-link", &["-d", &s, &d]);
+        }
+    }
+
+    let mut unloaded = 0u32;
+    let modules = run("pactl", &["list", "modules", "short"]).unwrap_or_default();
+    for line in modules.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(idx) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let args = parts.next().unwrap_or("");
+        let hit = args.contains("shadow-audio")
+            || args.contains("shadow-fx")
+            || args.contains("ShadowAudio")
+            || args.contains("sink_name=shadow_")
+            || args.contains("shadow_master")
+            || args.contains("shadow_track_")
+            || args.contains("shadow_hold")
+            || args.contains("shadow_post_")
+            || args.contains("shadow_rs_")
+            || args.contains("shadow_fx_")
+            || (name == "module-loopback" && args.contains("shadow_"));
+        if hit && run_ok("pactl", &["unload-module", idx]).is_ok() {
+            unloaded += 1;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    Ok(format!(
+        "Legacy Shadow Audio removed ({unloaded} modules, moved {moved} stream(s))"
     ))
 }
 
@@ -1386,15 +1501,21 @@ pub fn enforce_playback_placements(session: &Session) -> Result<u32> {
         if si.sink_or_source == pref {
             continue;
         }
-        // Only reclaim from other BusChain buses (never yank off real HW devices).
-        let on_shadow = si.sink_or_source.starts_with("buschain_")
-            || si.sink_or_source.parse::<u32>().ok().is_some_and(|idx| {
-                sinks
-                    .iter()
-                    .find(|s| s.index == idx)
-                    .is_some_and(|s| s.name.starts_with("buschain_"))
-            });
-        if !on_shadow {
+        // Resolve current sink name (Pulse may report index or name).
+        let cur_name = if sinks.iter().any(|s| s.name == si.sink_or_source) {
+            si.sink_or_source.clone()
+        } else {
+            si.sink_or_source
+                .parse::<u32>()
+                .ok()
+                .and_then(|idx| sinks.iter().find(|s| s.index == idx).map(|s| s.name.clone()))
+                .unwrap_or_else(|| si.sink_or_source.clone())
+        };
+        let on_buschain = cur_name.starts_with("buschain_") || is_legacy_shadow_sink(&cur_name);
+        // When system default is a BusChain bus, reclaim unassigned user apps from
+        // HW too — otherwise stream-restore leaves Chromium on Scarlett forever.
+        let pref_is_buschain = pref.starts_with("buschain_");
+        if !on_buschain && !(pref_is_buschain && si.is_user_app()) {
             continue;
         }
         if move_sink_input_if_needed(si.index, pref, &si.sink_or_source).unwrap_or(false) {
@@ -1963,7 +2084,7 @@ pub fn ensure_live_track(
     }
     std::thread::sleep(std::time::Duration::from_millis(60));
     apply_track_levels(session)?;
-    Ok(format!("Track bus live · {bus}"))
+    Ok(format!("Ensure track bus live · {bus}"))
 }
 
 /// After a track is removed from the session: gate + tear its leftover PW nodes only.

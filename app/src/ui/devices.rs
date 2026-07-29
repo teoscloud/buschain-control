@@ -1,6 +1,5 @@
 use crate::app_state::AppState;
 use crate::audio::graph::DeviceNode;
-use crate::audio::live::LiveChange;
 use crate::audio::worker::Command;
 use crate::design::{self, Theme};
 use crate::session::DeviceClockConfig;
@@ -25,28 +24,22 @@ pub fn draw_device_clock_panel(
         .or(caps.preferred_rate.nonzero())
         .unwrap_or(48_000);
 
-    // Ensure prefs exist, clamped to caps.
-    {
-        let entry = state
-            .session
-            .device_clocks
-            .entry(device.name.clone())
-            .or_insert_with(|| DeviceClockConfig {
-                sample_rate: live,
-                quantum: state.session.performance.quantum.max(64),
-                soft_quantum: true,
-            });
-        let soft = entry.soft_quantum;
-        let resolved = resolve_profile(
-            AudioPreset::Custom,
-            &caps,
-            Some(entry.sample_rate),
-            Some(entry.quantum),
-            soft,
-        );
-        entry.sample_rate = resolved.sample_rate;
-        entry.quantum = resolved.quantum;
-    }
+    // Display-only defaults — do not write device_clocks until the user edits
+    // or clicks Apply (avoids saving every sink ever opened on Output).
+    let stored = state.session.device_clocks.get(&device.name).cloned();
+    let soft_pref = stored.as_ref().map(|c| c.soft_quantum).unwrap_or(true);
+    let resolved_pref = resolve_profile(
+        AudioPreset::Custom,
+        &caps,
+        Some(stored.as_ref().map(|c| c.sample_rate).unwrap_or(live)),
+        Some(
+            stored
+                .as_ref()
+                .map(|c| c.quantum)
+                .unwrap_or_else(|| state.session.performance.quantum.max(64)),
+        ),
+        soft_pref,
+    );
 
     ui.add_space(4.0);
     ui.separator();
@@ -74,14 +67,7 @@ pub fn draw_device_clock_panel(
             }
         ))
         .size(10.0)
-        .color(if device.sample_rate == Some(
-            state
-                .session
-                .device_clocks
-                .get(&device.name)
-                .map(|c| c.sample_rate)
-                .unwrap_or(live),
-        ) {
+        .color(if device.sample_rate == Some(resolved_pref.sample_rate) {
             theme.accent()
         } else {
             theme.warning()
@@ -95,15 +81,11 @@ pub fn draw_device_clock_panel(
         } else {
             caps.rates.clone()
         };
-        let mut rate = state
-            .session
-            .device_clocks
-            .get(&device.name)
-            .map(|c| c.sample_rate)
-            .unwrap_or(live);
+        let mut rate = resolved_pref.sample_rate;
         if !rates.contains(&rate) {
             rate = rates[0];
         }
+        let rate_before = rate;
         egui::ComboBox::from_id_salt(format!("dev_rate_{}", device.name))
             .selected_text(format!("{rate}"))
             .show_ui(ui, |ui| {
@@ -113,12 +95,8 @@ pub fn draw_device_clock_panel(
             });
 
         ui.label(RichText::new("Quantum").size(11.0).color(theme.text_dim()));
-        let mut q = state
-            .session
-            .device_clocks
-            .get(&device.name)
-            .map(|c| c.quantum)
-            .unwrap_or(256);
+        let mut q = resolved_pref.quantum;
+        let q_before = q;
         egui::ComboBox::from_id_salt(format!("dev_q_{}", device.name))
             .selected_text(format!("{q}"))
             .show_ui(ui, |ui| {
@@ -129,29 +107,38 @@ pub fn draw_device_clock_panel(
                 }
             });
 
-        if let Some(entry) = state.session.device_clocks.get_mut(&device.name) {
-            if rate != entry.sample_rate || q != entry.quantum {
-                entry.sample_rate = rate;
-                entry.quantum = q;
-                state.dirty = true;
-            }
+        if rate != rate_before || q != q_before {
+            let entry = state
+                .session
+                .device_clocks
+                .entry(device.name.clone())
+                .or_insert_with(|| DeviceClockConfig {
+                    sample_rate: rate,
+                    quantum: q,
+                    soft_quantum: soft_pref,
+                });
+            entry.sample_rate = rate;
+            entry.quantum = q;
+            state.dirty = true;
         }
     });
 
-    let mut soft = state
-        .session
-        .device_clocks
-        .get(&device.name)
-        .map(|c| c.soft_quantum)
-        .unwrap_or(true);
+    let mut soft = soft_pref;
     if ui
         .checkbox(&mut soft, "Soft quantum (PipeWire may raise period under load)")
         .changed()
     {
-        if let Some(entry) = state.session.device_clocks.get_mut(&device.name) {
-            entry.soft_quantum = soft;
-            state.dirty = true;
-        }
+        let entry = state
+            .session
+            .device_clocks
+            .entry(device.name.clone())
+            .or_insert_with(|| DeviceClockConfig {
+                sample_rate: resolved_pref.sample_rate,
+                quantum: resolved_pref.quantum,
+                soft_quantum: soft,
+            });
+        entry.soft_quantum = soft;
+        state.dirty = true;
     }
 
     ui.horizontal(|ui| {
@@ -161,20 +148,26 @@ pub fn draw_device_clock_panel(
             "Apply device clock"
         };
         if design::button(ui, &theme, label, true).clicked() {
+            // Ensure a prefs row exists before Apply (may be first touch).
+            state
+                .session
+                .device_clocks
+                .entry(device.name.clone())
+                .or_insert_with(|| DeviceClockConfig {
+                    sample_rate: resolved_pref.sample_rate,
+                    quantum: resolved_pref.quantum,
+                    soft_quantum: soft_pref,
+                });
             state.apply_device_clock(&device.name, is_source);
         }
-        let period = state
-            .session
-            .device_clocks
-            .get(&device.name)
-            .map(|c| {
-                if c.sample_rate > 0 {
-                    (c.quantum as f32 * 1000.0) / c.sample_rate as f32
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
+        let period = {
+            let sr = resolved_pref.sample_rate;
+            if sr > 0 {
+                (resolved_pref.quantum as f32 * 1000.0) / sr as f32
+            } else {
+                0.0
+            }
+        };
         ui.label(
             RichText::new(format!("period {period:.2} ms"))
                 .size(10.0)
@@ -277,7 +270,7 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
         .or_else(|| state.snapshot.default_sink.clone());
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        let sinks: Vec<_> = state
+        let mut sinks: Vec<_> = state
             .snapshot
             .sinks
             .iter()
@@ -285,11 +278,14 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                 if state.show_hidden_output {
                     return true;
                 }
+                // Always hide helpers + pre-rebrand Shadow Audio leftovers.
                 if s.name.starts_with("buschain_fx_")
                     || s.name.starts_with("buschain_post_")
                     || s.name.starts_with("buschain_mid_")
                     || s.name.starts_with("buschain_rs_")
                     || s.name == "buschain_hold"
+                    || s.name.starts_with("shadow_")
+                    || s.description.starts_with("ShadowAudio_")
                 {
                     return false;
                 }
@@ -302,18 +298,54 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
             })
             .cloned()
             .collect();
+        // Session-owned virtual buses may exist in PW before the next snapshot
+        // lands — synthesize Output rows so toggles / +Track feel instant.
+        for t in &state.session.tracks {
+            let show = t.kind.is_master() || t.virtual_output;
+            if !show {
+                continue;
+            }
+            let name = t.expected_sink_name();
+            if sinks.iter().any(|s| s.name == name) {
+                continue;
+            }
+            sinks.push(DeviceNode {
+                index: 0,
+                name,
+                description: format!("BusChainControl_{}", t.name.replace(' ', "_")),
+                volume_pct: 100,
+                mute: false,
+                sample_rate: None,
+            });
+        }
         for sink in sinks {
             let is_app_bus = sink.name == "buschain_master"
                 || sink.name.starts_with("buschain_track_");
-            let is_shadow = sink.name.starts_with("buschain_");
+            let is_shadow = sink.name.starts_with("buschain_")
+                || sink.name.starts_with("shadow_");
             let is_active_hw = active_hw.as_deref() == Some(sink.name.as_str());
             let is_active_def = active_default.as_deref() == Some(sink.name.as_str());
+            // Prefer session track name — PW keeps the create-time description
+            // (e.g. Track_1) until a rename push lands.
+            let label = state
+                .session
+                .tracks
+                .iter()
+                .find(|t| t.expected_sink_name() == sink.name)
+                .map(|t| {
+                    if t.kind.is_master() {
+                        "BusChainControl_Master".into()
+                    } else {
+                        format!("BusChainControl_{}", t.name.replace(' ', "_"))
+                    }
+                })
+                .unwrap_or_else(|| sink.description.clone());
 
             design::panel(ui, &theme, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(&sink.description)
+                            RichText::new(&label)
                                 .size(13.0)
                                 .strong()
                                 .color(theme.text()),
@@ -365,7 +397,8 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                         let is_fx = sink.name.starts_with("buschain_fx_")
                             || sink.name.starts_with("buschain_post_")
                             || sink.name.starts_with("buschain_rs_")
-                            || sink.name == "buschain_hold";
+                            || sink.name == "buschain_hold"
+                            || sink.name.starts_with("shadow_");
                         let is_hidden_track = sink.name.starts_with("buschain_track_")
                             && !state.session.tracks.iter().any(|t| {
                                 t.expected_sink_name() == sink.name && t.virtual_output

@@ -69,7 +69,8 @@ pub struct Track {
     pub output_targets: Vec<Uuid>,
     /// Expose this track as a system virtual output (apps / default sink / Move to).
     /// Master is always exposed. When off, the bus still exists for internal routing.
-    #[serde(default = "default_true")]
+    /// Missing field in old JSON ⇒ false (opt-in), matching new-track defaults.
+    #[serde(default)]
     pub virtual_output: bool,
     /// Runtime: null-sink / filter-chain sink name for this track
     #[serde(skip)]
@@ -105,15 +106,21 @@ pub struct Session {
     pub tracks: Vec<Track>,
     pub master_output: Option<String>,
     /// Description of Master HW out — used when the sink name changes after reboot.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_output_desc: Option<String>,
     /// Preferred system default sink (usually a BusChain track bus). Re-applied on graph apply.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_default_sink: Option<String>,
+    /// Legacy: forced false on launch; kept for Settings checkbox / older tools.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub autostart_graph: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ladspa_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lv2_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clap_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vst3_enabled: bool,
     /// Mixer selection / accent highlight RGB (Settings → Appearance).
     #[serde(default = "default_accent_rgb")]
@@ -122,7 +129,8 @@ pub struct Session {
     #[serde(default)]
     pub performance: PerformanceProfile,
     /// Per HW sink/source clock prefs (keyed by PipeWire node name).
-    #[serde(default)]
+    /// Only written when the user edits/Applies a device clock — not on mere view.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub device_clocks: HashMap<String, DeviceClockConfig>,
 }
 
@@ -198,11 +206,38 @@ impl Session {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let mut s = self.clone();
+        s.prune_for_persist();
         store::save_active(&mut s)
     }
 
     pub fn touch_saved_at(&mut self) {
         self.saved_at = chrono_like_now();
+    }
+
+    /// Drop runtime / irrelevant noise before writing JSON.
+    pub fn prune_for_persist(&mut self) {
+        // Mixer-owned buses never carry meaningful device clocks.
+        self.device_clocks
+            .retain(|k, _| !k.starts_with("buschain_") && !k.starts_with("shadow_"));
+        for t in &mut self.tracks {
+            // Empty optionals stay null; clear blank descs.
+            if t.input_source_desc
+                .as_ref()
+                .is_some_and(|d| d.trim().is_empty())
+            {
+                t.input_source_desc = None;
+            }
+            if t.input_source.is_none() {
+                t.input_source_desc = None;
+            }
+        }
+        if self
+            .master_output_desc
+            .as_ref()
+            .is_some_and(|d| d.trim().is_empty())
+        {
+            self.master_output_desc = None;
+        }
     }
 }
 
@@ -218,7 +253,10 @@ fn chrono_like_now() -> String {
 impl Session {
 
     /// Coerce legacy Input → Bus and ensure bus tracks default to master outs.
-    pub fn normalize(&mut self) {
+    /// Also rewrites pre-rebrand `shadow_*` insert labels → `buschain_*`.
+    /// Returns true when the session was mutated (caller should persist).
+    pub fn normalize(&mut self) -> bool {
+        let mut dirty = false;
         let master_id = self
             .tracks
             .iter()
@@ -227,13 +265,23 @@ impl Session {
         for t in &mut self.tracks {
             if matches!(t.kind, TrackKind::Input) {
                 t.kind = TrackKind::Bus;
+                dirty = true;
             }
             if !t.kind.is_master() && t.output_targets.is_empty() {
                 if let Some(mid) = master_id {
                     t.output_targets.push(mid);
+                    dirty = true;
+                }
+            }
+            for plug in &mut t.inserts {
+                let migrated = crate::audio::plugin::normalize_label(&plug.id.id);
+                if migrated != plug.id.id.as_str() {
+                    plug.id.id = migrated.to_string();
+                    dirty = true;
                 }
             }
         }
+        dirty
     }
 
     /// Snap Custom rate/quantum to true Master HW caps (drops phantom 192k etc.).

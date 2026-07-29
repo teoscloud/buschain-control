@@ -73,6 +73,8 @@ pub enum Command {
         name: String,
         desc: Option<String>,
     },
+    /// Update `device.description` on an existing bus (track rename).
+    SetBusDescription { name: String, description: String },
     Shutdown,
 }
 
@@ -346,6 +348,7 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
             | Command::SetDefaultSink(_)
             | Command::SetDefaultSource(_)
             | Command::SetMasterHw { .. }
+            | Command::SetBusDescription { .. }
             | Command::SetSinkMute { .. }
             | Command::SetSinkVolume { .. }
             | Command::SetSourceMute { .. }
@@ -408,8 +411,17 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let mut last_cmd_at = Instant::now();
     // Buses currently mixer-muted — volume drags skip the heavy gate path.
     let mut muted_buses: HashMap<String, bool> = HashMap::new();
-    // Do not tear down on launch — leave existing BusChain buses / FX chains running
-    // so restarting the UI doesn't cut audio. Advanced "Reset graph" still cleans up.
+    // Do not tear down BusChain on launch — leave buses / FX running across UI restart.
+    // Always sweep pre-rebrand Shadow Audio leftovers (wrong media.name escaped teardown).
+    match graph::teardown_legacy_shadow_graph() {
+        Ok(msg) if !msg.is_empty() => {
+            let _ = tx.send(Event::Status(msg));
+        }
+        Err(e) => {
+            let _ = tx.send(Event::Error(format!("legacy shadow cleanup: {e:#}")));
+        }
+        _ => {}
+    }
     let _ = tx.send(Event::Status(
         "Worker ready — buschain-engine supervisor online".into(),
     ));
@@ -659,6 +671,12 @@ fn process_command_batch(
                 }
                 Command::ApplySession(mut session) => {
                     sync_engine_clock(&session);
+                    session.normalize();
+                    if let Ok(msg) = graph::teardown_legacy_shadow_graph() {
+                        if !msg.is_empty() {
+                            let _ = tx.send(Event::Status(msg));
+                        }
+                    }
                     match graph::apply_session(&mut session, &mut fx, graph::ApplyKind::Full) {
                         Ok(message) => {
                             *last_session = Some(session.clone());
@@ -771,6 +789,9 @@ fn process_command_batch(
                         Ok(message) => {
                             *last_session = Some(session.clone());
                             let _ = tx.send(Event::SessionApplied { session, message });
+                            // Surface the new bus in Output / Playback immediately
+                            // (idle full snapshot is ~30s).
+                            let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                         }
                         Err(e) => {
                             let _ = tx.send(Event::Error(format!("ensure track: {e:#}")));
@@ -922,7 +943,6 @@ fn process_command_batch(
                         eng.desired_mut()
                             .set_preferred_default(Some(name.clone()));
                     });
-                    // Light path only — placements/full snapshot are deferred (idle).
                     match graph::set_default_sink_if_needed(&name) {
                         Ok(true) => {
                             let _ = tx.send(Event::Status(format!("System default → {name}")));
@@ -936,6 +956,25 @@ fn process_command_batch(
                             let _ = tx.send(Event::Error(format!("set-default-sink: {e:#}")));
                         }
                     }
+                    // Immediate reclaim so apps leave HW/legacy sinks when default is BusChain.
+                    if let Some(session) = last_session.as_ref() {
+                        match graph::enforce_playback_placements(session) {
+                            Ok(n) if n > 0 => {
+                                let _ = tx.send(Event::Status(format!(
+                                    "Placed {n} stream(s) → system default"
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Event::Error(format!("place streams: {e:#}")));
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Kick Master→HW repair so BusChain default is audible.
+                    crate::audio::engine_handle::with_engine(|eng| {
+                        let _ = eng.reconcile_light();
+                    });
+                    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                 }
                 Command::SetDefaultSource(name) => {
                     if let Err(e) = graph::set_default_source(&name) {
@@ -961,6 +1000,10 @@ fn process_command_batch(
                             let _ = tx.send(Event::Error(format!("master hw: {e:#}")));
                         }
                     }
+                }
+                Command::SetBusDescription { name, description } => {
+                    let _ = buschain_engine::backend::push_description(&name, &description);
+                    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                 }
             }
         }

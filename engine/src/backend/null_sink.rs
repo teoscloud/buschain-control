@@ -15,10 +15,13 @@ pub fn ensure_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
         // Rate retarget is BindMasterClock → migrate_recreate_null_sink only.
         if is_app_bus {
             let _ = push_clock_props(name, clock);
+            // Keep device.description in sync with session track renames.
+            let _ = push_description(name, &spec.description);
             return Ok(());
         }
         if sink_is_stereo_fl_fr(name) && live == Some(clock.sample_rate) {
             let _ = push_clock_props(name, clock);
+            let _ = push_description(name, &spec.description);
             return Ok(());
         }
         // Helpers (post / hold / rate-bridge): recreate bad layouts / wrong rate.
@@ -169,6 +172,16 @@ fn push_clock_props(name: &str, clock: &ClockProps) -> Result<()> {
         clock.quantum,
         if clock.soft_quantum { "false" } else { "true" },
     );
+    let _ = std::process::Command::new("pw-cli")
+        .args(["s", name, "Props", &body])
+        .output();
+    Ok(())
+}
+
+/// Update the human label on an existing null-sink (session rename path).
+pub fn push_description(name: &str, description: &str) -> Result<()> {
+    let desc = sanitize_desc(description);
+    let body = format!("{{ device.description = \"{}\" }}", desc.replace('\"', "\\\""));
     let _ = std::process::Command::new("pw-cli")
         .args(["s", name, "Props", &body])
         .output();

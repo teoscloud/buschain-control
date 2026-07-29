@@ -8,9 +8,12 @@ use buschain_control::tray::{self, HeadlessWait};
 use buschain_control::ui;
 use buschain_control::withdraw;
 
+mod dev_bootstrap;
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--popup" || a == "popup") {
+        // Do not bootstrap — would steal the tray app's IPC socket.
         return run_popup(&args);
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -19,10 +22,14 @@ fn main() -> eframe::Result<()> {
                (default)        in-process graph + embedded IPC for ctl/waybar\n\
                --hidden         tray only — no window until Show (autostart)\n\
                --daemon-client  debug: attach to external buschain-daemon\n\
-               --popup [playback]  small playback popup\n"
+               --popup [playback]  small playback popup\n\n\
+               Dev: `cargo run` / `cargo run -- --hidden` bootstraps plugins + buschain-ctl.\n"
         );
         std::process::exit(0);
     }
+
+    // Plain `cargo run` = full local workflow (plugins, ctl for waybar, clean socket).
+    dev_bootstrap::run();
 
     let start_hidden = args.iter().any(|a| a == "--hidden");
 
@@ -77,15 +84,11 @@ fn main() -> eframe::Result<()> {
 }
 
 fn run_popup(args: &[String]) -> eframe::Result<()> {
-    // GTK legacy only when explicitly forced (QS / egui are the hot path).
-    if matches!(
-        std::env::var("BUSCHAIN_CONTROL_USE_GTK_MIXER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    ) {
-        if let Ok(mixer) = std::env::var("BUSCHAIN_CONTROL_MIXER") {
-            let _ = std::process::Command::new(mixer).arg("--toggle").spawn();
-            std::process::exit(0);
-        }
+    // Direct `buschain-control --popup`: prefer GTK panel when packaged / on PATH.
+    // Tray / ctl / waybar go through `popup_launch::spawn_mixer_popup` (same order).
+    // Do not call spawn_mixer_popup here — its egui fallback re-execs --popup.
+    if buschain_control::popup_launch::try_gtk_mixer() {
+        std::process::exit(0);
     }
 
     let _tab = args

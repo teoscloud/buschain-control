@@ -101,8 +101,6 @@ button label {
 button.close-btn {
   min-width: 22px;
   min-height: 22px;
-  max-width: 22px;
-  max-height: 22px;
   padding: 0;
   margin: 0;
   border-radius: 999px;
@@ -228,8 +226,8 @@ button.use-btn:hover {
   box-shadow: none;
 }
 .stream-card {
-  min-width: 78px;
-  max-width: 88px;
+  min-width: 56px;
+  padding: 8px 4px;
 }
 .stream-card:hover,
 .track-card:hover,
@@ -254,10 +252,12 @@ button.use-btn:hover {
   color: alpha(#f7f5ff, 0.42);
 }
 .stream-pct {
-  font-size: 10px;
-  font-weight: 600;
-  color: alpha(#f7f5ff, 0.62);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #e6c35c;
   padding-top: 2px;
+  min-width: 0;
 }
 
 .app-icon {
@@ -270,14 +270,17 @@ button.use-btn:hover {
   background-image: none;
 }
 
-/* Scales — soft slate, force round trough (incl. GTK3 contents/progress) */
+/* Scales — soft slate, thin round trough */
 scale {
   min-height: 112px;
-  min-width: 22px;
+  min-width: 14px;
   padding: 2px 0;
   outline: none;
   background: transparent;
   background-image: none;
+}
+scale.stream-fader {
+  min-width: 12px;
 }
 scale contents,
 scale trough,
@@ -291,7 +294,10 @@ scale fill {
 }
 scale trough {
   background-color: alpha(#f7f5ff, 0.12);
-  min-width: 5px;
+  min-width: 3px;
+}
+scale.stream-fader trough {
+  min-width: 3px;
 }
 scale highlight,
 scale fill,
@@ -324,35 +330,6 @@ scale.horizontal {
 scale.horizontal trough {
   min-height: 5px;
   min-width: 0;
-}
-
-levelbar,
-levelbar trough,
-levelbar block,
-levelbar block.empty,
-levelbar block.filled {
-  min-width: 5px;
-  border-radius: 999px;
-  border: none;
-  background-image: none;
-  box-shadow: none;
-}
-levelbar.vertical {
-  min-height: 112px;
-  min-width: 6px;
-  margin: 0 0 0 4px;
-}
-levelbar trough {
-  background-color: alpha(#f7f5ff, 0.10);
-}
-levelbar block.filled {
-  background-color: #8fd19e;
-}
-levelbar block.high {
-  background-color: #e6d08a;
-}
-levelbar block.full {
-  background-color: #e08b84;
 }
 
 .empty {
