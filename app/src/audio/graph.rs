@@ -550,16 +550,28 @@ pub fn sink_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when module args name this sink exactly (not a `__stg` / prefix sibling).
+fn module_args_sink_name(args: &str, name: &str) -> bool {
+    for tok in args.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("sink_name=") {
+            if v == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Unload a BusChain `module-null-sink` by sink name so a filter-chain can reuse it.
 pub fn unload_named_null_sink(name: &str) -> Result<()> {
     let text = run("pactl", &["list", "modules", "short"]).unwrap_or_default();
-    let needle = format!("sink_name={name}");
     for line in text.lines() {
         let mut parts = line.splitn(3, '\t');
         let Some(idx) = parts.next() else { continue };
         let Some(mod_name) = parts.next() else { continue };
         let args = parts.next().unwrap_or("");
-        if mod_name == "module-null-sink" && args.contains(&needle) {
+        // Exact token — substring match also hit `buschain_post_*__stg` A/B posts.
+        if mod_name == "module-null-sink" && module_args_sink_name(args, name) {
             let _ = run_ok("pactl", &["unload-module", idx]);
             std::thread::sleep(std::time::Duration::from_millis(40));
             return Ok(());
@@ -734,31 +746,53 @@ fn set_named_sink_audible(name: &str, muted: bool) {
 }
 
 /// Open or silence FX helpers on a bus (monolithic FX + leftover slot/mid nodes).
-/// Always hits the monolithic FX + post by exact name — never rely on list scans alone.
+/// Open path: live A/B generation only (never both gens — dual post→dest sums loud).
+/// Mute path: silence every gen still present.
 fn set_slot_chain_audible(bus: &str, muted: bool) {
-    let fx = crate::audio::filter_chain::fx_name_for_bus(bus);
-    let post = crate::audio::filter_chain::post_name_for_bus(bus);
-    if sink_exists(&fx) {
-        set_named_sink_audible(&fx, muted);
+    let live_fx = buschain_engine::live_fx_name(bus);
+    let live_post = buschain_engine::live_post_name(bus);
+    let can_fx = crate::audio::filter_chain::fx_name_for_bus(bus);
+    let can_post = crate::audio::filter_chain::post_name_for_bus(bus);
+    let stg_fx = format!("{can_fx}__stg");
+    let stg_post = format!("{can_post}__stg");
+    if muted {
+        for name in [&live_fx, &live_post, &can_fx, &can_post, &stg_fx, &stg_post] {
+            if sink_exists(name) {
+                set_named_sink_audible(name, true);
+            }
+        }
+    } else {
+        if sink_exists(&live_fx) {
+            set_named_sink_audible(&live_fx, false);
+        }
+        if sink_exists(&live_post) {
+            set_named_sink_audible(&live_post, false);
+        }
     }
-    if sink_exists(&post) {
-        set_named_sink_audible(&post, muted);
-    }
-    // Leftover per-slot nodes from older builds.
+    // Leftover per-slot nodes from older builds (never A/B gens — handled above).
     let fx_prefix = crate::audio::filter_chain::slot_fx_prefix(bus);
     let mid_prefix = crate::audio::filter_chain::slot_mid_prefix(bus);
     for sink in list_sinks().unwrap_or_default() {
         let n = &sink.name;
+        if n.as_str() == live_fx
+            || n.as_str() == can_fx
+            || n.as_str() == stg_fx
+            || n.as_str() == live_post
+            || n.as_str() == can_post
+            || n.as_str() == stg_post
+        {
+            continue;
+        }
         if n.starts_with(&fx_prefix) || n.starts_with(&mid_prefix) {
             set_named_sink_audible(n, muted);
         }
     }
 }
 
-/// Retry-open FX + post after spawn (pactl can race the new node briefly).
+/// Retry-open live FX + post after spawn (pactl can race the new node briefly).
 fn ensure_fx_path_open(bus: &str) {
-    let fx = crate::audio::filter_chain::fx_name_for_bus(bus);
-    let post = crate::audio::filter_chain::post_name_for_bus(bus);
+    let fx = buschain_engine::live_fx_name(bus);
+    let post = buschain_engine::live_post_name(bus);
     for _ in 0..8 {
         let mut ok = true;
         if sink_exists(&fx) {
@@ -1182,14 +1216,19 @@ fn ensure_bus_keepalive(bus: &str) -> Result<()> {
 /// Never removes keepalive readers.
 fn unload_loopbacks_for_track_bus(bus: &str, _fx_name: &str) -> u32 {
     let post = crate::audio::filter_chain::post_name_for_bus(bus);
+    let post_stg = format!("{post}__stg");
     let fx_prefix = crate::audio::filter_chain::slot_fx_prefix(bus);
     let mid_prefix = crate::audio::filter_chain::slot_mid_prefix(bus);
     let legacy_fx = crate::audio::filter_chain::fx_name_for_bus(bus);
+    let live_fx = buschain_engine::live_fx_name(bus);
+    let stg_fx = format!("{legacy_fx}__stg");
     let text = run("pactl", &["list", "modules", "short"]).unwrap_or_default();
     let mon = format!("source={bus}.monitor");
     let post_mon = format!("source={post}.monitor");
+    let post_stg_mon = format!("source={post_stg}.monitor");
     let sink_bus = format!("sink={bus}");
     let sink_post = format!("sink={post}");
+    let sink_post_stg = format!("sink={post_stg}");
     let mut unloaded = 0u32;
     for line in text.lines() {
         let mut parts = line.splitn(3, '\t');
@@ -1205,10 +1244,15 @@ fn unload_loopbacks_for_track_bus(bus: &str, _fx_name: &str) -> u32 {
         let outbound = args.contains(&mon);
         let fx_touch = args.contains(&fx_prefix)
             || args.contains(&legacy_fx)
+            || args.contains(&live_fx)
+            || args.contains(&stg_fx)
             || args.contains(&mid_prefix);
         let post_touch = args.contains(&post_mon)
+            || args.contains(&post_stg_mon)
             || args.contains(&sink_post)
-            || args.contains(&post);
+            || args.contains(&sink_post_stg)
+            || args.contains(&post)
+            || args.contains(&post_stg);
         let mic_in = args.contains(&sink_bus) && !args.contains("source=buschain_");
         if !(outbound || fx_touch || post_touch || mic_in) {
             continue;
@@ -1235,6 +1279,18 @@ fn unload_mids_for_bus(bus: &str) {
 fn unload_post_sink_for_bus(bus: &str) {
     let post = crate::audio::filter_chain::post_name_for_bus(bus);
     let _ = unload_named_null_sink(&post);
+    let _ = unload_named_null_sink(&format!("{post}__stg"));
+}
+
+/// Map `buschain_post_*` (+ optional `__stg`) → owning bus name.
+fn bus_for_post_sink(name: &str) -> Option<String> {
+    let base = name.strip_suffix("__stg").unwrap_or(name);
+    if base == "buschain_post_master" {
+        Some("buschain_master".into())
+    } else {
+        base.strip_prefix("buschain_post_")
+            .map(|id| format!("buschain_track_{id}"))
+    }
 }
 
 /// Remove track buses / FX helpers that no longer belong to any session track.
@@ -1293,15 +1349,12 @@ pub fn prune_orphan_buschain_track_sinks(
                 let _ = unload_named_null_sink(&name);
             }
         }
-        // Orphan post-FX meter sinks
+        // Orphan post-FX meter sinks (canonical + `__stg` A/B generation).
         if name.starts_with("buschain_post_") {
-            let bus = if name == "buschain_post_master" {
-                "buschain_master".to_string()
-            } else {
-                name.replacen("buschain_post_", "buschain_track_", 1)
-            };
-            if !keep_bus.contains(&bus) {
-                let _ = unload_named_null_sink(&name);
+            if let Some(bus) = bus_for_post_sink(&name) {
+                if !keep_bus.contains(&bus) {
+                    let _ = unload_named_null_sink(&name);
+                }
             }
         }
     }
@@ -1835,7 +1888,10 @@ pub fn rewire_track_route(
     // Sync DesiredState egress before any arm intent.
     crate::audio::engine_handle::sync_desired_from_session(session, hw_sink);
 
-    let mut has_fx = !inserts.is_empty() && fx_path_audible(&bus);
+    // Helper alive (canonical or `__stg`) counts as FX present even if post→dest
+    // briefly flaps — otherwise every track dry-bypassed plugins after A/B.
+    let helper_live = buschain_engine::any_gen_live(&bus);
+    let mut has_fx = !inserts.is_empty() && (fx_path_audible(&bus) || helper_live);
     let mut warnings = Vec::new();
     // Route/Hotplug must never ForceRespawn — only RewireTrackFx / ClockBind.
     if allow_fx_ensure && !inserts.is_empty() && !has_fx {
@@ -1866,13 +1922,19 @@ pub fn rewire_track_route(
     // Master→HW is owned by ArmSession / reconcile (session barrier). Never arm here.
     if is_master {
         crate::audio::engine_handle::remember_master_hw(hw_sink);
+        // Still re-assert wet Master egress when inserts/helpers are live.
+        if !inserts.is_empty() && has_fx {
+            if let Err(e) = crate::audio::engine_handle::arm_track_egress(&bus, true) {
+                warnings.push(format!("arm wet master: {e:#}"));
+            }
+        }
     } else if !inserts.is_empty() {
-        if has_fx {
+        if has_fx || helper_live {
             if let Err(e) = crate::audio::engine_handle::arm_track_egress(&bus, true) {
                 warnings.push(format!("arm wet: {e:#}"));
             }
         } else if allow_fx_ensure {
-            // Ensure already ran restore_dry — arm dry egress via engine.
+            // Ensure already ran restore_dry — arm dry only when no helper exists.
             if let Err(e) = crate::audio::engine_handle::arm_track_egress(&bus, false) {
                 warnings.push(format!("arm dry fallback: {e:#}"));
             }
@@ -1965,13 +2027,19 @@ pub fn rewire_track_fx(
         let _ = ensure_bus_keepalive(&bus);
     }
 
-    // Clean legacy per-slot helpers if any remain.
+    // Clean legacy per-slot helpers if any remain — never touch A/B live/staging.
     let mid_prefix = crate::audio::filter_chain::slot_mid_prefix(&bus);
     let fx_slot_prefix = crate::audio::filter_chain::slot_fx_prefix(&bus);
+    let live_fx = buschain_engine::live_fx_name(&bus);
+    let can_fx = crate::audio::filter_chain::fx_name_for_bus(&bus);
+    let stg_fx = format!("{can_fx}__stg");
     for s in list_sinks().unwrap_or_default() {
+        if s.name.ends_with("__stg") || s.name == live_fx || s.name == can_fx || s.name == stg_fx
+        {
+            continue;
+        }
         if s.name.starts_with(&mid_prefix)
-            || (s.name.starts_with(&fx_slot_prefix)
-                && s.name != crate::audio::filter_chain::fx_name_for_bus(&bus))
+            || (s.name.starts_with(&fx_slot_prefix) && s.name != can_fx)
         {
             let _ = unload_named_null_sink(&s.name);
         }
@@ -1987,8 +2055,15 @@ pub fn rewire_track_fx(
     let fx_result =
         crate::audio::insert_map::ensure_track_fx(session, track_id, &dest, mode);
 
-    // Link-only — FX ensure already ran above (no second ForceRespawn).
-    let route_msg = rewire_track_route(session, track_id, &hw_sink, false)?;
+    // Always re-assert wet post→dest after ensure. Skipping Master used to leave
+    // dry bus→HW after idle reconcile chased the wrong A/B generation.
+    if is_master {
+        crate::audio::engine_handle::remember_master_hw(&hw_sink);
+    }
+    let route_msg = match crate::audio::engine_handle::arm_track_egress(&bus, true) {
+        Ok(()) => format!("Route {bus} · post→dest"),
+        Err(e) => format!("Route {bus} · arm warn: {e:#}"),
+    };
     open_track_audio(session, track_id, &bus)?;
 
     if let Some(t) = session.tracks.iter_mut().find(|t| t.id == track_id) {
@@ -1998,7 +2073,6 @@ pub fn rewire_track_fx(
     match fx_result {
         Ok((_, fx_msg)) => Ok(format!("{fx_msg} · {route_msg}")),
         Err(e) => {
-            // Do not report ok=true when FX died — UI/idle must retry ForceRespawn.
             crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
             Err(anyhow!("FX failed (dry fallback): {e:#} · {route_msg}"))
         }

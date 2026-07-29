@@ -188,19 +188,32 @@ pub fn push_description(name: &str, description: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when module args name this sink exactly (not a `__stg` / prefix sibling).
+fn module_args_sink_name(args: &str, name: &str) -> bool {
+    for tok in args.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("sink_name=") {
+            if v == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn unload_named_null_sink(name: &str) -> Result<()> {
     let out = std::process::Command::new("pactl")
         .args(["list", "short", "modules"])
         .output()
         .context("pactl list modules")?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let needle = format!("sink_name={name}");
     for line in text.lines() {
         let mut parts = line.splitn(3, '\t');
         let Some(idx) = parts.next() else { continue };
         let Some(mod_name) = parts.next() else { continue };
         let args = parts.next().unwrap_or("");
-        if mod_name == "module-null-sink" && args.contains(&needle) {
+        // Exact token match — `contains("sink_name=buschain_post_master")` also
+        // matched `buschain_post_master__stg` and killed the live A/B generation.
+        if mod_name == "module-null-sink" && module_args_sink_name(args, name) {
             let _ = std::process::Command::new("pactl")
                 .args(["unload-module", idx])
                 .status();

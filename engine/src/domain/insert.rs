@@ -28,6 +28,8 @@ pub struct ChainSpec {
 }
 
 impl ChainSpec {
+    /// Canonical generation names only. Live routing after A/B must use
+    /// `live_fx_name` / `live_post_name` (see `pipeline::insert::live_wire_plan`).
     pub fn wire_plan(&self) -> WirePlan {
         WirePlan {
             bus: self.bus.clone(),
@@ -38,14 +40,18 @@ impl ChainSpec {
     }
 
     pub fn signature(&self) -> String {
-        let body = self
-            .inserts
-            .iter()
-            .map(|p| format!("{}:{}", p.slot_id.simple(), normalize_ladspa_label(&p.plugin_key)))
-            .collect::<Vec<_>>()
-            .join("|");
-        format!("mono2|{body}")
+        inserts_signature(&self.inserts)
     }
+}
+
+/// Topology fingerprint for Props gating (slot order + plugin keys; not bypass/knobs).
+pub fn inserts_signature(inserts: &[InsertSlot]) -> String {
+    let body = inserts
+        .iter()
+        .map(|p| format!("{}:{}", p.slot_id.simple(), normalize_ladspa_label(&p.plugin_key)))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("mono2|{body}")
 }
 
 /// Resolved physical nodes for the sealed wet path.

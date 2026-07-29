@@ -62,14 +62,16 @@ Defined in `app/src/audio/live.rs`. Maps to worker commands → `buschain-engine
 | Op | Engine intent | Forbidden |
 |----|---------------|-----------|
 | Power / knobs / mix | `PushFxControls` → Props (lock-free of Engine ensure) | Respawn; Mix-as-power; plugin-identity branches |
-| Add / remove / reorder | Async `EnsureFxChain(Force)` + dry link + monitor gate + soft-cutover | Route/Hotplug ForceRespawn; audible dry/partial FX while Building; HOL Props thread |
+| Add / remove / reorder | Async A/B cutover (warm) or cold ForceRespawn + monitor gate | Route/Hotplug ForceRespawn; audible dry while Building; HOL Props thread |
 | Cold bring-up / Full Apply | `ArmSession` (warm-adopt if graph already healthy) | App `pw-link` / last-resort dry while Building |
 | Route (HW / targets) | `arm_track_egress` after Wet (+ dwell) | Dry bypass while Building; arm Master→HW in app |
 | Mute / fader | Levels on outbound path | Mute/zero app-facing sink |
 
 ### End-to-end track arming
 
-- **Building (ForceRespawn)**: keep dry `bus→dest` *link* (no cork) but **gate `{bus}.monitor`** so output is silent until the full wet rack is sealed; feed FX + hold. Soft-cutover arms `post→dest`, drops dry, then ungates monitor.
+- **Building (warm / wet already)**: A/B dual helper — spawn `buschain_fx_*__stg` behind live, wet/wet flip, retire old. **No monitor gate** (continuous audio). Props target live generation via `live_fx_name`.
+- **Building (cold / no live wet)**: keep dry `bus→dest` *link* (no cork) but **gate `{bus}.monitor`** until the full wet rack is sealed; then soft-cutover + ungate.
+- **Ideal later**: in-process DSP host (see `docs/ROADMAP.md`) — PipeWire as I/O only; sample-accurate rack mutation.
 - **Dwell**: ~60ms continuous spine ready before arming wet egress (flap resets timer). Dry tracks use ~40ms existence check.
 - **Session barrier**: on cold `ArmSession`, keep Master→HW disarmed until Master spine ready **and** every unmuted non-master insert track is `Wet` or `Failed` (Failed+dry = resolved). Latch `speakers_armed` so idle reconcile does not re-silence.
 - **Warm adopt (UI restart)**: if live PW already matches Desired (buses, FX signature+spine, Master→HW), latch `speakers_armed` and Idempotent-reconcile — do **not** disarm or ForceRespawn. Fail closed → cold arm.

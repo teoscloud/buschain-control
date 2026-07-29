@@ -136,6 +136,50 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
 
     plugin_windows::prune_plugin_windows(state);
     plugin_windows::draw_plugin_windows(ctx, state);
+
+    if state.graph_loading {
+        draw_graph_loading_overlay(ctx, state);
+    }
+}
+
+fn draw_graph_loading_overlay(ctx: &egui::Context, state: &AppState) {
+    let theme = state.theme;
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("graph_loading_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(12, 14, 18, 200),
+            );
+            let msg = if state.status.starts_with("Loading audio graph") {
+                state.status.as_str()
+            } else {
+                "Loading audio graph — starting FX racks…"
+            };
+            let galley = painter.layout_no_wrap(
+                msg.to_string(),
+                egui::FontId::proportional(16.0),
+                theme.text(),
+            );
+            let pos = rect.center() - galley.size() * 0.5;
+            painter.galley(pos, galley, theme.text());
+            let sub = painter.layout_no_wrap(
+                "App is awake — PipeWire helpers can take a few seconds.".to_string(),
+                egui::FontId::proportional(12.0),
+                theme.text_muted(),
+            );
+            let sub_pos = egui::pos2(
+                rect.center().x - sub.size().x * 0.5,
+                pos.y + 28.0,
+            );
+            painter.galley(sub_pos, sub, theme.text_muted());
+        });
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
 }
 
 fn popup_favorites_path() -> std::path::PathBuf {

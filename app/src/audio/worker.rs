@@ -920,9 +920,10 @@ fn process_command_batch(
                         Err(e) => {
                             let msg = format!("{e:#}");
                             span.end(format!("skip {msg}"));
-                            // Rebuild / transient miss — keep wet cache; UI retries quietly.
+                            // Rebuild / A/B miss — keep wet cache; do not storm status/retries.
                             let deferred = msg.contains("rebuilding")
-                                || msg.contains("props deferred");
+                                || msg.contains("props deferred")
+                                || msg.contains("not found");
                             if !deferred {
                                 crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
                                 let _ = tx.send(Event::Status(format!(
@@ -939,7 +940,8 @@ fn process_command_batch(
                     {
                         let msg = format!("{e:#}");
                         let deferred = msg.contains("rebuilding")
-                            || msg.contains("props deferred");
+                            || msg.contains("props deferred")
+                            || msg.contains("not found");
                         if !deferred {
                             if let Some(t) = session.tracks.iter().find(|t| t.id == track_id) {
                                 let bus = t.expected_sink_name();

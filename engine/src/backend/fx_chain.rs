@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::domain::{normalize_ladspa_label, ChainSpec, InsertSlot};
+use crate::domain::{inserts_signature, normalize_ladspa_label, ChainSpec, InsertSlot};
 
 /// Cache `pw-cli ls Node` lookups — that command is the dominant cost of live knob pushes.
 fn node_id_cache() -> &'static Mutex<HashMap<String, (u32, Instant)>> {
@@ -136,24 +136,25 @@ impl FilterChainRuntime {
             }
         }
         self.children = left;
-        let pattern = format!("pipewire -c .*/buschain-control-fx/{fx_name}\\.conf");
+        // Exact conf path — never a basename regex that could widen unexpectedly.
+        let conf = self.conf_dir.join(format!("{fx_name}.conf"));
+        let pattern = format!("pipewire -c {}", conf.display());
         let _ = Command::new("pkill")
             .args(["-f", &pattern])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         if wipe_conf {
-            let conf = self.conf_dir.join(format!("{fx_name}.conf"));
             let _ = fs::remove_file(&conf);
             let _ = fs::remove_file(signature_path(&self.conf_dir, fx_name));
         }
-        // Short wait — long polls HOL the worker; sink usually vanishes in <100ms.
-        let deadline = std::time::Instant::now() + Duration::from_millis(160);
+        // Short wait — long polls HOL the worker; sink usually vanishes quickly.
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
         while std::time::Instant::now() < deadline {
             if !sink_exists(fx_name) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(12));
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -259,12 +260,26 @@ pub fn sink_has_input(name: &str) -> bool {
 
 pub fn find_node_id_by_name(node_name: &str) -> Option<u32> {
     const TTL: Duration = Duration::from_secs(45);
-    if let Ok(g) = node_id_cache().lock() {
-        if let Some((id, at)) = g.get(node_name) {
-            if at.elapsed() < TTL {
-                return Some(*id);
-            }
+    let stale = node_id_cache()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(node_name).map(|(id, at)| (*id, *at)));
+    if let Some((id, at)) = stale {
+        if at.elapsed() < TTL {
+            return Some(id);
         }
+        // Expired — refresh. On CLI timeout keep the stale id while the sink lives
+        // (false "not found" was kicking Props storms + destructive A/B retries).
+        if let Some(id) = find_node_id_by_name_uncached(node_name) {
+            if let Ok(mut g) = node_id_cache().lock() {
+                g.insert(node_name.to_string(), (id, Instant::now()));
+            }
+            return Some(id);
+        }
+        if sink_exists(node_name) {
+            return Some(id);
+        }
+        return None;
     }
     let id = find_node_id_by_name_uncached(node_name)?;
     if let Ok(mut g) = node_id_cache().lock() {
@@ -512,16 +527,16 @@ fn push_props_on_node(fx_name: &str, entries: &[String]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    // Fast-fail before `pw-cli ls Node` (CLI_TIMEOUT ~400ms) when FX is down.
-    if !sink_exists(fx_name) {
-        invalidate_node_id_cache(Some(fx_name));
-        return Err(anyhow!(
-            "FX node `{fx_name}` not found for live param push"
-        ));
-    }
+    // Prefer node-id / pw-cli over pactl short-sinks — under ForceRespawn storms
+    // sink_exists false-negatives while the filter-chain node is already up.
     let mut tried_refresh = false;
     loop {
         let Some(id) = find_node_id_by_name(fx_name) else {
+            if !tried_refresh {
+                invalidate_node_id_cache(Some(fx_name));
+                tried_refresh = true;
+                continue;
+            }
             return Err(anyhow!("FX node `{fx_name}` not found for live param push"));
         };
         let params = entries.join(" ");
@@ -554,9 +569,16 @@ pub fn push_insert_controls(fx_name: &str, inserts: &[InsertSlot]) -> Result<()>
     if crate::fx_busy::is_rebuilding(fx_name) {
         return Err(anyhow!("FX rebuilding — props deferred"));
     }
+    // Props are index-mapped (`n0`, `n1`, …). If Desired order/count ≠ live `.sig`,
+    // a remove/reorder push onto the old gen briefly writes the next plugin's
+    // Bypass=0 onto the removed (often powered-off) slot — audible until cutover.
+    let want = inserts_signature(inserts);
+    if let Some(have) = read_signature(fx_name) {
+        if have != want {
+            return Err(anyhow!("FX topology mismatch — props deferred"));
+        }
+    }
     let span = crate::fx_trace::span("PushFxControls");
-    // Hot path: do not gate on .sig / pactl. Stale topology is an ensure/rewire
-    // concern — rejecting knobs here makes the UI feel multi-second delayed.
     let mut entries = Vec::new();
     for (i, plug) in inserts.iter().enumerate() {
         let node = format!("n{i}");
@@ -571,6 +593,16 @@ pub fn push_insert_controls(fx_name: &str, inserts: &[InsertSlot]) -> Result<()>
         Err(e) => span.end(format!("{fx_name} ERR {e:#}")),
     }
     r
+}
+
+/// Spawn helper from an already-written conf (Phase 1: conf prepared before stop).
+pub fn spawn_pipewire_conf_from_prepared(
+    runtime: &mut FilterChainRuntime,
+    fx_name: &str,
+    conf_path: &Path,
+    post_name: &str,
+) -> Result<()> {
+    spawn_pipewire_conf(runtime, fx_name, conf_path, post_name)
 }
 
 fn spawn_pipewire_conf(
@@ -671,19 +703,34 @@ fn spawn_pipewire_conf(
     ))
 }
 
-/// Spawn monolithic multi-plugin FX for `spec.bus`. Playback targets post null-sink.
+/// Spawn monolithic multi-plugin FX for `spec.bus` at canonical wire-plan names.
 pub fn spawn_sidechain(
     runtime: &mut FilterChainRuntime,
     spec: &ChainSpec,
     clock_fragment: &str,
 ) -> Result<()> {
     let plan = spec.wire_plan();
-    let fx_name = plan.fx_sink.as_str();
-    let post_name = plan.post_sink.as_str();
-    let description = format!("BusChainControl_FX_{}", crate::domain::bus_suffix(spec.bus.as_str()));
+    spawn_sidechain_named(
+        runtime,
+        spec,
+        plan.fx_sink.as_str(),
+        plan.post_sink.as_str(),
+        clock_fragment,
+    )
+}
 
-    // Caller (`ensure_fx_chain`) already stopped the helper — do not double-kill
-    // (second stop_one burned up to ~800ms and HOL'd knobs/Props).
+/// Spawn FX helper with explicit sink names (canonical or `__stg` for A/B).
+pub fn spawn_sidechain_named(
+    runtime: &mut FilterChainRuntime,
+    spec: &ChainSpec,
+    fx_name: &str,
+    post_name: &str,
+    clock_fragment: &str,
+) -> Result<()> {
+    let description = format!(
+        "BusChainControl_FX_{}",
+        crate::domain::bus_suffix(spec.bus.as_str())
+    );
 
     let conf_path = runtime.conf_dir.join(format!("{fx_name}.conf"));
     write_fx_sink_conf(
@@ -697,6 +744,30 @@ pub fn spawn_sidechain(
     spawn_pipewire_conf(runtime, fx_name, &conf_path, post_name)?;
     write_signature(&runtime.conf_dir, fx_name, &spec.signature())?;
     Ok(())
+}
+
+/// Write conf only (Phase 1: prepare next rack before stopping the live helper).
+pub fn prepare_fx_conf(
+    runtime: &FilterChainRuntime,
+    fx_name: &str,
+    post_name: &str,
+    spec: &ChainSpec,
+    clock_fragment: &str,
+) -> Result<PathBuf> {
+    let description = format!(
+        "BusChainControl_FX_{}",
+        crate::domain::bus_suffix(spec.bus.as_str())
+    );
+    let conf_path = runtime.conf_dir.join(format!("{fx_name}.conf"));
+    write_fx_sink_conf(
+        &conf_path,
+        fx_name,
+        &description,
+        post_name,
+        &spec.inserts,
+        clock_fragment,
+    )?;
+    Ok(conf_path)
 }
 
 /// Find the Pulse sink-input for `{fx_name}_out` and move it onto `post_name`.

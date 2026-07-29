@@ -2106,7 +2106,9 @@ fn draw_plugin_browser(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize
             .push(plugin_ref_with_defaults(id));
         let tid = state.session.tracks[track_idx].id;
         state.schedule_fx_rewire(tid);
-        if !state.status.starts_with("Live graph bring-up") {
+        if !state.status.starts_with("Loading audio graph")
+            && !state.status.starts_with("Live graph bring-up")
+        {
             state.status = format!("Added {name} — live slot rewire…");
         }
     }

@@ -72,8 +72,8 @@ Hard rules:
 - Never mute `{bus}.monitor` during wet switch (corks Chromium).
 - Never return “OK dry” when the rack is non-empty — return `Failed` with spawn log.
 - Keepalive `{bus}.monitor → buschain_hold` always preserved.
-- Never open dry→dest while Building.
-- v1 process path: **LADSPA only** (monolithic `n0→n1→…` filter-chain).
+- Never open dry→dest while Building (cold path). Warm structural edits use **A/B cutover** (`buschain_fx_*__stg`) so the live rack stays audible until flip.
+- v1 process path: **LADSPA only** (monolithic `n0→n1→…` filter-chain). Ideal later: in-process DSP host — see `docs/ROADMAP.md`.
 
 ## GraphSupervisor (`Engine::reconcile`)
 

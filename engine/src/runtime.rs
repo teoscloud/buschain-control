@@ -18,6 +18,7 @@ use crate::domain::{
     fx_name_for_bus, post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
     LinkSpec, NodeRole, NodeSpec, Props,
 };
+use crate::fx_gen::{any_gen_live, live_fx_name, live_post_name};
 use crate::plan::DesiredState;
 use crate::pipeline;
 
@@ -231,10 +232,12 @@ impl Engine {
         let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
         let mut n = 0u32;
         for bus in buses {
-            let post = post_name_for_bus(&bus);
-            if sink_exists(&post) {
-                let _ = self.backend.destroy_node(&post);
-                n += 1;
+            // Both A/B generations — leaving `__stg` posts behind re-broke wet routing.
+            for post in [post_name_for_bus(&bus), crate::fx_gen::staging_post(&bus)] {
+                if sink_exists(&post) {
+                    let _ = self.backend.destroy_node(&post);
+                    n += 1;
+                }
             }
         }
         // Also sweep any orphan posts not in desired buses.
@@ -439,9 +442,10 @@ impl Engine {
                 continue;
             }
             let from = format!("{bus}.monitor");
-            let post = post_name_for_bus(bus);
+            // Live A/B generation — canonical-only names left `__stg` racks dry→HW.
+            let post = live_post_name(bus);
             let post_mon = format!("{post}.monitor");
-            let fx = fx_name_for_bus(bus);
+            let fx = live_fx_name(bus);
             let dests = self.desired.egress_dests(bus);
             let dest_refs: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
             let allow_egress = if bus == "buschain_master" {
@@ -495,8 +499,8 @@ impl Engine {
                             let _ = self.backend.unlink_raw(&from, d);
                         }
                     }
-                } else if !sink_exists(&fx) {
-                    // Truly Building — no FX node yet; strip premature post→dest.
+                } else if !sink_exists(&fx) && !any_gen_live(bus) {
+                    // Truly Building — no FX generation at all; strip premature post→dest.
                     let mut had_post = false;
                     for d in &dests {
                         if link_is_live(&post_mon, d) {
@@ -596,8 +600,7 @@ impl Engine {
             if keep.contains(&bus) {
                 continue;
             }
-            let fx = fx_name_for_bus(&bus);
-            if sink_exists(&fx) {
+            if any_gen_live(&bus) {
                 if let Err(e) = self.teardown_fx_chain(&bus) {
                     report.push(format!("FX teardown {bus}: {e:#}"));
                 } else {
@@ -615,8 +618,10 @@ impl Engine {
                 self.prune_orphan_post(&bus, &dest);
                 continue;
             }
-            let fx = fx_name_for_bus(&bus);
-            if self.fx.spawn_in_backoff(&fx) {
+            let fx = live_fx_name(&bus);
+            if self.fx.spawn_in_backoff(&fx)
+                || self.fx.spawn_in_backoff(&fx_name_for_bus(&bus))
+            {
                 // Still prune parallel dry+post while waiting — avoids chorus.
                 if !self.chain_is_wet(&bus) {
                     self.prune_orphan_post(&bus, &dest);
@@ -659,7 +664,7 @@ impl Engine {
                                 report.push(format!("FX {bus}: re-armed egress"));
                             }
                         }
-                    } else if !sink_exists(&fx) {
+                    } else if !sink_exists(&fx) && !any_gen_live(&bus) {
                         self.prune_orphan_post(&bus, &dest);
                     }
                     if !e.contains("backoff") && !e.contains("not audible") {
@@ -667,13 +672,13 @@ impl Engine {
                     }
                 }
                 Ok(_) => {
-                    // Building — only strip post when FX node is gone.
-                    if !sink_exists(&fx) {
+                    // Building — only strip post when no FX generation exists.
+                    if !sink_exists(&fx) && !any_gen_live(&bus) {
                         self.prune_orphan_post(&bus, &dest);
                     }
                 }
                 Err(e) => {
-                    if !sink_exists(&fx) {
+                    if !sink_exists(&fx) && !any_gen_live(&bus) {
                         self.prune_orphan_post(&bus, &dest);
                     }
                     report.push(format!("FX {bus}: {e:#}"));
@@ -688,7 +693,8 @@ impl Engine {
         if pipeline::arm::spine_instant_ready(bus) {
             return;
         }
-        let post = post_name_for_bus(bus);
+        // Live generation (may be `__stg` after A/B) — never only the canonical name.
+        let post = live_post_name(bus);
         let post_mon = format!("{post}.monitor");
         if dest.is_empty() {
             let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
@@ -722,10 +728,14 @@ impl Engine {
                 // feed often drops while fx/post nodes remain. The old branch only
                 // restored links when spine_ok was already true → forever on
                 // buschain_hold (meters alive via hold/bus, audible silence).
-                let post = post_name_for_bus(master);
-                let post_mon = format!("{post}.monitor");
-                let fx = fx_name_for_bus(master);
-                if sink_exists(&fx) {
+                //
+                // CRITICAL: use live A/B generation. Canonical-only checks treated a
+                // healthy `buschain_fx_master__stg` as "missing", stripped the wet
+                // path, and fail-opened dry master→HW (plugins silently skipped).
+                if any_gen_live(master) || sink_exists(&live_fx_name(master)) {
+                    let fx = live_fx_name(master);
+                    let post = live_post_name(master);
+                    let post_mon = format!("{post}.monitor");
                     let _ = self
                         .backend
                         .unlink_from_source_except(&from, &[&fx, "buschain_hold"]);
@@ -762,10 +772,11 @@ impl Engine {
                 } else if self.desired.fx_failed.contains(master) {
                     // FX ensure failed (e.g. legacy plugin labels) — fail-open dry
                     // Master→HW so system audio is not stuck on hold forever.
-                    let post = post_name_for_bus(master);
-                    let post_mon = format!("{post}.monitor");
-                    if link_is_live(&post_mon, &hw) || sink_exists(&post) {
-                        let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                    for post in [live_post_name(master), post_name_for_bus(master)] {
+                        let post_mon = format!("{post}.monitor");
+                        if link_is_live(&post_mon, &hw) || sink_exists(&post) {
+                            let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                        }
                     }
                     wake_sink(&hw);
                     let _ = self
@@ -790,10 +801,11 @@ impl Engine {
             } else {
                 // Dry Master: never leave orphan post→HW (parallel with master→HW =
                 // delayed double = chorus/echo). Prune post outs every idle pass.
-                let post = post_name_for_bus(master);
-                let post_mon = format!("{post}.monitor");
-                if link_is_live(&post_mon, &hw) || sink_exists(&post) {
-                    let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                for post in [live_post_name(master), post_name_for_bus(master)] {
+                    let post_mon = format!("{post}.monitor");
+                    if link_is_live(&post_mon, &hw) || sink_exists(&post) {
+                        let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                    }
                 }
                 if link_is_live(&from, &hw) {
                     // Healthy dry Master→HW — leave master links alone (meter stability).
@@ -914,8 +926,12 @@ impl Engine {
                 if !pipeline::arm::spine_instant_ready(bus) {
                     return false;
                 }
-                let fx = fx_name_for_bus(bus);
-                if read_signature(&fx).as_deref() != Some(spec.signature().as_str()) {
+                // Signature on whichever generation is live (canonical or `__stg`).
+                let want = spec.signature();
+                let sig_ok = [&live_fx_name(bus), &fx_name_for_bus(bus), &crate::fx_gen::staging_fx(bus)]
+                    .into_iter()
+                    .any(|fx| read_signature(fx).as_deref() == Some(want.as_str()));
+                if !sig_ok {
                     return false;
                 }
                 // Spines + signatures are enough for warm adopt. Missing post→dest
@@ -1155,7 +1171,7 @@ impl Engine {
     }
 
     pub fn push_fx_controls(&mut self, bus: &str, inserts: Vec<InsertSlot>) -> Result<()> {
-        let fx_name = crate::domain::fx_name_for_bus(bus);
+        let fx_name = live_fx_name(bus);
         // Props-only — never pactl here. Existence is owns_live / .sig / last-resort
         // sink_exists inside pipeline::insert::push_fx_controls.
         pipeline::insert::push_fx_controls(&mut self.fx, &fx_name, &inserts)?;
@@ -1194,8 +1210,8 @@ impl Engine {
             }
             _ => {
                 // Orphan / restart: treat existing FX sink as a candidate wet path.
-                let fx = crate::domain::fx_name_for_bus(bus);
-                if !crate::backend::sink_exists(&fx) {
+                let fx = live_fx_name(bus);
+                if !crate::backend::sink_exists(&fx) && !any_gen_live(bus) {
                     return ChainState::Dry;
                 }
                 let dest = if bus == "buschain_master" {

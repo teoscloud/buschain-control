@@ -937,6 +937,16 @@ macro_rules! eq8_bands {
                 modes: None,
                 logarithmic: false,
             },
+            ParamDef {
+                key: "Bypass",
+                label: "Bypass",
+                kind: ParamKind::Toggle,
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+                modes: None,
+                logarithmic: false,
+            },
         ]
     };
 }

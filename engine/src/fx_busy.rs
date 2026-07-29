@@ -24,7 +24,7 @@ fn busy() -> &'static Mutex<BusyState> {
     })
 }
 
-const SETTLE: Duration = Duration::from_millis(250);
+const SETTLE: Duration = Duration::from_millis(120);
 
 pub fn mark_rebuilding(fx_name: &str, on: bool) {
     let Ok(mut g) = busy().lock() else {

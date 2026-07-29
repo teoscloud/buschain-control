@@ -8,8 +8,9 @@ mod null_sink;
 pub use cli::invalidate_probe_caches;
 
 pub use fx_chain::{
-    find_node_id_by_name, push_insert_controls, read_signature, sink_exists, sink_has_input,
-    spawn_sidechain, FilterChainRuntime,
+    find_node_id_by_name, prepare_fx_conf, push_insert_controls, read_signature, sink_exists,
+    sink_has_input, spawn_pipewire_conf_from_prepared, spawn_sidechain, spawn_sidechain_named,
+    write_signature, FilterChainRuntime,
 };
 
 /// Gate outbound `{bus}.monitor` without muting the app-facing sink (avoids cork).

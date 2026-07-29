@@ -11,15 +11,9 @@ use crate::session::Session;
 use egui::TextureHandle;
 use uuid::Uuid;
 
-/// Post-FX meter sink for a bus (`buschain_master` → `buschain_post_master`).
+/// Post-FX meter sink for a bus — live A/B generation (canonical or `__stg`).
 fn post_meter_sink(bus: &str) -> String {
-    if bus == "buschain_master" {
-        "buschain_post_master".into()
-    } else if let Some(id) = bus.strip_prefix("buschain_track_") {
-        format!("buschain_post_{id}")
-    } else {
-        bus.to_string()
-    }
+    buschain_engine::live_post_name(bus)
 }
 
 /// In-app plugin editor (never a separate OS/viewport window).
@@ -98,6 +92,8 @@ pub struct AppState {
     pub request_show: bool,
     /// Tray asked to withdraw the main window.
     pub request_hide: bool,
+    /// Cold ApplySession / ArmSession in flight — show loading chrome until done.
+    pub graph_loading: bool,
 }
 
 impl AppState {
@@ -166,13 +162,14 @@ impl AppState {
             request_quit: false,
             request_show: false,
             request_hide: false,
+            graph_loading: !via_daemon,
         };
         state.refresh_performance_from_device();
         if via_daemon {
             state.status = "Connected to external daemon (--daemon-client)".into();
         } else {
             state.worker.send(Command::ApplySession(state.session.clone()));
-            state.status = "in-process — graph bring-up…".into();
+            state.status = "Loading audio graph — FX racks starting (this can take a few seconds)…".into();
         }
         state
     }
@@ -233,8 +230,9 @@ impl AppState {
             self.levels_pending_full = false;
             self.worker
                 .send(Command::ApplySession(self.session.clone()));
+            self.graph_loading = true;
             self.status = format!(
-                "Live graph bring-up ({}) — streams stay on buses…",
+                "Loading audio graph ({}) — streams stay on buses…",
                 change.label()
             );
             return;
@@ -1092,19 +1090,22 @@ impl AppState {
                 Event::Status(s) => {
                     let skipped = s.starts_with("Live params skipped");
                     let live_ok = s.starts_with("Live params →");
+                    let missing = skipped && s.contains("not found");
                     if !self.status.starts_with("Reattached") {
                         self.status = s;
                     }
                     if skipped {
-                        // Wet race: fewer, slower retries — 100ms×20 under pactl load
-                        // was a multi-second storm that killed ForceRespawn visibility.
-                        if self.params_track.is_some() && self.params_retry_count < 8 {
+                        // Missing FX node after A/B: don't storm Props — wait for ensure.
+                        let max = if missing { 2 } else { 6 };
+                        if self.params_track.is_some() && self.params_retry_count < max {
                             self.params_retry_armed = true;
                             self.params_retry_count =
                                 self.params_retry_count.saturating_add(1);
-                            self.params_deadline =
-                                Some(Instant::now() + Duration::from_millis(250));
-                        } else if self.params_retry_count >= 8 {
+                            self.params_deadline = Some(
+                                Instant::now()
+                                    + Duration::from_millis(if missing { 400 } else { 250 }),
+                            );
+                        } else if self.params_retry_count >= max && !missing {
                             self.status =
                                 "FX control stuck — params not wet after retries".into();
                         }
@@ -1136,8 +1137,12 @@ impl AppState {
                                 }
                             }
                         }
+                        let graph_ok = message.starts_with("Graph OK");
                         self.status = message;
                         self.sync_meter_targets();
+                        if graph_ok || self.graph_is_live() {
+                            self.graph_loading = false;
+                        }
                         continue;
                     }
 
@@ -1170,6 +1175,7 @@ impl AppState {
                             || message.contains("adopted");
                         self.status = message;
                         self.dirty = false;
+                        self.graph_loading = false;
                         if clockish {
                             self.force_meter_rebind(true);
                         } else {
@@ -1179,6 +1185,9 @@ impl AppState {
                     } else {
                         // Keep local knob/fader edits; only refresh status text.
                         self.status = message;
+                        if self.graph_is_live() {
+                            self.graph_loading = false;
+                        }
                     }
                 }
             }

@@ -31,6 +31,22 @@
 
 ## Next
 
+- [ ] Dual-helper A/B FX cutover (near-seamless add/remove/reorder under `pipewire -c`)
 - [ ] Native in-process VST3 backend (replace Carla adapter)
 - [ ] Real CLAP instantiate + process
+
+## Ideal / later — in-process DSP host (the “leap”)
+
+Today FX is an out-of-process `pipewire -c` + `libpipewire-module-filter-chain` helper
+per bus. Topology is baked at module load, so add/remove/reorder cannot mutate the
+live graph via Props; A/B dual helpers are the best seamlessness under that model.
+
+**State of the art (future):** run the insert rack inside BusChain (or a dedicated
+DSP thread we own). PipeWire becomes I/O only (bus capture / HW playback). Plugins
+are still black boxes (`process()` + advertised ports); the host owns an in-memory
+graph so add/remove/reorder/bypass are realtime list updates — true DAW-grade
+structural edits with no helper respawn.
+
+Do **not** start this until A/B cutover metrics say residual gap is still unacceptable.
+Do **not** resurrect per-slot OS processes as a substitute.
 

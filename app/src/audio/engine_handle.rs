@@ -176,8 +176,9 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             if keep.contains(&bus) {
                 continue;
             }
-            let fx = fx_name_for_bus(&bus);
-            if sink_exists(&fx) || eng.chain_is_wet(&bus) {
+            let fx = buschain_engine::live_fx_name(&bus);
+            let stg = format!("{}__stg", fx_name_for_bus(&bus));
+            if sink_exists(&fx) || sink_exists(&stg) || eng.chain_is_wet(&bus) {
                 let _ = eng.teardown_fx_chain(&bus);
             }
         }
@@ -216,12 +217,16 @@ pub fn arm_session(session: &Session, hw_sink: &str, force_fx: bool) -> anyhow::
 }
 
 /// Arm one track's configured egress hops (wet post→dests or dry bus→dests).
-/// If `wet` is requested but spine isn't ready, stays hold-only (no dry flash).
+///
+/// Wet + helper alive: always attempt post→dest (Master or track→Master). A flaky
+/// spine probe must not leave the bus dry/hold while `__stg`/canonical FX is up —
+/// that is what made every track "skip" plugins after A/B.
 pub fn arm_track_egress(bus: &str, wet: bool) -> anyhow::Result<()> {
     with_engine(|eng| {
         let dests = eng.desired().egress_dests(bus);
         if wet {
-            if !buschain_engine::spine_instant_ready(bus) && !eng.chain_is_wet(bus) {
+            let helper = buschain_engine::any_gen_live(bus) || eng.chain_is_wet(bus);
+            if !helper && !buschain_engine::spine_instant_ready(bus) {
                 eng.disarm_track_egress(bus, true);
                 set_wet_cached(bus, false);
                 return Ok(());
@@ -229,6 +234,12 @@ pub fn arm_track_egress(bus: &str, wet: bool) -> anyhow::Result<()> {
             eng.arm_track_egress(bus, true, &dests)?;
             set_wet_cached(bus, true);
         } else {
+            // Never dry-bypass while an FX helper still owns the bus.
+            if buschain_engine::any_gen_live(bus) {
+                eng.arm_track_egress(bus, true, &dests)?;
+                set_wet_cached(bus, true);
+                return Ok(());
+            }
             eng.arm_track_egress(bus, false, &dests)?;
             set_wet_cached(bus, false);
         }
@@ -386,8 +397,26 @@ pub fn set_master_hw_light(hw: &str) -> anyhow::Result<String> {
 pub fn push_fx_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<()> {
     // Props must not wait on the Engine mutex while ForceRespawn sleeps.
     // Write live controls lock-free; best-effort sync Desired under try_lock.
-    let fx_name = fx_name_for_bus(bus);
-    buschain_engine::backend::push_insert_controls(&fx_name, &inserts)?;
+    // Target active A/B generation (may be `__stg` after warm cutover).
+    let fx_name = buschain_engine::live_fx_name(bus);
+    match buschain_engine::backend::push_insert_controls(&fx_name, &inserts) {
+        Ok(()) => {}
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("not found") {
+                // Heal stale generation pointer and retry once.
+                let _ = buschain_engine::live_fx_name(bus); // heal inside
+                let healed = buschain_engine::live_fx_name(bus);
+                if healed != fx_name {
+                    buschain_engine::backend::push_insert_controls(&healed, &inserts)?;
+                } else {
+                    return Err(e);
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    }
     if let Ok(mut g) = engine_mutex().try_lock() {
         if let Some(spec) = g.desired_mut().fx_chains.get_mut(bus) {
             spec.inserts = inserts;

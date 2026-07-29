@@ -8,12 +8,14 @@ pub mod clock;
 pub mod contract;
 pub mod domain;
 pub mod fx_busy;
+pub mod fx_gen;
 pub mod fx_trace;
 pub mod pipeline;
 pub mod plan;
 pub mod runtime;
 
 pub use fx_busy::{is_rebuilding as fx_is_rebuilding, RebuildGuard as FxRebuildGuard};
+pub use fx_gen::{any_gen_live, heal_live_gen, live_fx_name, live_post_name};
 
 pub use clock::{
     invalidate_clock_probe_caches, probe_endpoint_caps, probe_master_hw_from_sinks, probe_rates_pw,

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::backend::{link_is_live, sink_exists, sink_has_input, AudioBackend};
-use crate::domain::{fx_name_for_bus, post_name_for_bus};
+use crate::fx_gen::{live_fx_name, live_post_name};
 
 /// Continuous ready window before arming wet egress (flap resets).
 /// Keep short — add/remove ForceRespawn holds the track silent until this passes.
@@ -19,8 +19,8 @@ pub const DRY_DWELL: Duration = Duration::from_millis(40);
 /// Wet spine ready *without* requiring post→dest yet (pre-arm probe).
 pub fn spine_instant_ready(bus: &str) -> bool {
     let from = format!("{bus}.monitor");
-    let fx = fx_name_for_bus(bus);
-    let post = post_name_for_bus(bus);
+    let fx = live_fx_name(bus);
+    let post = live_post_name(bus);
     let fx_out = format!("{fx}_out");
     if !sink_exists(&fx) || !sink_exists(&post) {
         return false;
@@ -98,9 +98,9 @@ pub fn disarm_track_egress_ex(
     keep_dry_dest: Option<&str>,
 ) {
     let from = format!("{bus}.monitor");
-    let post = post_name_for_bus(bus);
+    let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
-    let fx = fx_name_for_bus(bus);
+    let fx = live_fx_name(bus);
 
     let mut keep: Vec<&str> = vec!["buschain_hold"];
     if keep_fx_feed && sink_exists(&fx) {
@@ -129,9 +129,9 @@ pub fn arm_track_egress(
     dests: &[String],
 ) -> Result<()> {
     let from = format!("{bus}.monitor");
-    let post = post_name_for_bus(bus);
+    let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
-    let fx = fx_name_for_bus(bus);
+    let fx = live_fx_name(bus);
 
     if wet {
         let _ = backend.unlink_from_source_except(&from, &[fx.as_str(), "buschain_hold"]);
@@ -178,9 +178,9 @@ pub fn arm_track_egress_soft_cutover(
     dests: &[String],
 ) -> Result<()> {
     let from = format!("{bus}.monitor");
-    let post = post_name_for_bus(bus);
+    let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
-    let fx = fx_name_for_bus(bus);
+    let fx = live_fx_name(bus);
 
     // Keep dry dest(s) audible while post egress comes up.
     let mut bus_keep: Vec<&str> = vec![fx.as_str(), "buschain_hold"];
@@ -231,11 +231,86 @@ pub fn arm_track_egress_soft_cutover(
     Ok(())
 }
 
+/// Warm A/B: wire `new_post→dest` muted, drop old post→dest, then unmute new.
+/// Never leave both posts audible into dest (that summed ~+6 dB / "gain through roof").
+pub fn arm_wet_ab_cutover(
+    backend: &mut dyn AudioBackend,
+    bus: &str,
+    old_fx: &str,
+    old_post: &str,
+    new_fx: &str,
+    new_post: &str,
+    dests: &[String],
+) -> Result<()> {
+    let from = format!("{bus}.monitor");
+    let old_mon = format!("{old_post}.monitor");
+    let new_mon = format!("{new_post}.monitor");
+
+    // Parallel feed both FX (warm DSP); keep hold. Speakers still hear old_post only.
+    let _ = backend.ensure_link_raw(&from, old_fx);
+    let _ = backend.ensure_link_raw(&from, new_fx);
+    let _ = backend.ensure_link_raw(&from, "buschain_hold");
+
+    // Mute new post before linking → dest so the parallel path cannot double-sum.
+    post_level(new_post, true);
+    for d in dests {
+        if d.is_empty() || !sink_exists(d) {
+            continue;
+        }
+        let _ = backend.ensure_link_raw(&old_mon, d);
+        backend.ensure_link_raw(&new_mon, d)?;
+    }
+    for d in dests {
+        if d.is_empty() {
+            continue;
+        }
+        for _ in 0..8 {
+            if link_is_live(&new_mon, d) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Drop old first while new is still muted — exclusive cutover.
+        let _ = backend.unlink_raw(&old_mon, d);
+    }
+    let _ = backend.unlink_from_source_except(&old_mon, &[]);
+    post_level(new_post, false);
+
+    // Exclusive bus→new_fx (+ hold).
+    let _ = backend.unlink_from_source_except(&from, &[new_fx, "buschain_hold"]);
+    let _ = backend.ensure_link_raw(&from, new_fx);
+    let _ = backend.ensure_link_raw(&from, "buschain_hold");
+    let _ = old_fx; // retired by caller after this returns
+    Ok(())
+}
+
+fn post_level(post: &str, muted: bool) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("pactl")
+        .args([
+            "set-sink-mute",
+            post,
+            if muted { "1" } else { "0" },
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("pactl")
+        .args([
+            "set-sink-volume",
+            post,
+            if muted { "0%" } else { "100%" },
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 pub fn disarm_master_hw(backend: &mut dyn AudioBackend, hw: &str) {
     let from = "buschain_master.monitor";
-    let post = post_name_for_bus("buschain_master");
+    let post = live_post_name("buschain_master");
     let post_mon = format!("{post}.monitor");
-    let fx = fx_name_for_bus("buschain_master");
+    let fx = live_fx_name("buschain_master");
     if sink_exists(&fx) {
         let _ = backend.unlink_from_source_except(from, &[fx.as_str(), "buschain_hold"]);
     } else {

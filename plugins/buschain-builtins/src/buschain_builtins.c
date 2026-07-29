@@ -410,6 +410,7 @@ enum {
   E8_B0 = 4,
   E8_OUTGAIN = 4 + EQ8_BANDS * 5,
   E8_MIX,
+  E8_BYPASS,
   E8_N
 };
 typedef struct {
@@ -485,12 +486,13 @@ static void e8_run(LADSPA_Handle h, unsigned long n) {
   Eq8 *s = h;
   float out_g = s->p[E8_OUTGAIN] ? db_to_lin(*s->p[E8_OUTGAIN]) : 1.0f;
   float mix = s->p[E8_MIX] ? clampf(*s->p[E8_MIX], 0.0f, 1.0f) : 1.0f;
+  int bypass = s->p[E8_BYPASS] && *s->p[E8_BYPASS] >= 0.5f;
   const float *il = s->p[E8_IN_L], *ir = s->p[E8_IN_R];
   float *ol = s->o[E8_OUT_L], *or_ = s->o[E8_OUT_R];
   if (!il || !ol) return;
   if (!ir) ir = il;
   if (!or_) or_ = ol;
-  if (mix < 1.0e-5f) {
+  if (bypass || mix < 1.0e-5f) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
     return;
   }
@@ -895,6 +897,10 @@ static void init_all(void) {
     PD[5][E8_MIX]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
     PH[5][E8_MIX].LowerBound=0; PH[5][E8_MIX].UpperBound=1;
     PH[5][E8_MIX].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_1;
+    PN[5][E8_BYPASS]="Bypass";
+    PD[5][E8_BYPASS]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
+    PH[5][E8_BYPASS].LowerBound=0; PH[5][E8_BYPASS].UpperBound=1;
+    PH[5][E8_BYPASS].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_TOGGLED|LADSPA_HINT_DEFAULT_0;
     D[5].UniqueID=392015; D[5].Label="buschain_eq8"; D[5].Name="BusChain EQ 8-Band";
     D[5].Maker="BusChain Control"; D[5].Copyright="MIT"; D[5].PortCount=E8_N;
     D[5].PortDescriptors=PD[5]; D[5].PortNames=PN[5]; D[5].PortRangeHints=PH[5];

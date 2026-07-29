@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use buschain_engine::{
-    fx_name_for_bus, normalize_ladspa_label, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
+    normalize_ladspa_label, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
     NodeName,
 };
 
@@ -159,7 +159,10 @@ pub fn push_track_controls(session: &Session, track_id: uuid::Uuid) -> anyhow::R
         return Ok(format!("No LADSPA inserts on {bus}"));
     }
     crate::audio::engine_handle::push_fx_controls(&bus, inserts)?;
-    Ok(format!("Live params → {}", fx_name_for_bus(&bus)))
+    Ok(format!(
+        "Live params → {}",
+        buschain_engine::live_fx_name(&bus)
+    ))
 }
 
 pub fn push_bus_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<String> {
@@ -167,5 +170,8 @@ pub fn push_bus_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<
         return Ok(format!("No LADSPA inserts on {bus}"));
     }
     crate::audio::engine_handle::push_fx_controls(bus, inserts)?;
-    Ok(format!("Live params → {}", fx_name_for_bus(bus)))
+    Ok(format!(
+        "Live params → {}",
+        buschain_engine::live_fx_name(bus)
+    ))
 }
