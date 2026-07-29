@@ -986,14 +986,22 @@ impl Engine {
             let keep_fx = self.desired.fx_chains.contains_key(bus);
             pipeline::arm::disarm_track_egress(&mut self.backend, bus, keep_fx);
         }
+        // Soft-arm Master: do not silence speakers if Master→HW is already live.
+        // Cold disarm-first caused multi-second mute on UI restart (fail-closed).
         if let Some(hw) = self
             .desired
             .master_hw
             .clone()
             .or_else(|| self.master_hw.clone())
         {
-            pipeline::arm::disarm_master_hw(&mut self.backend, &hw);
-            report.push(format!("disarmed speakers ({hw})"));
+            let master_live = link_is_live("buschain_master.monitor", &hw)
+                || link_is_live("buschain_post_master.monitor", &hw);
+            if master_live {
+                report.push(format!("soft-arm speakers (keep live →{hw})"));
+            } else {
+                pipeline::arm::disarm_master_hw(&mut self.backend, &hw);
+                report.push(format!("disarmed speakers ({hw})"));
+            }
         }
 
         let mut bus_report = self.reconcile_buses_and_levels()?;

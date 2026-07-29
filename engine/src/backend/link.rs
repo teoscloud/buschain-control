@@ -86,8 +86,11 @@ fn pick_lr(ports: &[String], prefer_monitor: bool) -> Option<(String, String)> {
 
 /// Build stereo port pairs for Pulse-style `source` → `sink`.
 fn port_pairs(source: &str, sink: &str) -> Result<Vec<(String, String)>> {
-    let outs = run_capture("pw-link", &["-o"])?;
-    let inns = run_capture("pw-link", &["-i"])?;
+    // Cached listings — uncached -o/-i on every spine poll was a multi-second HOL.
+    let outs = cli::pw_link_outputs()
+        .ok_or_else(|| anyhow!("pw-link -o failed / empty"))?;
+    let inns = cli::pw_link_inputs()
+        .ok_or_else(|| anyhow!("pw-link -i failed / empty"))?;
 
     let src_node = pw_node(source);
     let dst_node = pw_node(sink);
@@ -198,9 +201,8 @@ fn try_link(source: &str, sink: &str) -> Result<()> {
     let pairs = port_pairs(source, sink)?;
     for (out_p, in_p) in &pairs {
         // Disconnect only this exact pair (ignore errors if not linked).
-        let _ = Command::new("pw-link")
-            .args(["-d", out_p, in_p])
-            .output();
+        // Timed — unbounded `pw-link -d` hung ForceRespawn for ~10s.
+        let _ = run_status("pw-link", &["-d", out_p.as_str(), in_p.as_str()]);
         run_status("pw-link", &[out_p.as_str(), in_p.as_str()])
             .with_context(|| format!("pw-link {out_p} → {in_p}"))?;
     }

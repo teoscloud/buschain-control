@@ -25,7 +25,7 @@ static float db_to_lin(float db) { return powf(10.0f, db * 0.05f); }
  *   |x| > T  →  y = sign(x)·(T + (1−T)·tanh((|x|−T)/(1−T)))
  *             → soft knee into a ±1.0 ceiling, then × POST.
  */
-enum { SC_IN_L, SC_IN_R, SC_OUT_L, SC_OUT_R, SC_THRES, SC_POST, SC_MIX, SC_N };
+enum { SC_IN_L, SC_IN_R, SC_OUT_L, SC_OUT_R, SC_THRES, SC_POST, SC_MIX, SC_BYPASS, SC_N };
 typedef struct {
   const LADSPA_Data *p[SC_N];
   LADSPA_Data *o[SC_N];
@@ -63,6 +63,11 @@ static void sc_run(LADSPA_Handle h, unsigned long n) {
   if (!il || !ol) return;
   if (!ir) ir = il;
   if (!or_) or_ = ol;
+  /* Standard Bypass port — host power; Mix stays a user wet/dry control. */
+  if (s->p[SC_BYPASS] && *s->p[SC_BYPASS] >= 0.5f) {
+    for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
+    return;
+  }
   /* Mix≈0 or Post≈0: dry pass-through. Always write outs (in-place hosts keep ol==il). */
   if (mix < 1.0e-5f || post < 1.0e-5f) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
@@ -531,7 +536,7 @@ enum {
   OD_IN_L = 0, OD_IN_R, OD_OUT_L, OD_OUT_R,
   OD_PREBAND, OD_COLOR, OD_PRESHAPE, OD_DRIVE, OD_BOOST,
   OD_CHAR, OD_BIAS, OD_POSTFILT, OD_POSTGAIN, OD_MIX,
-  OD_SPLIT, OD_FOCUS, OD_N
+  OD_SPLIT, OD_FOCUS, OD_BYPASS, OD_N
 };
 
 typedef struct {
@@ -651,6 +656,10 @@ static void od_run(LADSPA_Handle h, unsigned long n) {
   if (!il || !ol) return;
   if (!ir) ir = il;
   if (!or_) or_ = ol;
+  if (s->p[OD_BYPASS] && *s->p[OD_BYPASS] >= 0.5f) {
+    for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
+    return;
+  }
   if (mix < 1.0e-5f) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
     return;
@@ -749,11 +758,11 @@ static const char *PN[N_PLUGINS][MAXPORTS];
 
 static void init_all(void) {
   if (ready) return;
-  /* Softclip 392010 — Fruity Soft Clipper–style (Threshold + Post + Mix) */
+  /* Softclip 392010 — Fruity Soft Clipper–style (Threshold + Post + Mix + Bypass) */
   PN[0][0]="Input L"; PN[0][1]="Input R"; PN[0][2]="Output L"; PN[0][3]="Output R";
-  PN[0][4]="Threshold"; PN[0][5]="Post"; PN[0][6]="Mix";
+  PN[0][4]="Threshold"; PN[0][5]="Post"; PN[0][6]="Mix"; PN[0][7]="Bypass";
   for (int i=0;i<4;i++) PD[0][i]=(i<2)?(LADSPA_PORT_INPUT|LADSPA_PORT_AUDIO):(LADSPA_PORT_OUTPUT|LADSPA_PORT_AUDIO);
-  PD[0][4]=PD[0][5]=PD[0][6]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
+  PD[0][4]=PD[0][5]=PD[0][6]=PD[0][7]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
   memset(PH[0],0,sizeof(PH[0]));
   PH[0][4].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_MIDDLE;
   PH[0][4].LowerBound=0.05f; PH[0][4].UpperBound=1.0f;
@@ -761,6 +770,8 @@ static void init_all(void) {
   PH[0][5].LowerBound=0.0f; PH[0][5].UpperBound=4.0f;
   PH[0][6].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_1;
   PH[0][6].LowerBound=0.0f; PH[0][6].UpperBound=1.0f;
+  PH[0][7].LowerBound=0; PH[0][7].UpperBound=1;
+  PH[0][7].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_TOGGLED|LADSPA_HINT_DEFAULT_0;
   D[0].UniqueID=392010; D[0].Label="buschain_softclip"; D[0].Name="BusChain Soft Clipper";
   D[0].Maker="BusChain Control"; D[0].Copyright="MIT"; D[0].PortCount=SC_N;
   D[0].PortDescriptors=PD[0]; D[0].PortNames=PN[0]; D[0].PortRangeHints=PH[0];
@@ -896,7 +907,7 @@ static void init_all(void) {
   PN[6][4]="Pre Band"; PN[6][5]="Color (Hz)"; PN[6][6]="Pre Shape";
   PN[6][7]="Drive"; PN[6][8]="Boost"; PN[6][9]="Character"; PN[6][10]="Bias";
   PN[6][11]="Post Filter (Hz)"; PN[6][12]="Post Gain"; PN[6][13]="Mix";
-  PN[6][14]="Split (Hz)"; PN[6][15]="Focus";
+  PN[6][14]="Split (Hz)"; PN[6][15]="Focus"; PN[6][16]="Bypass";
   for (int i=0;i<4;i++) PD[6][i]=(i<2)?(LADSPA_PORT_INPUT|LADSPA_PORT_AUDIO):(LADSPA_PORT_OUTPUT|LADSPA_PORT_AUDIO);
   for (int i=4;i<OD_N;i++) PD[6][i]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
   memset(PH[6],0,sizeof(PH[6]));
@@ -925,6 +936,8 @@ static void init_all(void) {
   PH[6][14].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_LOGARITHMIC|LADSPA_HINT_DEFAULT_MIDDLE;
   PH[6][15].LowerBound=0; PH[6][15].UpperBound=2;
   PH[6][15].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_INTEGER|LADSPA_HINT_DEFAULT_1;
+  PH[6][16].LowerBound=0; PH[6][16].UpperBound=1;
+  PH[6][16].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_TOGGLED|LADSPA_HINT_DEFAULT_0;
   D[6].UniqueID=392016; D[6].Label="buschain_overdrive"; D[6].Name="BusChain Theatre Drive";
   D[6].Maker="BusChain Control"; D[6].Copyright="MIT"; D[6].PortCount=OD_N;
   D[6].PortDescriptors=PD[6]; D[6].PortNames=PN[6]; D[6].PortRangeHints=PH[6];

@@ -566,7 +566,8 @@ fn draw_input_dropdown(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize
         )
         .collect();
 
-    egui::ComboBox::from_id_salt(format!("input_{track_idx}"))
+    let input_salt = state.session.tracks[track_idx].id;
+    egui::ComboBox::from_id_salt(format!("input_{input_salt}"))
         .selected_text(RichText::new(&current).size(11.0))
         .width(ui.available_width())
         .show_ui(ui, |ui| {
@@ -703,6 +704,13 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
         state.session.tracks[track_idx]
             .assigned_playback
             .retain(|a| a != &key && !keys_same_app(a, &key));
+        state.dirty = true;
+        // Sync worker last_session so idle enforce doesn't re-pin this app.
+        state
+            .worker
+            .send(crate::audio::worker::Command::ApplyLevels(
+                state.session.clone(),
+            ));
         // Unpin → move off this bus onto preferred default / master (fresh list).
         let fallback = state
             .session
@@ -719,6 +727,7 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
     }
 
     let assigned_now = state.session.tracks[track_idx].assigned_playback.clone();
+    let track_id_salt = state.session.tracks[track_idx].id;
     let choices: Vec<(String, String, Option<String>)> = live
         .into_iter()
         .filter(|(k, _, _)| {
@@ -729,7 +738,7 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
         .collect();
 
     let mut pick: Option<String> = None;
-    egui::ComboBox::from_id_salt(format!("app_assign_{track_idx}"))
+    egui::ComboBox::from_id_salt(format!("app_assign_{track_id_salt}"))
         .selected_text(
             RichText::new(if choices.is_empty() {
                 if state.snapshot.sink_inputs.is_empty() {
@@ -781,7 +790,14 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
             }
             track.sink_name = Some(sink.clone());
         }
-        // Ensure bus exists, then fresh pactl place (priority over FX rewire in worker).
+        state.dirty = true;
+        // Sync pins into worker before place — idle enforce uses last_session.
+        state
+            .worker
+            .send(crate::audio::worker::Command::ApplyLevels(
+                state.session.clone(),
+            ));
+        // Ensure bus exists (coalesce runs Ensure before PlaceApp in-batch).
         if !state.snapshot.sinks.iter().any(|s| s.name == sink) {
             state.ensure_new_track(tid);
         }

@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context, Result};
 pub const CLI_TIMEOUT: Duration = Duration::from_millis(400);
 const SHORT_SINKS_TTL: Duration = Duration::from_millis(150);
 const PW_LINK_L_TTL: Duration = Duration::from_millis(80);
+const PW_LINK_PORTS_TTL: Duration = Duration::from_millis(100);
 
 fn wait_with_timeout(
     child: &mut std::process::Child,
@@ -80,6 +81,16 @@ fn pw_link_l_cache() -> &'static Mutex<Option<(Instant, String)>> {
     C.get_or_init(|| Mutex::new(None))
 }
 
+fn pw_link_o_cache() -> &'static Mutex<Option<(Instant, String)>> {
+    static C: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
+fn pw_link_i_cache() -> &'static Mutex<Option<(Instant, String)>> {
+    static C: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
 pub fn invalidate_probe_caches() {
     if let Ok(mut g) = short_sinks_cache().lock() {
         *g = None;
@@ -87,9 +98,18 @@ pub fn invalidate_probe_caches() {
     if let Ok(mut g) = pw_link_l_cache().lock() {
         *g = None;
     }
+    if let Ok(mut g) = pw_link_o_cache().lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = pw_link_i_cache().lock() {
+        *g = None;
+    }
 }
 
 /// Cached `pactl list short sinks` (TTL ~150ms).
+///
+/// On CLI timeout, return the last good listing (fail-open) so Props do not
+/// treat a wedged `pactl` as “FX node missing” and storm-retries for minutes.
 pub fn pactl_short_sinks() -> Option<String> {
     if let Ok(g) = short_sinks_cache().lock() {
         if let Some((at, text)) = g.as_ref() {
@@ -98,11 +118,23 @@ pub fn pactl_short_sinks() -> Option<String> {
             }
         }
     }
-    let text = run_capture("pactl", &["list", "short", "sinks"], CLI_TIMEOUT).ok()?;
-    if let Ok(mut g) = short_sinks_cache().lock() {
-        *g = Some((Instant::now(), text.clone()));
+    match run_capture("pactl", &["list", "short", "sinks"], CLI_TIMEOUT) {
+        Ok(text) => {
+            if let Ok(mut g) = short_sinks_cache().lock() {
+                *g = Some((Instant::now(), text.clone()));
+            }
+            Some(text)
+        }
+        Err(_) => {
+            // Stale-but-known beats false “missing FX” under probe storms.
+            if let Ok(g) = short_sinks_cache().lock() {
+                if let Some((_, text)) = g.as_ref() {
+                    return Some(text.clone());
+                }
+            }
+            None
+        }
     }
-    Some(text)
 }
 
 /// Cached `pw-link -l` (TTL ~80ms) — dominant cost inside spine polls.
@@ -116,6 +148,38 @@ pub fn pw_link_listing() -> Option<String> {
     }
     let text = run_capture("pw-link", &["-l"], CLI_TIMEOUT).ok()?;
     if let Ok(mut g) = pw_link_l_cache().lock() {
+        *g = Some((Instant::now(), text.clone()));
+    }
+    Some(text)
+}
+
+/// Cached `pw-link -o` (output ports) — used by every `link_is_live` probe.
+pub fn pw_link_outputs() -> Option<String> {
+    if let Ok(g) = pw_link_o_cache().lock() {
+        if let Some((at, text)) = g.as_ref() {
+            if at.elapsed() < PW_LINK_PORTS_TTL {
+                return Some(text.clone());
+            }
+        }
+    }
+    let text = run_capture("pw-link", &["-o"], CLI_TIMEOUT).ok()?;
+    if let Ok(mut g) = pw_link_o_cache().lock() {
+        *g = Some((Instant::now(), text.clone()));
+    }
+    Some(text)
+}
+
+/// Cached `pw-link -i` (input ports).
+pub fn pw_link_inputs() -> Option<String> {
+    if let Ok(g) = pw_link_i_cache().lock() {
+        if let Some((at, text)) = g.as_ref() {
+            if at.elapsed() < PW_LINK_PORTS_TTL {
+                return Some(text.clone());
+            }
+        }
+    }
+    let text = run_capture("pw-link", &["-i"], CLI_TIMEOUT).ok()?;
+    if let Ok(mut g) = pw_link_i_cache().lock() {
         *g = Some((Instant::now(), text.clone()));
     }
     Some(text)

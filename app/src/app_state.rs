@@ -79,8 +79,10 @@ pub struct AppState {
     /// Live param push (knobs) — separate from structural hotplug.
     params_deadline: Option<Instant>,
     params_track: Option<Uuid>,
-    /// After a failed Props push, allow one deferred retry (~50ms).
+    /// After a failed Props push, allow deferred retries (bounded).
     params_retry_armed: bool,
+    /// Count of wet-race Props retries for the current params_track.
+    params_retry_count: u8,
     meter_targets_sig: u64,
     /// Second meter rebind after bus migrate (posts may appear a beat late).
     meter_rebind_deadline: Option<Instant>,
@@ -154,6 +156,7 @@ impl AppState {
             params_deadline: None,
             params_track: None,
             params_retry_armed: false,
+            params_retry_count: 0,
             meter_targets_sig: 0,
             meter_rebind_deadline: None,
             reattach_attempted: false,
@@ -247,20 +250,15 @@ impl AppState {
                 self.flush_levels(false);
             }
             LiveChange::FxParams { track_id } => {
-                // Keep latest params even while a rewire is queued — rewire
-                // loads insert state from session, but knobs after that still
-                // need a Props push once the deadline fires.
+                // Always keep latest params — never drop across rewire (minutes/never).
                 self.params_track = Some(track_id);
                 self.params_retry_armed = false;
-                if self.hotplug_deadline.is_none() {
-                    // Flush on next tick (same frame). Trailing 8ms debounce made
-                    // sparse drags fall into worker idle reconcile and feel stuck.
-                    self.params_deadline = Some(Instant::now());
-                }
+                self.params_retry_count = 0;
+                // Flush even while rewire is coalescing — Props are lock-free of ensure.
+                self.params_deadline = Some(Instant::now());
             }
             LiveChange::FxRewire { track_id } => {
-                self.params_deadline = None;
-                self.params_track = None;
+                // Keep params_track so power/knobs during rebuild still flush after.
                 match self.hotplug_track {
                     Some(None) => {}
                     Some(Some(id)) if id != track_id => {
@@ -268,7 +266,8 @@ impl AppState {
                     }
                     _ => self.hotplug_track = Some(Some(track_id)),
                 }
-                self.hotplug_deadline = Some(Instant::now() + Duration::from_millis(40));
+                // Short coalesce — long debounce made add/reorder feel dead.
+                self.hotplug_deadline = Some(Instant::now() + Duration::from_millis(16));
                 self.status = "Live FX rewire — slots (streams untouched)…".into();
             }
             LiveChange::EnsureTrack { track_id } => {
@@ -279,13 +278,11 @@ impl AppState {
                 self.status = "Live ensure track bus…".into();
             }
             LiveChange::Route => {
-                self.params_deadline = None;
-                self.params_track = None;
-                // Reconcile routes + Force Master/track FX when inserts aren't wet.
+                // Links only — never clear pending Props (Route must not starve knobs).
                 self.worker.send(Command::RewireSessionRoutes(
                     self.session.clone(),
                 ));
-                self.status = "Live routing — Master HW + FX ensure…".into();
+                self.status = "Live routing — links only…".into();
             }
             LiveChange::Reconcile => {
                 self.hotplug_deadline = None;
@@ -791,12 +788,10 @@ impl AppState {
         self.commit(LiveChange::FxParams { track_id });
     }
 
-    /// Discrete power toggle — flush Props immediately (no 8ms coalesce wait).
+    /// Discrete power toggle — flush Props immediately (no coalesce wait).
     pub fn flush_fx_params_now(&mut self, track_id: Uuid) {
         self.commit(LiveChange::FxParams { track_id });
-        if self.hotplug_deadline.is_none() {
-            self.params_deadline = Some(Instant::now());
-        }
+        self.params_deadline = Some(Instant::now());
     }
 
     pub fn mark_routing_dirty(&mut self) {
@@ -1101,28 +1096,57 @@ impl AppState {
                         self.status = s;
                     }
                     if skipped {
-                        // Brief wet race: one deferred retry if knobs still target same track.
-                        if !self.params_retry_armed && self.params_track.is_some() {
+                        // Wet race: fewer, slower retries — 100ms×20 under pactl load
+                        // was a multi-second storm that killed ForceRespawn visibility.
+                        if self.params_track.is_some() && self.params_retry_count < 8 {
                             self.params_retry_armed = true;
+                            self.params_retry_count =
+                                self.params_retry_count.saturating_add(1);
                             self.params_deadline =
-                                Some(Instant::now() + Duration::from_millis(50));
+                                Some(Instant::now() + Duration::from_millis(250));
+                        } else if self.params_retry_count >= 8 {
+                            self.status =
+                                "FX control stuck — params not wet after retries".into();
                         }
                     } else if live_ok {
                         self.params_retry_armed = false;
+                        self.params_retry_count = 0;
                     }
                 }
                 Event::Error(e) => self.status = e,
                 Event::SessionApplied { session, message } => {
+                    // Ensure/Prune/FX-rewire return a session clone from when the
+                    // cmd was queued — full adopt wipes newer assigns/faders/knobs.
+                    // Only patch sink_name.
+                    let patch_sinks_only = message.contains("Ensure track")
+                        || message.contains("Removed bus")
+                        || message.starts_with("Prune")
+                        || message.contains("FX wet")
+                        || message.contains("FX dry")
+                        || message.contains("FX failed")
+                        || message.contains("FX building")
+                        || message.starts_with("Graph OK");
+                    if patch_sinks_only {
+                        for t in &session.tracks {
+                            if let Some(local) =
+                                self.session.tracks.iter_mut().find(|l| l.id == t.id)
+                            {
+                                if t.sink_name.is_some() {
+                                    local.sink_name = t.sink_name.clone();
+                                }
+                            }
+                        }
+                        self.status = message;
+                        self.sync_meter_targets();
+                        continue;
+                    }
+
                     // Full adopt only for structural/load events. Light FX/level
                     // responses no longer carry a session (daemon fire-and-forget).
                     let structural = message.contains("adopted")
                         || message.contains("loaded")
                         || message.contains("Apply")
                         || message.contains("apply")
-                        || message.contains("Rewir")
-                        || message.contains("Hotplug")
-                        || message.contains("Ensure")
-                        || message.contains("Prune")
                         || message.contains("Clock")
                         || message.contains("migrat")
                         || message.contains("GraphClock")
@@ -1130,14 +1154,7 @@ impl AppState {
                         || message.contains("Device clock")
                         || message.contains("saved")
                         || session.slug != self.session.slug
-                        || session.tracks.len() != self.session.tracks.len()
-                        || session.tracks.iter().map(|t| t.inserts.len()).sum::<usize>()
-                            != self
-                                .session
-                                .tracks
-                                .iter()
-                                .map(|t| t.inserts.len())
-                                .sum::<usize>();
+                        || session.tracks.len() != self.session.tracks.len();
                     if structural {
                         let prev_rate = self.session.performance.sample_rate;
                         let prev_q = self.session.performance.quantum;
@@ -1188,11 +1205,9 @@ impl AppState {
                             track_id,
                         });
                         self.status = "Rewiring FX slots (streams untouched)…".into();
-                        // After rewire lands, push any knobs that were moved during it.
-                        if self.params_track.is_some() {
-                            self.params_deadline =
-                                Some(Instant::now() + Duration::from_millis(120));
-                        }
+                        // Always Props after structural rewire (current session knobs).
+                        self.params_track = Some(track_id);
+                        self.params_deadline = Some(Instant::now());
                     }
                     _ => {
                         self.worker
@@ -1205,24 +1220,18 @@ impl AppState {
 
         if let Some(deadline) = self.params_deadline {
             if Instant::now() >= deadline {
-                // Don't Props-push while a slot rewire is still pending.
-                if self.hotplug_deadline.is_some() {
-                    self.params_deadline =
-                        Some(Instant::now() + Duration::from_millis(40));
-                } else {
-                    self.params_deadline = None;
-                    // Keep params_track so a skipped push can retry the same rack.
-                    if let Some(track_id) = self.params_track {
-                        if let Some((bus, inserts)) =
-                            crate::audio::insert_map::ladspa_slots_for(&self.session, track_id)
-                        {
-                            self.worker.send(Command::PushFxControls { bus, inserts });
-                        } else {
-                            self.worker.send(Command::PushFxParams {
-                                session: self.session.clone(),
-                                track_id,
-                            });
-                        }
+                // Props may run while rewire is coalescing — ensure is off this thread.
+                self.params_deadline = None;
+                if let Some(track_id) = self.params_track {
+                    if let Some((bus, inserts)) =
+                        crate::audio::insert_map::ladspa_slots_for(&self.session, track_id)
+                    {
+                        self.worker.send(Command::PushFxControls { bus, inserts });
+                    } else {
+                        self.worker.send(Command::PushFxParams {
+                            session: self.session.clone(),
+                            track_id,
+                        });
                     }
                 }
             }

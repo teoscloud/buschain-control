@@ -12,6 +12,20 @@ pub use fx_chain::{
     spawn_sidechain, FilterChainRuntime,
 };
 
+/// Gate outbound `{bus}.monitor` without muting the app-facing sink (avoids cork).
+/// Free fn so ForceRespawn RAII can ungated without holding `AudioBackend`.
+pub fn gate_bus_monitor(bus: &str, gated: bool) -> Result<()> {
+    let mon = format!("{bus}.monitor");
+    if gated {
+        let _ = run_ok("pactl", &["set-source-mute", &mon, "1"]);
+        let _ = run_ok("pactl", &["set-source-volume", &mon, "0%"]);
+    } else {
+        let _ = run_ok("pactl", &["set-source-mute", &mon, "0"]);
+        let _ = run_ok("pactl", &["set-source-volume", &mon, "100%"]);
+    }
+    Ok(())
+}
+
 pub use link::{ensure_link, link_is_live, teardown_buschain_links, unlink};
 
 pub use null_sink::push_description;
@@ -121,15 +135,7 @@ impl AudioBackend for PipewireCliBackend {
     }
 
     fn gate_monitor(&mut self, bus: &str, gated: bool) -> Result<()> {
-        let mon = format!("{bus}.monitor");
-        if gated {
-            let _ = run_ok("pactl", &["set-source-mute", &mon, "1"]);
-            let _ = run_ok("pactl", &["set-source-volume", &mon, "0%"]);
-        } else {
-            let _ = run_ok("pactl", &["set-source-mute", &mon, "0"]);
-            let _ = run_ok("pactl", &["set-source-volume", &mon, "100%"]);
-        }
-        Ok(())
+        gate_bus_monitor(bus, gated)
     }
 
     fn list_sink_names(&mut self) -> Result<Vec<String>> {

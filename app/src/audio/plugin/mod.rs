@@ -66,30 +66,46 @@ pub struct PluginRef {
 }
 
 impl PluginRef {
-    /// Control values pushed to a live filter-chain node (graph-free).
-    /// `PluginRef.mix` owns Mix ports; insert power folds into Bypass/Mix/Enable —
-    /// no module unload, no topology change.
+    /// Control values for a live filter-chain node (graph-free Props).
+    ///
+    /// Black-box host: write only advertised ports. User Mix updates a Mix port
+    /// if present. Insert power sets Bypass/Enable only when those ports exist —
+    /// never invent Mix-as-power or other plugin-specific DSP semantics.
     pub fn effective_control_params(&self) -> Vec<(String, f32)> {
         let mut params = self.params.clone();
         if let Some((_, v)) = params.iter_mut().find(|(k, _)| k == "Mix") {
             *v = self.mix.clamp(0.0, 1.0);
         }
+        let has_bypass = params.iter().any(|(k, _)| k == "Bypass");
+        let has_enable = params.iter().any(|(k, _)| k == "Enable");
         if self.bypass {
-            for (k, v) in &mut params {
-                match k.as_str() {
-                    "Mix" | "Wet" | "Dry/Wet" | "Blend" => *v = 0.0,
-                    "Bypass" => *v = 1.0,
-                    "Enable" => *v = 0.0,
-                    _ => {}
+            if has_bypass {
+                for (k, v) in &mut params {
+                    if k == "Bypass" {
+                        *v = 1.0;
+                    }
+                }
+            }
+            if has_enable {
+                for (k, v) in &mut params {
+                    if k == "Enable" {
+                        *v = 0.0;
+                    }
                 }
             }
         } else {
-            // Powered on: clear any stale Bypass/Enable left in session params.
-            for (k, v) in &mut params {
-                match k.as_str() {
-                    "Bypass" => *v = 0.0,
-                    "Enable" => *v = 1.0,
-                    _ => {}
+            if has_bypass {
+                for (k, v) in &mut params {
+                    if k == "Bypass" {
+                        *v = 0.0;
+                    }
+                }
+            }
+            if has_enable {
+                for (k, v) in &mut params {
+                    if k == "Enable" {
+                        *v = 1.0;
+                    }
                 }
             }
         }

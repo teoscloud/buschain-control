@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 
 use crate::backend::{
-    filter_chain_clock_for_sink, push_insert_controls, read_signature, sink_exists, sink_has_input,
-    spawn_sidechain, FilterChainRuntime,
+    filter_chain_clock_for_sink, gate_bus_monitor, push_insert_controls, read_signature,
+    sink_exists, sink_has_input, spawn_sidechain, FilterChainRuntime,
 };
 use crate::backend::link_is_live;
 use crate::backend::AudioBackend;
@@ -16,8 +16,30 @@ use crate::domain::{
     bus_suffix, ChainEnsureMode, ChainSpec, ChainState, InsertSlot, NodeRole, NodeSpec, WirePlan,
 };
 use crate::pipeline::arm::{
-    arm_track_egress, disarm_track_egress_ex, spine_instant_ready, wait_spine_stable, WET_DWELL,
+    arm_track_egress_soft_cutover, disarm_track_egress_ex, spine_instant_ready,
+    wait_spine_stable, WET_DWELL,
 };
+
+/// Silence `{bus}.monitor` for the ForceRespawn window (dry bridge stays linked so
+/// apps don't cork; user hears mute until the full wet rack is sealed).
+struct RebuildSilence {
+    bus: String,
+}
+
+impl RebuildSilence {
+    fn enter(bus: &str) -> Self {
+        let _ = gate_bus_monitor(bus, true);
+        Self {
+            bus: bus.to_string(),
+        }
+    }
+}
+
+impl Drop for RebuildSilence {
+    fn drop(&mut self) {
+        let _ = gate_bus_monitor(&self.bus, false);
+    }
+}
 
 /// Wet spine + (optionally) post→dest.
 fn path_audible(plan: &WirePlan, require_dest: bool) -> bool {
@@ -94,7 +116,8 @@ fn restore_dry(
         let _ = backend.unlink_from_source_except(&from, &["buschain_hold"]);
     }
     let _ = backend.ensure_link_raw(&from, "buschain_hold");
-    runtime.stop_one_keep_artifacts(plan.fx_sink.as_str());
+    // Failed wet — wipe helper + signature so Props/idle don't think FX is live.
+    runtime.stop_one(plan.fx_sink.as_str());
     Ok(())
 }
 
@@ -158,8 +181,19 @@ pub fn ensure_fx_chain(
         ));
     }
 
-    // 1) Drop wet egress but keep a dry bus→dest bridge so playback (YouTube /
-    // Chromium) does not hear a silent gap and stall A/V during ForceRespawn.
+    // User ForceRespawn wins over spawn backoff (don't leave edits silent for 20s).
+    runtime.clear_spawn_failed(fx_name);
+    // Gate Props for this FX until stop→spawn→spine finishes (kills retry storms).
+    // Keyed by fx_name — hot path is backend::push_insert_controls, not bus.
+    let _rebuild_gate = crate::fx_busy::RebuildGuard::enter(fx_name);
+    // Mute outbound monitor while rebuilding — dry bridge stays linked (no cork)
+    // but user must not hear dry/partial FX until the sealed wet rack is armed.
+    let _rebuild_silence = RebuildSilence::enter(plan.bus.as_str());
+    let ensure_span = crate::fx_trace::span("ForceRespawn");
+    let t0 = std::time::Instant::now();
+
+    // 1) Drop wet egress but keep a dry bus→dest *link* so Chromium/YouTube keep
+    // writing into the bus (no cork). Monitor is gated above → hear silence, not dry.
     // Wet is re-armed exclusively below and the dry hop is pruned.
     if arm_egress && !dest.is_empty() {
         let _ = backend.ensure_link_raw(&from, dest);
@@ -174,75 +208,123 @@ pub fn ensure_fx_chain(
             None
         },
     );
+    crate::fx_trace::log("ForceRespawn.disarm", fx_name, t0.elapsed().as_millis());
 
     // 2) Respawn FX helper (hard-fails on spawn errors).
+    // Dry link + gated monitor: apps stay uncorked; output stays silent until ungated.
+    let t_stop = std::time::Instant::now();
     runtime.stop_one(fx_name);
+    crate::backend::invalidate_probe_caches();
+    crate::fx_trace::log("ForceRespawn.stop", fx_name, t_stop.elapsed().as_millis());
+    let t_spawn = std::time::Instant::now();
     if let Err(e) = spawn_sidechain(runtime, spec, &clock_fragment) {
         runtime.mark_spawn_failed(fx_name);
-        let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        if !runtime.owns_live(fx_name) {
+            let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        }
+        ensure_span.end(format!("spawn FAIL {fx_name}: {e:#}"));
         return Ok(ChainState::Failed(format!("FX spawn: {e:#}")));
     }
     runtime.clear_spawn_failed(fx_name);
+    crate::backend::invalidate_probe_caches();
+    crate::fx_trace::log("ForceRespawn.spawn", fx_name, t_spawn.elapsed().as_millis());
 
     // 3) Feed FX silently — no dest yet.
-    backend.ensure_link_raw(&from, fx_name)?;
+    if let Err(e) = backend.ensure_link_raw(&from, fx_name) {
+        runtime.mark_spawn_failed(fx_name);
+        if !runtime.owns_live(fx_name) {
+            let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        }
+        ensure_span.end(format!("feed FAIL {fx_name}: {e:#}"));
+        return Ok(ChainState::Failed(format!("FX feed link: {e:#}")));
+    }
     let _ = backend.unlink_from_source_except(&format!("{fx_name}.monitor"), &[]);
     let _ = backend.unlink_from_source_except(&post_mon, &[]);
     let _ = backend.ensure_link_raw(&from, "buschain_hold");
 
     // 4) Poll instant spine ready, then short continuous dwell.
+    // Keep this tight — each iteration can hit pw-link probes; long loops HOL knobs.
+    // Owns-live + pw-link is enough when pactl short-sinks is wedged (Props storms).
+    let fx_out = format!("{fx_name}_out");
+    let post = plan.post_sink.as_str();
+    let bus = plan.bus.as_str();
+    let t_spine = std::time::Instant::now();
     let mut wet_ok = false;
-    for _ in 0..25 {
-        wet_ok = spine_instant_ready(plan.bus.as_str());
+    for _ in 0..12 {
+        wet_ok = spine_instant_ready(bus)
+            || (runtime.owns_live(fx_name)
+                && link_is_live(&from, fx_name)
+                && (link_is_live(&fx_out, post) || sink_has_input(post)));
         if wet_ok {
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(15));
     }
 
     if !wet_ok {
         runtime.mark_spawn_failed(fx_name);
-        let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        // Only wipe if the helper is actually dead — pactl false-neg must not
+        // destroy a running filter-chain (that left Master dry + Props stuck).
+        if !runtime.owns_live(fx_name) {
+            let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        }
+        ensure_span.end(format!(
+            "spine FAIL {fx_name} after {}ms",
+            t_spine.elapsed().as_millis()
+        ));
         return Ok(ChainState::Failed(
             "wet path not live after FX spawn (fx_out never reached post)".into(),
         ));
     }
 
-    if !wait_spine_stable(plan.bus.as_str(), WET_DWELL) {
+    let dwell_ok = wait_spine_stable(bus, WET_DWELL)
+        || (runtime.owns_live(fx_name)
+            && link_is_live(&from, fx_name)
+            && (link_is_live(&fx_out, post) || sink_has_input(post)));
+    if !dwell_ok {
         runtime.mark_spawn_failed(fx_name);
-        let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        if !runtime.owns_live(fx_name) {
+            let _ = restore_dry(backend, runtime, &plan, arm_egress);
+        }
+        ensure_span.end(format!("dwell FAIL {fx_name}"));
         return Ok(ChainState::Failed(
             "spine unstable during dwell — restored dry".into(),
         ));
     }
+    crate::fx_trace::log("ForceRespawn.spine", fx_name, t_spine.elapsed().as_millis());
 
-    // 5) Arm egress (or leave hold-only when barrier holds Master→HW).
+    // 5) Soft-cutover wet arm — keep dry bus→dest until post→dest is live.
+    // Hard exclusive arm used to drop dry first → Chromium/YouTube pause.
     if arm_egress && !dest.is_empty() {
         let dests = vec![dest.clone()];
-        if let Err(e) = arm_track_egress(backend, plan.bus.as_str(), true, &dests) {
+        if let Err(e) = arm_track_egress_soft_cutover(backend, bus, &dests) {
             runtime.mark_spawn_failed(fx_name);
-            let _ = restore_dry(backend, runtime, &plan, true);
+            if !runtime.owns_live(fx_name) {
+                let _ = restore_dry(backend, runtime, &plan, true);
+            }
+            ensure_span.end(format!("arm FAIL {fx_name}: {e:#}"));
             return Ok(ChainState::Failed(format!(
                 "post→dest arm failed — restored dry: {e:#}"
             )));
         }
-        // Prune any race dry hop.
-        for _ in 0..5 {
-            let _ = backend.unlink_raw(&from, dest);
-            if !link_is_live(&from, dest) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(30));
-        }
-        if !path_audible(&plan, true) {
+        // path_audible uses pactl sink_has_input — also accept link-based spine.
+        let link_wet = link_is_live(&plan.post_monitor(), dest.as_str())
+            && runtime.owns_live(fx_name)
+            && link_is_live(&from, fx_name)
+            && (link_is_live(&fx_out, post) || sink_has_input(post));
+        if !path_audible(&plan, true) && !link_wet {
             runtime.mark_spawn_failed(fx_name);
-            let _ = restore_dry(backend, runtime, &plan, true);
+            if !runtime.owns_live(fx_name) {
+                let _ = restore_dry(backend, runtime, &plan, true);
+            }
+            ensure_span.end(format!("audible FAIL {fx_name}"));
             return Ok(ChainState::Failed(
                 "exclusive wet arm failed — restored dry".into(),
             ));
         }
     }
 
+    ensure_span.end(format!("wet {fx_name} total={}ms", t0.elapsed().as_millis()));
     Ok(ChainState::Wet(plan))
 }
 
@@ -251,6 +333,9 @@ pub fn push_fx_controls(
     fx_name: &str,
     inserts: &[InsertSlot],
 ) -> Result<()> {
+    if crate::fx_busy::is_rebuilding(fx_name) {
+        return Err(anyhow!("FX rebuilding — props deferred"));
+    }
     // Prefer owns_live — avoid pactl list-short on every knob tick.
     if !runtime.owns_live(fx_name) {
         // Signature file is enough proof the helper was spawned; skip sink_exists

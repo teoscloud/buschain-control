@@ -85,8 +85,8 @@ pub fn track_path_ready(bus: &str, wet: bool, dests: &[String]) -> bool {
 
 /// Drop wet egress (post→*). Optionally keep a dry `bus→dest` bridge and/or FX feed.
 ///
-/// Pass `keep_dry_dest` during ForceRespawn rebuilds so apps (e.g. Chromium) keep
-/// hearing audio instead of a silent gap that stalls A/V.
+/// Pass `keep_dry_dest` during ForceRespawn so the dry *link* stays (apps don't
+/// cork). Output is silenced separately via `gate_bus_monitor` until wet is sealed.
 pub fn disarm_track_egress(backend: &mut dyn AudioBackend, bus: &str, keep_fx_feed: bool) {
     disarm_track_egress_ex(backend, bus, keep_fx_feed, None);
 }
@@ -165,6 +165,69 @@ pub fn arm_track_egress(
             backend.ensure_link_raw(&from, d)?;
         }
     }
+    Ok(())
+}
+
+/// Wet arm that keeps a dry `bus→dest` *link* until `post→dest` is live.
+///
+/// Plain [`arm_track_egress`] drops dry first — that graph gap corks Chromium.
+/// ForceRespawn also gates the bus monitor so the dry link carries silence.
+pub fn arm_track_egress_soft_cutover(
+    backend: &mut dyn AudioBackend,
+    bus: &str,
+    dests: &[String],
+) -> Result<()> {
+    let from = format!("{bus}.monitor");
+    let post = post_name_for_bus(bus);
+    let post_mon = format!("{post}.monitor");
+    let fx = fx_name_for_bus(bus);
+
+    // Keep dry dest(s) audible while post egress comes up.
+    let mut bus_keep: Vec<&str> = vec![fx.as_str(), "buschain_hold"];
+    for d in dests {
+        if !d.is_empty() {
+            bus_keep.push(d.as_str());
+        }
+    }
+    let _ = backend.unlink_from_source_except(&from, &bus_keep);
+    let _ = backend.ensure_link_raw(&from, &fx);
+    let _ = backend.ensure_link_raw(&from, "buschain_hold");
+    for d in dests {
+        if d.is_empty() || !sink_exists(d) {
+            continue;
+        }
+        let _ = backend.ensure_link_raw(&from, d);
+    }
+
+    let allow: Vec<&str> = dests
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::once("buschain_hold"))
+        .collect();
+    let _ = backend.unlink_from_source_except(&post_mon, &allow);
+    for d in dests {
+        if d.is_empty() || !sink_exists(d) {
+            continue;
+        }
+        backend.ensure_link_raw(&post_mon, d)?;
+    }
+
+    // Drop dry only after post→dest sticks (brief poll — don't HOL the worker).
+    for d in dests {
+        if d.is_empty() {
+            continue;
+        }
+        for _ in 0..8 {
+            if link_is_live(&post_mon, d) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = backend.unlink_raw(&from, d);
+    }
+    let _ = backend.unlink_from_source_except(&from, &[fx.as_str(), "buschain_hold"]);
+    let _ = backend.ensure_link_raw(&from, &fx);
+    let _ = backend.ensure_link_raw(&from, "buschain_hold");
     Ok(())
 }
 

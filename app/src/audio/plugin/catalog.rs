@@ -353,6 +353,16 @@ static SOFTCLIP: &[ParamDef] = &[
         modes: None,
         logarithmic: false,
     },
+    ParamDef {
+        key: "Bypass",
+        label: "Bypass",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
 ];
 
 static LIMITER: &[ParamDef] = &[
@@ -673,6 +683,16 @@ static OVERDRIVE: &[ParamDef] = &[
         max: 2.0,
         default: 1.0, // Drive Bass — theatre / 808 thicken
         modes: Some(OD_FOCUS),
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Bypass",
+        label: "Bypass",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        modes: None,
         logarithmic: false,
     },
 ];

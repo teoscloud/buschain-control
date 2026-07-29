@@ -367,8 +367,11 @@ pub fn ensure_fx_chain(
     mode: ChainEnsureMode,
 ) -> anyhow::Result<ChainState> {
     let bus = spec.bus.as_str().to_string();
+    let span = buschain_engine::fx_trace::span("EnsureFxChain");
+    let mode_tag = format!("{mode:?}");
     let state = with_engine(|eng| eng.ensure_fx_chain(spec, mode))?;
     set_wet_cached(&bus, state.is_wet());
+    span.end(format!("{bus} {mode_tag} wet={}", state.is_wet()));
     Ok(state)
 }
 
@@ -381,7 +384,16 @@ pub fn set_master_hw_light(hw: &str) -> anyhow::Result<String> {
 }
 
 pub fn push_fx_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<()> {
-    with_engine(|eng| eng.push_fx_controls(bus, inserts))
+    // Props must not wait on the Engine mutex while ForceRespawn sleeps.
+    // Write live controls lock-free; best-effort sync Desired under try_lock.
+    let fx_name = fx_name_for_bus(bus);
+    buschain_engine::backend::push_insert_controls(&fx_name, &inserts)?;
+    if let Ok(mut g) = engine_mutex().try_lock() {
+        if let Some(spec) = g.desired_mut().fx_chains.get_mut(bus) {
+            spec.inserts = inserts;
+        }
+    }
+    Ok(())
 }
 
 pub fn teardown_fx_chain(bus: &str) -> anyhow::Result<()> {

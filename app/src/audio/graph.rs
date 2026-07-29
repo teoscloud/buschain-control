@@ -1645,40 +1645,6 @@ fn fx_topology_live(bus: &str, inserts: &[crate::audio::plugin::PluginRef]) -> b
     !inserts.is_empty() && fx_path_audible(bus)
 }
 
-/// Reconcile one track — FX rewire only when membership/order changed.
-fn reconcile_track_route(
-    session: &mut Session,
-    fx: &mut crate::audio::filter_chain::FilterChainRuntime,
-    track_id: uuid::Uuid,
-    hw_sink: &str,
-) -> Result<(bool, String)> {
-    let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
-        return Err(anyhow!("track not found"));
-    };
-    let bus = track.expected_sink_name();
-    let inserts = live_ladspa_inserts(track);
-    let want_fx = !inserts.is_empty();
-    let has_fx = fx_topology_live(&bus, &inserts);
-    let mid_prefix = crate::audio::filter_chain::slot_mid_prefix(&bus);
-    let fx_slot_prefix = crate::audio::filter_chain::slot_fx_prefix(&bus);
-    let has_orphan_slots = list_sinks().unwrap_or_default().iter().any(|s| {
-        s.name.starts_with(&mid_prefix) || s.name.starts_with(&fx_slot_prefix)
-    });
-
-    let _ = ensure_bus_keepalive(&bus);
-
-    if want_fx != has_fx || has_orphan_slots {
-        let msg = rewire_track_fx(session, fx, track_id)?;
-        return Ok((true, msg));
-    }
-
-    let msg = rewire_track_route(session, track_id, hw_sink, true)?;
-    if want_fx {
-        let _ = crate::audio::insert_map::push_track_controls(session, track_id);
-    }
-    Ok((false, msg))
-}
-
 /// Apply session routing — **idle reconcile**, never nuclear.
 ///
 /// If buses/FX/loopbacks are already correct, Apply is a no-op for PipeWire topology
@@ -1731,13 +1697,27 @@ pub fn apply_session(
     let mut warnings: Vec<String> = Vec::new();
 
     // Full: input/keepalive only — ArmSession owns FX spawn + sealed egress.
-    // Hotplug: per-track reconcile (may ForceRespawn one chain) without re-barrier.
+    // Hotplug/Route: links + Props only — NEVER ForceRespawn (that starved knobs
+    // whenever wet probes flapped). Structural FX = RewireTrackFx / ClockBind.
     // ClockBind: ForceRespawn every insert rack so FX/post match the new GraphClock.
     for id in ids {
         let result = match kind {
             ApplyKind::Full => rewire_track_route(session, id, &hw_sink, false)
                 .map(|m| (false, m)),
-            ApplyKind::Hotplug => reconcile_track_route(session, fx, id, &hw_sink),
+            ApplyKind::Hotplug => {
+                // Links + Props only — NEVER ForceRespawn (wet flaps stole minutes).
+                let msg = rewire_track_route(session, id, &hw_sink, false)?;
+                let want_fx = session
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(track_has_live_fx)
+                    .unwrap_or(false);
+                if want_fx {
+                    let _ = crate::audio::insert_map::push_track_controls(session, id);
+                }
+                Ok((false, msg))
+            }
             ApplyKind::ClockBind => {
                 let has_fx = session
                     .tracks
@@ -1838,7 +1818,7 @@ pub fn rewire_track_route(
     allow_fx_ensure: bool,
 ) -> Result<String> {
     session.normalize();
-    let master_name = "buschain_master";
+    let _master_name = "buschain_master";
     let (is_master, bus, inserts, input_source) = {
         let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
             return Err(anyhow!("track not found for route rewire"));
@@ -1857,28 +1837,21 @@ pub fn rewire_track_route(
 
     let mut has_fx = !inserts.is_empty() && fx_path_audible(&bus);
     let mut warnings = Vec::new();
+    // Route/Hotplug must never ForceRespawn — only RewireTrackFx / ClockBind.
     if allow_fx_ensure && !inserts.is_empty() && !has_fx {
-        let dest = if is_master {
-            hw_sink.to_string()
-        } else {
-            master_name.to_string()
-        };
-        if let Err(e) = crate::audio::insert_map::ensure_track_fx(
-            session,
-            track_id,
-            &dest,
-            buschain_engine::ChainEnsureMode::ForceRespawn,
-        ) {
-            warnings.push(format!("FX ensure: {e:#}"));
-        }
-        has_fx = fx_path_audible(&bus);
-        if !has_fx {
-            // Fail-open dry only after ensure Failed (engine restore_dry). Never dry while Building.
-            warnings.push(format!(
-                "FX not wet on {bus} with {} insert(s) — engine dry fallback",
-                inserts.len()
-            ));
-        }
+        buschain_engine::fx_trace::log(
+            "FORCE_RESPAWN_LEAK",
+            &format!("rewire_track_route allow_fx_ensure bus={bus}"),
+            0,
+        );
+        eprintln!(
+            "[buschain] BUG: Route path requested ForceRespawn on {bus} — refused (hold-only)"
+        );
+        crate::audio::engine_handle::disarm_track_egress(&bus, true);
+        warnings.push(format!(
+            "FX not wet on {bus} — hold-only (Route must not ForceRespawn)"
+        ));
+        has_fx = false;
     } else if !inserts.is_empty() && !has_fx {
         // Link-only: keep hold-only — do not open dry bypass while Building.
         crate::audio::engine_handle::disarm_track_egress(&bus, true);
@@ -2011,16 +1984,8 @@ pub fn rewire_track_fx(
     };
 
     let mode = buschain_engine::ChainEnsureMode::ForceRespawn;
-    let fx_msg = match crate::audio::insert_map::ensure_track_fx(session, track_id, &dest, mode)
-    {
-        Ok((_, m)) => m,
-        Err(e) => {
-            // Engine restore_dry already ran — still re-assert dry links so
-            // meters/heard path don't stay on a half-switched wet spine.
-            crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
-            format!("FX failed (dry fallback): {e:#}")
-        }
-    };
+    let fx_result =
+        crate::audio::insert_map::ensure_track_fx(session, track_id, &dest, mode);
 
     // Link-only — FX ensure already ran above (no second ForceRespawn).
     let route_msg = rewire_track_route(session, track_id, &hw_sink, false)?;
@@ -2030,7 +1995,14 @@ pub fn rewire_track_fx(
         t.sink_name = Some(bus.clone());
     }
 
-    Ok(format!("{fx_msg} · {route_msg}"))
+    match fx_result {
+        Ok((_, fx_msg)) => Ok(format!("{fx_msg} · {route_msg}")),
+        Err(e) => {
+            // Do not report ok=true when FX died — UI/idle must retry ForceRespawn.
+            crate::audio::engine_handle::set_chain_wet_cached(&bus, false);
+            Err(anyhow!("FX failed (dry fallback): {e:#} · {route_msg}"))
+        }
+    }
 }
 
 /// Bring one new track bus online without touching other tracks' FX.

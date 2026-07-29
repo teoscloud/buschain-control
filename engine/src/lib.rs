@@ -7,9 +7,13 @@ pub mod backend;
 pub mod clock;
 pub mod contract;
 pub mod domain;
+pub mod fx_busy;
+pub mod fx_trace;
 pub mod pipeline;
 pub mod plan;
 pub mod runtime;
+
+pub use fx_busy::{is_rebuilding as fx_is_rebuilding, RebuildGuard as FxRebuildGuard};
 
 pub use clock::{
     invalidate_clock_probe_caches, probe_endpoint_caps, probe_master_hw_from_sinks, probe_rates_pw,
