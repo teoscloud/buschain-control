@@ -25,10 +25,13 @@ typedef enum {
   P_FREQ_HIGH,
   P_HF_BIAS,
   P_STEREO_LINK,
+  P_STABILITY,
   P_ATTACK,
   P_RELEASE,
   P_KNEE,
   P_RATIO,
+  P_GATE_ENABLE,
+  P_GATE_MIX,
   P_HPF,
   P_LPF,
   P_BYPASS,
@@ -101,10 +104,13 @@ static void run(LV2_Handle instance, uint32_t n_samples) {
   params.freq_high_hz = pget(self, P_FREQ_HIGH, params.freq_high_hz);
   params.hf_bias = pget(self, P_HF_BIAS, params.hf_bias);
   params.stereo_link = pget(self, P_STEREO_LINK, params.stereo_link);
+  params.stability = pget(self, P_STABILITY, params.stability);
   params.attack_ms = pget(self, P_ATTACK, params.attack_ms);
   params.release_ms = pget(self, P_RELEASE, params.release_ms);
   params.knee_db = pget(self, P_KNEE, params.knee_db);
   params.ratio = pget(self, P_RATIO, params.ratio);
+  params.gate_enable = pget(self, P_GATE_ENABLE, 0.0f) >= 0.5f;
+  params.gate_mix = pget(self, P_GATE_MIX, params.gate_mix);
   params.hpf_enable = pget(self, P_HPF, 0.0f) >= 0.5f;
   params.lpf_enable = pget(self, P_LPF, 0.0f) >= 0.5f;
   params.bypass = pget(self, P_BYPASS, 0.0f) >= 0.5f;

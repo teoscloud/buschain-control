@@ -29,24 +29,19 @@
 - [x] Hyprland `exec-once = buschain-control --hidden`
 - [x] Drop systemd `buschain-daemon` user unit
 
-## Next
+## Done (in-process DSP host)
 
-- [ ] Dual-helper A/B FX cutover (near-seamless add/remove/reorder under `pipewire -c`)
-- [ ] Native in-process VST3 backend (replace Carla adapter)
-- [ ] Real CLAP instantiate + process
+- [x] RT-safe insert host (`engine/src/host/`) — Rack / Slot / LADSPA / SPSC controls
+- [x] `PwFxNode` — libpipewire filter, `process()` in PW RT callback
+- [x] Sealed path: `{bus}.monitor → buschain_fx_* → buschain_post_* → dest`
+- [x] Gen-swap structural edits (no A/B helpers, no `pipewire -c`)
+- [x] Click-free bypass fades, denormals FTZ/DAZ, xrun counters, latency publish
+- [x] Retire Props FX / `.sig` / dual-helper A/B cutover
 
-## Ideal / later — in-process DSP host (the “leap”)
+## Done (DAW apex v2)
 
-Today FX is an out-of-process `pipewire -c` + `libpipewire-module-filter-chain` helper
-per bus. Topology is baked at module load, so add/remove/reorder cannot mutate the
-live graph via Props; A/B dual helpers are the best seamlessness under that model.
-
-**State of the art (future):** run the insert rack inside BusChain (or a dedicated
-DSP thread we own). PipeWire becomes I/O only (bus capture / HW playback). Plugins
-are still black boxes (`process()` + advertised ports); the host owns an in-memory
-graph so add/remove/reorder/bypass are realtime list updates — true DAW-grade
-structural edits with no helper respawn.
-
-Do **not** start this until A/B cutover metrics say residual gap is still unacceptable.
-Do **not** resurrect per-slot OS processes as a substitute.
-
+- [x] **F2** Native levels/mute/gate + Metadata defaults + registry snapshot/sources; PulseCompat for stream-move only; app levels/defaults via engine
+- [x] **G** CLAP/VST3 on host path + insert_map + `state_blob` (always built-in; full CLAP/VST3 process APIs still incomplete)
+- [x] **H** Master-bus PDC delay lines + latency publish bookkeeping; UI latency helpers
+- [x] **I** Remote `AudioProcessor` hook (`host/remote.rs`, `BUSCHAIN_SANDBOX_PLUGINS`)
+- [x] **J** Host pre/post meter atomics; freeze/bounce offline; UI bridge stub; ControlMsg sample timestamps

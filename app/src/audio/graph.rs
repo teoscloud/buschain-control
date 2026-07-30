@@ -534,10 +534,23 @@ pub fn list_source_outputs() -> Result<Vec<StreamNode>> {
 }
 
 pub fn set_sink_volume(name_or_index: &str, pct: u32) -> Result<()> {
+    // Prefer engine native levels (linear from percent). Preserve unmute.
+    let gain_db = if pct == 0 {
+        -120.0
+    } else {
+        20.0 * (pct as f32 / 100.0).log10()
+    };
+    if crate::audio::engine_handle::set_levels(name_or_index, gain_db, false).is_ok() {
+        return Ok(());
+    }
     run_ok("pactl", &["set-sink-volume", name_or_index, &format!("{pct}%")])
 }
 
 pub fn set_sink_mute(name_or_index: &str, mute: bool) -> Result<()> {
+    // Never force gain to 0 dB — that wiped every fader drag after set_sink_volume.
+    if crate::audio::engine_handle::set_mute(name_or_index, mute).is_ok() {
+        return Ok(());
+    }
     run_ok(
         "pactl",
         &["set-sink-mute", name_or_index, if mute { "1" } else { "0" }],
@@ -642,6 +655,9 @@ pub fn move_sink_input_if_needed(index: u32, sink: &str, current: &str) -> Resul
 }
 
 pub fn set_default_sink(name: &str) -> Result<()> {
+    if crate::audio::engine_handle::set_default_sink(name).unwrap_or(false) {
+        return Ok(());
+    }
     match run_ok("pactl", &["set-default-sink", name]) {
         Ok(()) => {
             std::thread::sleep(std::time::Duration::from_millis(40));
@@ -836,16 +852,17 @@ fn set_track_audible(sink: &str, muted: bool, gain_db: f32) -> Result<()> {
     let mon = format!("{sink}.monitor");
     // Never mute/zero the *app-facing sink* for user mute — that corks Chromium.
     // Silence the outbound monitor / FX chain only; keep sink open for streams.
+    // Always apply fader with muted=false on the app sink.
+    let _ = crate::audio::engine_handle::set_levels(sink, gain_db, false);
     if muted {
         let _ = set_source_mute(&mon, true);
         let _ = set_source_volume(&mon, 0);
         set_slot_chain_audible(sink, true);
-        // Keep sink unmuted at current fader so apps don't cork.
-        let _ = set_sink_mute(sink, false);
         let _ = set_sink_volume(sink, db_to_pct(gain_db));
+        let _ = run_ok("pactl", &["set-sink-mute", sink, "0"]);
     } else {
-        set_sink_volume(sink, db_to_pct(gain_db))?;
-        set_sink_mute(sink, false)?;
+        let _ = set_sink_volume(sink, db_to_pct(gain_db));
+        let _ = run_ok("pactl", &["set-sink-mute", sink, "0"]);
         let _ = set_source_mute(&mon, false);
         let _ = set_source_volume(&mon, 100);
         set_slot_chain_audible(sink, false);
@@ -854,13 +871,20 @@ fn set_track_audible(sink: &str, muted: bool, gain_db: f32) -> Result<()> {
     Ok(())
 }
 
-/// Continuous fader path — **bus volume only** (one/two pactl calls).
+/// Continuous fader path — **bus volume only**.
 ///
+/// Passes dB straight to the engine (no pct round-trip, no mute side-effect).
 /// Never call `ensure_fx_path_open` / `list_sinks` here: that was blocking the
 /// worker for hundreds of ms per tick and made faders jump while starving Props.
 pub fn apply_one_track_volume(sink: &str, gain_db: f32) -> Result<()> {
+    if crate::audio::engine_handle::set_levels(sink, gain_db, false).is_ok() {
+        return Ok(());
+    }
     set_sink_volume(sink, db_to_pct(gain_db))?;
-    let _ = set_sink_mute(sink, false);
+    let _ = run_ok(
+        "pactl",
+        &["set-sink-mute", sink, "0"],
+    );
     Ok(())
 }
 

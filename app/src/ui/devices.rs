@@ -191,18 +191,12 @@ impl NonZeroRate for u32 {
 
 pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
-    design::section_label(ui, &theme, "OUTPUT DEVICES — sinks");
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(
-            "Master HW out = speakers/headphones Master plays to (Scarlett, etc.).\n\
-             System default = where new apps play. Setting default to a BusChain track \
-             only sends apps *into* that track — Master still owns the path to hardware.",
-        )
-        .size(11.0)
-        .color(theme.text_muted()),
+    design::page_header(
+        ui,
+        &theme,
+        "Output",
+        "Pick Master hardware (speakers/headphones) and the system default sink. BusChain tracks are not hardware — they feed into Master.",
     );
-    ui.add_space(4.0);
 
     // Header uses the same resolver truth as the audio path.
     let hw_label = state
@@ -483,10 +477,22 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
 
 pub fn draw_input_devices(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
-    design::section_label(ui, &theme, "INPUT DEVICES — sources");
-    ui.add_space(4.0);
+    design::page_header(
+        ui,
+        &theme,
+        "Input",
+        "Microphones and capture devices. Set levels, mute, and the system default source.",
+    );
     ui.horizontal(|ui| {
-        ui.checkbox(&mut state.show_hidden_recording, "Show hidden");
+        ui.label(
+            RichText::new("Sources")
+                .size(12.0)
+                .strong()
+                .color(theme.text_dim()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.checkbox(&mut state.show_hidden_recording, "Show internals");
+        });
     });
     ui.add_space(4.0);
 

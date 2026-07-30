@@ -4,7 +4,7 @@ mod insert;
 
 pub use insert::{
     bus_suffix, fx_name_for_bus, inserts_signature, normalize_ladspa_label, post_name_for_bus,
-    ChainEnsureMode, ChainSpec, ChainState, InsertSlot, WirePlan,
+    ChainEnsureMode, ChainSpec, ChainState, InsertFormat, InsertSlot, WirePlan,
 };
 
 use serde::{Deserialize, Serialize};

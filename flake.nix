@@ -21,6 +21,48 @@
         libxrandr
       ];
 
+      # Shared libs commercial VST3/CLAP modules commonly dlopen (ldd / LSP / Ardour notes).
+      # Keep this list in sync for: package wrapProgram, plugin-ui/dsp helpers, and nix develop.
+      vst3PluginRuntimeLibs = with pkgs; [
+        # Fonts / 2D UI
+        freetype
+        fontconfig
+        cairo
+        pango
+        harfbuzz
+        libpng
+        zlib
+        expat
+        brotli
+        # GL / X11 / Wayland (editors + OpenGL UIs)
+        libGL
+        libglvnd
+        libx11
+        libxext
+        libxcursor
+        libxi
+        libxrandr
+        libxrender
+        libxcb
+        xcbutil
+        libxkbcommon
+        wayland
+        vulkan-loader
+        # Audio / media helpers some plugins pull at load
+        alsa-lib
+        libsndfile
+        # Network / licensing (e.g. Bertom → libcurl)
+        curl
+        openssl
+        # Toolkit fallbacks (prefer static plugins; still unblocks many binaries)
+        gtk3
+        gdk-pixbuf
+        # Misc
+        dbus
+        libuuid
+        icu
+      ];
+
       rustPlatform = pkgs.rustPlatform;
 
       commonNative = with pkgs; [
@@ -34,7 +76,7 @@
         libpulseaudio
         dbus
         openssl
-      ] ++ eguiLibs;
+      ] ++ eguiLibs ++ vst3PluginRuntimeLibs;
 
       gtkMixer = import ./packaging/nix/gtk-mixer.nix { inherit pkgs; };
 
@@ -48,6 +90,7 @@
         dontCargoInstall = true;
         buildPhase = ''
           runHook preBuild
+          # Builds app + tools (incl. buschain-plugin-ui / buschain-plugin-dsp).
           cargo build --release -p buschain-control -p buschain-tools
           runHook postBuild
         '';
@@ -60,6 +103,16 @@
           install -m755 target/release/buschain-daemon $out/bin/
           install -m755 target/release/buschain-ctl $out/bin/
           install -m755 packaging/waybar/buschain-waybar $out/bin/buschain-waybar
+          # VST3/CLAP helpers (native editor + per-track sandbox DSP).
+          if [ -f target/release/buschain-plugin-ui ]; then
+            install -m755 target/release/buschain-plugin-ui $out/bin/
+          fi
+          if [ -f target/release/buschain-plugin-dsp ]; then
+            install -m755 target/release/buschain-plugin-dsp $out/bin/
+          fi
+          if [ -f target/release/buschain-plugin-surface ]; then
+            install -m755 target/release/buschain-plugin-surface $out/bin/
+          fi
 
           ln -s ${gtkMixer}/bin/buschain-mixer-gtk $out/bin/buschain-mixer-gtk
           ln -s ${gtkMixer}/bin/buschain-mixer $out/bin/buschain-mixer
@@ -75,12 +128,14 @@
             cp assets/icons/buschain-control.png $out/share/icons/hicolor/256x256/apps/buschain-control.png
           fi
 
+          pluginLd=${lib.makeLibraryPath (eguiLibs ++ vst3PluginRuntimeLibs)}
           wrapProgram $out/bin/buschain-control \
-            --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath commonBuild} \
+            --prefix LD_LIBRARY_PATH : $pluginLd \
             --prefix PATH : $out/bin \
             --set-default BUSCHAIN_CONTROL_USE_GTK_MIXER 1
           wrapProgram $out/bin/buschain-daemon \
-            --prefix PATH : ${lib.makeBinPath [ pkgs.pipewire pkgs.pulseaudio ]}
+            --prefix PATH : ${lib.makeBinPath [ pkgs.pipewire pkgs.pulseaudio ]} \
+            --prefix LD_LIBRARY_PATH : $pluginLd
           wrapProgram $out/bin/buschain-ctl \
             --prefix PATH : $out/bin \
             --set-default BUSCHAIN_CONTROL_USE_GTK_MIXER 1
@@ -88,6 +143,18 @@
             --prefix PATH : $out/bin:${lib.makeBinPath [ pkgs.pulseaudio pkgs.procps ]} \
             --set-default BUSCHAIN_CONTROL_CTL $out/bin/buschain-ctl \
             --set-default BUSCHAIN_CONTROL_USE_GTK_MIXER 1
+          if [ -x $out/bin/buschain-plugin-ui ]; then
+            wrapProgram $out/bin/buschain-plugin-ui \
+              --prefix LD_LIBRARY_PATH : $pluginLd
+          fi
+          if [ -x $out/bin/buschain-plugin-dsp ]; then
+            wrapProgram $out/bin/buschain-plugin-dsp \
+              --prefix LD_LIBRARY_PATH : $pluginLd
+          fi
+          if [ -x $out/bin/buschain-plugin-surface ]; then
+            wrapProgram $out/bin/buschain-plugin-surface \
+              --prefix LD_LIBRARY_PATH : $pluginLd
+          fi
 
           runHook postInstall
         '';
@@ -151,6 +218,12 @@
           gcc
           gnumake
           lv2
+          lilv
+          serd
+          sord
+          sratom
+          zix
+          libxcb
           pipewire
           pulseaudio
           libpulseaudio
@@ -161,13 +234,15 @@
           (python3.withPackages (ps: [ ps.pygobject3 ]))
           # Wrapped mixer (gi + layer-shell) — required for waybar/tray popup in develop.
           gtkMixer
-        ] ++ eguiLibs;
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (eguiLibs ++ [ pkgs.dbus ]);
+        ] ++ eguiLibs ++ vst3PluginRuntimeLibs;
+        # Host + in-process VST3/CLAP + buschain-plugin-ui/dsp share this path.
+        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (eguiLibs ++ vst3PluginRuntimeLibs);
         shellHook = ''
           export CARGO_TARGET_DIR="$PWD/target"
           export LADSPA_PATH="$PWD/plugins/buschain-denoiser/build:$PWD/plugins/buschain-gate/build:$PWD/plugins/buschain-builtins/build:''${LADSPA_PATH:-}"
           export LV2_PATH="$PWD/plugins/buschain-denoiser/build:$PWD/plugins/buschain-gate/build:$PWD/plugins/buschain-builtins/build:''${LV2_PATH:-}"
-          export PATH="$PWD/target/debug:$PWD/packaging/waybar:$PATH"
+          # Prefer freshly built helpers next to cargo target (plugin UI / sandbox DSP).
+          export PATH="$PWD/target/debug:$PWD/target/release:$PWD/packaging/waybar:$PATH"
           export BUSCHAIN_CONTROL_CTL="$PWD/target/debug/buschain-ctl"
           # Prefer nix-wrapped mixer from this shell (not the bare packaging/ launcher).
           export BUSCHAIN_CONTROL_MIXER="$(command -v buschain-mixer-gtk)"
@@ -178,6 +253,9 @@
           echo "  hidden: cargo run -- --hidden"
           echo "  ctl:    cargo ctl -- status"
           echo "  waybar: buschain-waybar popup → GTK ($BUSCHAIN_CONTROL_MIXER)"
+          echo "  vst3:   LD_LIBRARY_PATH includes freetype/cairo/curl/alsa/… for plugin dlopen"
+          echo "  helpers: cargo build -p buschain-tools --bin buschain-plugin-ui --bin buschain-plugin-dsp --bin buschain-plugin-surface"
+          echo "  window:  Wayland host (default); VST3 editors float on XWayland"
         '';
       };
     };

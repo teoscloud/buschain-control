@@ -4,10 +4,21 @@ use egui::RichText;
 
 pub fn draw_recording(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
+    design::page_header(
+        ui,
+        &theme,
+        "Recording",
+        "Apps capturing audio (mics, loopbacks). Assign sources and levels without digging through pw-dump.",
+    );
     ui.horizontal(|ui| {
-        design::section_label(ui, &theme, "RECORDING — capture streams (source outputs)");
+        ui.label(
+            RichText::new("Capture streams")
+                .size(12.0)
+                .strong()
+                .color(theme.text_dim()),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.checkbox(&mut state.show_hidden_recording, "Show hidden");
+            ui.checkbox(&mut state.show_hidden_recording, "Show internals");
         });
     });
     ui.add_space(6.0);

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use buschain_engine::{
-    backend::sink_exists, fx_name_for_bus, BusLevel, ChainEnsureMode, ChainSpec, ChainState,
+    BusLevel, ChainEnsureMode, ChainSpec, ChainState,
     Engine, InsertSlot, Intent, NodeName, NodeRole, NodeSpec, PerformanceProfile,
 };
 
@@ -172,9 +172,7 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             if keep.contains(&bus) {
                 continue;
             }
-            let fx = buschain_engine::live_fx_name(&bus);
-            let stg = format!("{}__stg", fx_name_for_bus(&bus));
-            if sink_exists(&fx) || sink_exists(&stg) || eng.chain_is_wet(&bus) {
+            if buschain_engine::any_gen_live(&bus) || eng.chain_is_wet(&bus) {
                 let _ = eng.teardown_fx_chain(&bus);
             }
         }
@@ -214,9 +212,8 @@ pub fn arm_session(session: &Session, hw_sink: &str, force_fx: bool) -> anyhow::
 
 /// Arm one track's configured egress hops (wet post→dests or dry bus→dests).
 ///
-/// Wet + helper alive: always attempt post→dest (Master or track→Master). A flaky
-/// spine probe must not leave the bus dry/hold while `__stg`/canonical FX is up —
-/// that is what made every track "skip" plugins after A/B.
+/// Wet + host alive: always attempt post→dest (Master or track→Master). A flaky
+/// spine probe must not leave the bus dry/hold while the in-process host is up.
 pub fn arm_track_egress(bus: &str, wet: bool) -> anyhow::Result<()> {
     with_engine(|eng| {
         // Master→HW stays behind the session barrier (ensure_fx_chain already
@@ -396,28 +393,8 @@ pub fn set_master_hw_light(hw: &str) -> anyhow::Result<String> {
 }
 
 pub fn push_fx_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<()> {
-    // Props must not wait on the Engine mutex while ForceRespawn sleeps.
-    // Write live controls lock-free; best-effort sync Desired under try_lock.
-    // Target active A/B generation (may be `__stg` after warm cutover).
-    let fx_name = buschain_engine::live_fx_name(bus);
-    match buschain_engine::backend::push_insert_controls(&fx_name, &inserts) {
-        Ok(()) => {}
-        Err(e) => {
-            let msg = format!("{e:#}");
-            if msg.contains("not found") {
-                // Heal stale generation pointer and retry once.
-                let _ = buschain_engine::live_fx_name(bus); // heal inside
-                let healed = buschain_engine::live_fx_name(bus);
-                if healed != fx_name {
-                    buschain_engine::backend::push_insert_controls(&healed, &inserts)?;
-                } else {
-                    return Err(e);
-                }
-            } else {
-                return Err(e);
-            }
-        }
-    }
+    // In-process host control queue — lock-free of Engine ForceRespawn mutex.
+    buschain_engine::host::registry::push_host_controls(bus, &inserts)?;
     if let Ok(mut g) = engine_mutex().try_lock() {
         if let Some(spec) = g.desired_mut().fx_chains.get_mut(bus) {
             spec.inserts = inserts;
@@ -441,6 +418,57 @@ pub fn chain_is_wet(bus: &str) -> bool {
 
 pub fn remember_master_hw(hw: &str) {
     with_engine(|eng| eng.remember_master_hw(hw));
+}
+
+/// Native-preferring sink/source levels (db + mute).
+pub fn set_levels(sink: &str, gain_db: f32, muted: bool) -> anyhow::Result<()> {
+    with_engine(|eng| {
+        eng.apply(Intent::SetLevels {
+            sink: sink.to_string(),
+            gain_db,
+            muted,
+        })?;
+        Ok(())
+    })
+}
+
+/// Flip mute without clobbering the current fader gain (reads DesiredState).
+pub fn set_mute(sink: &str, muted: bool) -> anyhow::Result<()> {
+    with_engine(|eng| {
+        let gain = eng
+            .desired()
+            .bus_levels
+            .get(sink)
+            .map(|l| l.gain_db)
+            .unwrap_or(0.0);
+        eng.apply(Intent::SetLevels {
+            sink: sink.to_string(),
+            gain_db: gain,
+            muted,
+        })?;
+        Ok(())
+    })
+}
+
+pub fn set_default_sink(name: &str) -> anyhow::Result<bool> {
+    with_engine(|eng| eng.set_default_sink(name))
+}
+
+pub fn graph_snapshot() -> anyhow::Result<buschain_engine::GraphSnapshot> {
+    with_engine(|eng| eng.snapshot())
+}
+
+/// Host pre/post insert meter peaks (prefer over Pulse meter-* for FX buses).
+pub fn host_meter_peaks(bus: &str) -> Option<(f32, f32)> {
+    buschain_engine::host::registry::host_meter_peaks(bus)
+}
+
+pub fn host_latency_ms(bus: &str, sample_rate: u32) -> f32 {
+    let samples = buschain_engine::host::reported_latency(bus);
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    samples as f32 * 1000.0 / sample_rate as f32
 }
 
 pub fn stop_all_fx() {

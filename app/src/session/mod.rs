@@ -120,8 +120,13 @@ pub struct Session {
     pub lv2_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clap_paths: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// VST3 scan on by default (Carla discovery). Toggle in Config if unwanted.
+    #[serde(default = "default_true")]
     pub vst3_enabled: bool,
+    /// When true, non-trusted plugins run in a per-track SHM sandbox (P6).
+    /// Default false = trusted in-process hosting.
+    #[serde(default)]
+    pub sandbox_untrusted: bool,
     /// Mixer selection / accent highlight RGB (Settings → Appearance).
     #[serde(default = "default_accent_rgb")]
     pub accent_rgb: [u8; 3],
@@ -132,6 +137,15 @@ pub struct Session {
     /// Only written when the user edits/Applies a device clock — not on mere view.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub device_clocks: HashMap<String, DeviceClockConfig>,
+    /// MIDI hardware / PipeWire nodes (enable flags + labels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midi_devices: Vec<buschain_engine::MidiDeviceInfo>,
+    /// Logical routes: MIDI source → track / insert / master.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midi_routes: Vec<buschain_engine::MidiRoute>,
+    /// CC → parameter maps (learn mode writes here).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midi_maps: Vec<buschain_engine::MidiCcMap>,
 }
 
 fn default_accent_rgb() -> [u8; 3] {
@@ -187,10 +201,14 @@ impl Default for Session {
             ladspa_paths: vec![],
             lv2_paths: vec![],
             clap_paths: vec![],
-            vst3_enabled: false,
+            vst3_enabled: true,
+            sandbox_untrusted: false,
             accent_rgb: default_accent_rgb(),
             performance: PerformanceProfile::default(),
             device_clocks: HashMap::new(),
+            midi_devices: vec![],
+            midi_routes: vec![],
+            midi_maps: vec![],
         }
     }
 }
@@ -353,5 +371,47 @@ impl Session {
             (master, i)
         });
         idx
+    }
+
+    /// Reorder tracks by UI order indices (Master stays first — cannot move).
+    /// `from_ui` / `drop_before_ui` are indices into [`Self::tracks_ui_order`].
+    pub fn reorder_tracks_ui(&mut self, from_ui: usize, drop_before_ui: usize) -> bool {
+        let order = self.tracks_ui_order();
+        let n = order.len();
+        if from_ui == 0 || from_ui >= n {
+            return false;
+        }
+        if order
+            .get(from_ui)
+            .map(|&i| self.tracks[i].kind.is_master())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        // Keep Master pinned at UI slot 0.
+        let drop_before_ui = drop_before_ui.clamp(1, n);
+        if drop_before_ui == from_ui || drop_before_ui == from_ui + 1 {
+            return false;
+        }
+
+        let mut ids: Vec<Uuid> = order.iter().map(|&i| self.tracks[i].id).collect();
+        let item = ids.remove(from_ui);
+        let insert_at = if drop_before_ui > from_ui {
+            drop_before_ui - 1
+        } else {
+            drop_before_ui
+        };
+        ids.insert(insert_at, item);
+
+        if let Some(mid) = self.master_id() {
+            ids.retain(|id| *id != mid);
+            ids.insert(0, mid);
+        }
+
+        let old = std::mem::take(&mut self.tracks);
+        let mut map: std::collections::HashMap<Uuid, Track> =
+            old.into_iter().map(|t| (t.id, t)).collect();
+        self.tracks = ids.into_iter().filter_map(|id| map.remove(&id)).collect();
+        true
     }
 }

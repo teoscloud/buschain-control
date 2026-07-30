@@ -25,6 +25,25 @@ pub struct ParamDef {
     pub logarithmic: bool,
 }
 
+/// Owned counterpart for discovered CLAP/VST3/LV2 params (non-catalog plugins).
+#[derive(Debug, Clone)]
+pub struct OwnedParamDef {
+    pub key: String,
+    pub label: String,
+    pub kind: ParamKind,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub modes: Option<Vec<String>>,
+    pub logarithmic: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicPluginUiSpec {
+    pub title: String,
+    pub params: Vec<OwnedParamDef>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PluginUiSpec {
     pub label: &'static str,
@@ -118,7 +137,46 @@ static PRESET_DEFAULT: &[(&str, f32)] = &[
     ("Band 6 Freq (Hz)", 12000.0),
     ("HF Bias", 0.40),
     ("Stereo Link", 0.90),
-    ("Bypass", 0.0),
+    ("Stability", 0.45),
+        ("NR1 On", 1.0),
+    ("NR1 Freq (Hz)", 120.0),
+    ("NR1 Depth (dB)", 12.0),
+    ("NR1 Q", 1.5),
+    ("NR2 On", 1.0),
+    ("NR2 Freq (Hz)", 240.0),
+    ("NR2 Depth (dB)", 11.5),
+    ("NR2 Q", 1.5),
+    ("NR3 On", 1.0),
+    ("NR3 Freq (Hz)", 600.0),
+    ("NR3 Depth (dB)", 8.0),
+    ("NR3 Q", 1.5),
+    ("NR4 On", 1.0),
+    ("NR4 Freq (Hz)", 1580.0),
+    ("NR4 Depth (dB)", 14.0),
+    ("NR4 Q", 1.5),
+    ("NR5 On", 1.0),
+    ("NR5 Freq (Hz)", 3000.0),
+    ("NR5 Depth (dB)", 12.5115),
+    ("NR5 Q", 1.5),
+    ("NR6 On", 1.0),
+    ("NR6 Freq (Hz)", 12000.0),
+    ("NR6 Depth (dB)", 8.8918),
+    ("NR6 Q", 1.5),
+    ("NR7 On", 0.0),
+    ("NR7 Freq (Hz)", 1000.0),
+    ("NR7 Depth (dB)", 0.0),
+    ("NR7 Q", 1.5),
+    ("NR8 On", 0.0),
+    ("NR8 Freq (Hz)", 1000.0),
+    ("NR8 Depth (dB)", 0.0),
+    ("NR8 Q", 1.5),
+    ("Gate Enable", 0.0),
+    ("Gate Knee (dB)", 4.0),
+    ("Gate Ratio", 12.0),
+    ("Gate Attack (ms)", 1.2),
+    ("Gate Release (ms)", 90.0),
+    ("Gate Mix", 1.0),
+("Bypass", 0.0),
 ];
 
 static PRESET_USER_TUNED: &[(&str, f32)] = &[
@@ -137,7 +195,46 @@ static PRESET_USER_TUNED: &[(&str, f32)] = &[
     ("Band 6 Freq (Hz)", 12000.0),
     ("HF Bias", 0.40),
     ("Stereo Link", 0.90),
-    ("Bypass", 0.0),
+    ("Stability", 0.45),
+        ("NR1 On", 1.0),
+    ("NR1 Freq (Hz)", 120.0),
+    ("NR1 Depth (dB)", 12.0),
+    ("NR1 Q", 1.5),
+    ("NR2 On", 1.0),
+    ("NR2 Freq (Hz)", 240.0),
+    ("NR2 Depth (dB)", 11.5),
+    ("NR2 Q", 1.5),
+    ("NR3 On", 1.0),
+    ("NR3 Freq (Hz)", 600.0),
+    ("NR3 Depth (dB)", 8.0),
+    ("NR3 Q", 1.5),
+    ("NR4 On", 1.0),
+    ("NR4 Freq (Hz)", 1580.0),
+    ("NR4 Depth (dB)", 14.0),
+    ("NR4 Q", 1.5),
+    ("NR5 On", 1.0),
+    ("NR5 Freq (Hz)", 3000.0),
+    ("NR5 Depth (dB)", 12.5115),
+    ("NR5 Q", 1.5),
+    ("NR6 On", 1.0),
+    ("NR6 Freq (Hz)", 12000.0),
+    ("NR6 Depth (dB)", 15.0295),
+    ("NR6 Q", 1.5),
+    ("NR7 On", 0.0),
+    ("NR7 Freq (Hz)", 1000.0),
+    ("NR7 Depth (dB)", 0.0),
+    ("NR7 Q", 1.5),
+    ("NR8 On", 0.0),
+    ("NR8 Freq (Hz)", 1000.0),
+    ("NR8 Depth (dB)", 0.0),
+    ("NR8 Q", 1.5),
+    ("Gate Enable", 0.0),
+    ("Gate Knee (dB)", 4.0),
+    ("Gate Ratio", 12.0),
+    ("Gate Attack (ms)", 1.2),
+    ("Gate Release (ms)", 90.0),
+    ("Gate Mix", 1.0),
+("Bypass", 0.0),
 ];
 
 static PRESET_PCM2902: &[(&str, f32)] = &[
@@ -156,7 +253,46 @@ static PRESET_PCM2902: &[(&str, f32)] = &[
     ("Band 6 Freq (Hz)", 12000.0),
     ("HF Bias", 0.40),
     ("Stereo Link", 0.90),
-    ("Bypass", 0.0),
+    ("Stability", 0.45),
+        ("NR1 On", 1.0),
+    ("NR1 Freq (Hz)", 120.0),
+    ("NR1 Depth (dB)", 12.0),
+    ("NR1 Q", 1.5),
+    ("NR2 On", 1.0),
+    ("NR2 Freq (Hz)", 240.0),
+    ("NR2 Depth (dB)", 11.5),
+    ("NR2 Q", 1.5),
+    ("NR3 On", 1.0),
+    ("NR3 Freq (Hz)", 600.0),
+    ("NR3 Depth (dB)", 8.0),
+    ("NR3 Q", 1.5),
+    ("NR4 On", 1.0),
+    ("NR4 Freq (Hz)", 1580.0),
+    ("NR4 Depth (dB)", 14.0),
+    ("NR4 Q", 1.5),
+    ("NR5 On", 1.0),
+    ("NR5 Freq (Hz)", 3000.0),
+    ("NR5 Depth (dB)", 12.5),
+    ("NR5 Q", 1.5),
+    ("NR6 On", 1.0),
+    ("NR6 Freq (Hz)", 12000.0),
+    ("NR6 Depth (dB)", 10.0),
+    ("NR6 Q", 1.5),
+    ("NR7 On", 0.0),
+    ("NR7 Freq (Hz)", 1000.0),
+    ("NR7 Depth (dB)", 0.0),
+    ("NR7 Q", 1.5),
+    ("NR8 On", 0.0),
+    ("NR8 Freq (Hz)", 1000.0),
+    ("NR8 Depth (dB)", 0.0),
+    ("NR8 Q", 1.5),
+    ("Gate Enable", 0.0),
+    ("Gate Knee (dB)", 4.0),
+    ("Gate Ratio", 12.0),
+    ("Gate Attack (ms)", 1.2),
+    ("Gate Release (ms)", 90.0),
+    ("Gate Mix", 1.0),
+("Bypass", 0.0),
 ];
 
 static PRESET_MAC: &[(&str, f32)] = &[
@@ -175,7 +311,46 @@ static PRESET_MAC: &[(&str, f32)] = &[
     ("Band 6 Freq (Hz)", 16000.0),
     ("HF Bias", 0.35),
     ("Stereo Link", 0.85),
-    ("Bypass", 0.0),
+    ("Stability", 0.45),
+        ("NR1 On", 1.0),
+    ("NR1 Freq (Hz)", 250.0),
+    ("NR1 Depth (dB)", 0.8),
+    ("NR1 Q", 1.5),
+    ("NR2 On", 1.0),
+    ("NR2 Freq (Hz)", 574.0),
+    ("NR2 Depth (dB)", 0.8),
+    ("NR2 Q", 1.5),
+    ("NR3 On", 1.0),
+    ("NR3 Freq (Hz)", 1300.0),
+    ("NR3 Depth (dB)", 6.1),
+    ("NR3 Q", 1.5),
+    ("NR4 On", 1.0),
+    ("NR4 Freq (Hz)", 3000.0),
+    ("NR4 Depth (dB)", 11.4),
+    ("NR4 Q", 1.5),
+    ("NR5 On", 1.0),
+    ("NR5 Freq (Hz)", 7000.0),
+    ("NR5 Depth (dB)", 5.5),
+    ("NR5 Q", 1.5),
+    ("NR6 On", 1.0),
+    ("NR6 Freq (Hz)", 16000.0),
+    ("NR6 Depth (dB)", 5.5),
+    ("NR6 Q", 1.5),
+    ("NR7 On", 0.0),
+    ("NR7 Freq (Hz)", 1000.0),
+    ("NR7 Depth (dB)", 0.0),
+    ("NR7 Q", 1.5),
+    ("NR8 On", 0.0),
+    ("NR8 Freq (Hz)", 1000.0),
+    ("NR8 Depth (dB)", 0.0),
+    ("NR8 Q", 1.5),
+    ("Gate Enable", 0.0),
+    ("Gate Knee (dB)", 4.0),
+    ("Gate Ratio", 12.0),
+    ("Gate Attack (ms)", 1.2),
+    ("Gate Release (ms)", 90.0),
+    ("Gate Mix", 1.0),
+("Bypass", 0.0),
 ];
 
 static PRESET_GENTLE: &[(&str, f32)] = &[
@@ -194,7 +369,46 @@ static PRESET_GENTLE: &[(&str, f32)] = &[
     ("Band 6 Freq (Hz)", 12000.0),
     ("HF Bias", 0.35),
     ("Stereo Link", 0.85),
-    ("Bypass", 0.0),
+    ("Stability", 0.45),
+        ("NR1 On", 1.0),
+    ("NR1 Freq (Hz)", 60.0),
+    ("NR1 Depth (dB)", 8.0),
+    ("NR1 Q", 1.5),
+    ("NR2 On", 1.0),
+    ("NR2 Freq (Hz)", 180.0),
+    ("NR2 Depth (dB)", 9.0),
+    ("NR2 Q", 1.5),
+    ("NR3 On", 1.0),
+    ("NR3 Freq (Hz)", 500.0),
+    ("NR3 Depth (dB)", 7.0),
+    ("NR3 Q", 1.5),
+    ("NR4 On", 1.0),
+    ("NR4 Freq (Hz)", 1500.0),
+    ("NR4 Depth (dB)", 8.0),
+    ("NR4 Q", 1.5),
+    ("NR5 On", 1.0),
+    ("NR5 Freq (Hz)", 4500.0),
+    ("NR5 Depth (dB)", 12.0),
+    ("NR5 Q", 1.8),
+    ("NR6 On", 1.0),
+    ("NR6 Freq (Hz)", 12000.0),
+    ("NR6 Depth (dB)", 14.0),
+    ("NR6 Q", 2.0),
+    ("NR7 On", 0.0),
+    ("NR7 Freq (Hz)", 1000.0),
+    ("NR7 Depth (dB)", 0.0),
+    ("NR7 Q", 1.5),
+    ("NR8 On", 0.0),
+    ("NR8 Freq (Hz)", 1000.0),
+    ("NR8 Depth (dB)", 0.0),
+    ("NR8 Q", 1.5),
+    ("Gate Enable", 0.0),
+    ("Gate Knee (dB)", 4.0),
+    ("Gate Ratio", 12.0),
+    ("Gate Attack (ms)", 1.2),
+    ("Gate Release (ms)", 90.0),
+    ("Gate Mix", 1.0),
+("Bypass", 0.0),
 ];
 
 pub fn ui_spec_for(label: &str) -> Option<&'static PluginUiSpec> {
@@ -207,6 +421,158 @@ pub fn ui_spec_for_ref(plug: &PluginRef) -> Option<&'static PluginUiSpec> {
         return None;
     }
     ui_spec_for(&plug.id.id)
+}
+
+fn infer_param_kind(name: &str, min: f32, max: f32, toggled: bool) -> ParamKind {
+    if toggled || (min <= 0.0 && max <= 1.0 && name.to_ascii_lowercase().contains("bypass")) {
+        return ParamKind::Toggle;
+    }
+    if toggled || (max - min <= 1.0 && min >= 0.0 && max <= 1.0 && name.len() <= 12) {
+        let l = name.to_ascii_lowercase();
+        if l.contains("enable") || l.contains("bypass") || l.ends_with(" on") {
+            return ParamKind::Toggle;
+        }
+    }
+    ParamKind::Slider
+}
+
+fn owned_defs_from_param_pairs(pairs: &[(String, f32)]) -> Vec<OwnedParamDef> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k != "Mix")
+        .map(|(k, v)| OwnedParamDef {
+            key: k.clone(),
+            label: k.clone(),
+            kind: infer_param_kind(k, 0.0, 1.0, false),
+            min: 0.0,
+            max: 1.0,
+            default: *v,
+            modes: None,
+            logarithmic: false,
+        })
+        .collect()
+}
+
+fn probe_owned_defs(plug: &PluginRef) -> Vec<OwnedParamDef> {
+    match plug.id.format {
+        PluginFormat::Clap => {
+            if let Ok(infos) =
+                buschain_engine::probe_clap_params(&plug.id.id, &plug.id.id)
+            {
+                return infos
+                    .into_iter()
+                    .map(|p| OwnedParamDef {
+                        key: p.name.clone(),
+                        label: p.name.clone(),
+                        kind: infer_param_kind(&p.name, p.min, p.max, false),
+                        min: p.min,
+                        max: p.max,
+                        default: p.default,
+                        modes: None,
+                        logarithmic: p.max > p.min * 10.0 && p.min > 0.0,
+                    })
+                    .collect();
+            }
+        }
+        PluginFormat::Lv2 => {
+            let (uri, bundle) = parse_lv2_id(&plug.id.id);
+            if let Ok(infos) =
+                buschain_engine::probe_lv2_params(&uri, bundle.as_deref())
+            {
+                return infos
+                    .into_iter()
+                    .map(|p| OwnedParamDef {
+                        key: p.name.clone(),
+                        label: p.name.clone(),
+                        kind: infer_param_kind(&p.name, p.min, p.max, p.toggled),
+                        min: p.min,
+                        max: p.max,
+                        default: p.default,
+                        modes: None,
+                        logarithmic: false,
+                    })
+                    .collect();
+            }
+        }
+        PluginFormat::Vst3 => {}
+        PluginFormat::Ladspa => {}
+    }
+    Vec::new()
+}
+
+fn parse_lv2_id(id: &str) -> (String, Option<String>) {
+    if let Some(path) = id.strip_prefix("bundle:") {
+        return (String::new(), Some(path.to_string()));
+    }
+    (id.to_string(), None)
+}
+
+/// Build a dynamic egui param map when the static LADSPA catalog has no entry.
+pub fn dynamic_ui_for_ref(plug: &PluginRef) -> Option<DynamicPluginUiSpec> {
+    if ui_spec_for_ref(plug).is_some() {
+        return None;
+    }
+    let defs = if plug.params.is_empty() {
+        probe_owned_defs(plug)
+    } else {
+        let probed = probe_owned_defs(plug);
+        if probed.is_empty() {
+            owned_defs_from_param_pairs(&plug.params)
+        } else {
+            probed
+        }
+    };
+    if defs.is_empty() {
+        return None;
+    }
+    let title = plug
+        .id
+        .id
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&plug.id.id)
+        .trim_end_matches(".clap")
+        .to_string();
+    Some(DynamicPluginUiSpec { title, params: defs })
+}
+
+fn populate_probed_params(plug: &mut PluginRef) {
+    if !plug.params.is_empty() {
+        return;
+    }
+    let defs = probe_owned_defs(plug);
+    if !defs.is_empty() {
+        plug.params = defs
+            .iter()
+            .map(|d| (d.key.clone(), d.default))
+            .collect();
+        return;
+    }
+    match plug.id.format {
+        PluginFormat::Vst3 => {
+            let path = plug
+                .id
+                .id
+                .clone();
+            let probed = buschain_engine::probe_vst3_params(&path, &plug.id.id);
+            if probed.is_empty() {
+                plug.params.push(("Gain".into(), 1.0));
+            } else {
+                plug.params = probed
+                    .into_iter()
+                    .map(|(name, _min, _max, def)| (name, def))
+                    .collect();
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn plugin_title_for_ref(plug: &PluginRef) -> String {
+    ui_spec_for_ref(plug)
+        .map(|s| s.title.to_string())
+        .or_else(|| dynamic_ui_for_ref(plug).map(|d| d.title))
+        .unwrap_or_else(|| plug.id.id.clone())
 }
 
 /// Pulse module-ladspa-sink plugin= file stem for a label.
@@ -228,33 +594,64 @@ pub fn default_params(label: &str) -> Vec<(String, f32)> {
 }
 
 pub fn plugin_ref_with_defaults(id: PluginId) -> PluginRef {
-    let label = normalize_label(&id.id);
-    let id = PluginId {
-        format: id.format,
-        id: label.to_string(),
+    let (resolved, params, mix) = match id.format {
+        PluginFormat::Ladspa => {
+            let label = normalize_label(&id.id);
+            let params = default_params(label);
+            let mix = params
+                .iter()
+                .find(|(k, _)| k == "Mix")
+                .map(|(_, v)| *v)
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            (
+                PluginId {
+                    format: id.format,
+                    id: label.to_string(),
+                },
+                params,
+                mix,
+            )
+        }
+        _ => {
+            let mix = 1.0_f32;
+            (id, Vec::new(), mix)
+        }
     };
-    let params = default_params(label);
-    let mix = params
-        .iter()
-        .find(|(k, _)| k == "Mix")
-        .map(|(_, v)| *v)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
-    PluginRef {
-        id,
+    let mut plug = PluginRef {
+        id: resolved,
         bypass: false,
         mix,
         slot_id: uuid::Uuid::new_v4(),
         params,
-    }
+        state_blob: None,
+        sidechain_from: None,
+    };
+    populate_probed_params(&mut plug);
+    plug
 }
 
 impl PluginRef {
     /// Ensure every catalog param exists (keeps user values); drop obsolete keys.
     pub fn ensure_params(&mut self) {
-        let Some(spec) = ui_spec_for_ref(self) else {
+        if let Some(spec) = ui_spec_for_ref(self) {
+            self.ensure_static_params(spec);
             return;
-        };
+        }
+        if let Some(dyn_spec) = dynamic_ui_for_ref(self) {
+            for def in &dyn_spec.params {
+                if !self.params.iter().any(|(k, _)| k == &def.key) {
+                    self.params.push((def.key.clone(), def.default));
+                }
+            }
+            self.params
+                .retain(|(k, _)| dyn_spec.params.iter().any(|d| &d.key == k));
+            return;
+        }
+        populate_probed_params(self);
+    }
+
+    fn ensure_static_params(&mut self, spec: &'static PluginUiSpec) {
         // Migrate legacy softclip Drive → Threshold/Post once.
         // Do NOT treat Mix as legacy — Mix is still a live wet/dry port.
         if spec.label == "buschain_softclip" {
@@ -714,7 +1111,7 @@ static DENOISER: &[ParamDef] = &[
         label: "R1",
         kind: ParamKind::Slider,
         min: 0.0,
-        max: 24.0,
+        max: 48.0,
         default: 12.0,
         modes: None,
         logarithmic: false,
@@ -724,7 +1121,7 @@ static DENOISER: &[ParamDef] = &[
         label: "R2",
         kind: ParamKind::Slider,
         min: 0.0,
-        max: 24.0,
+        max: 48.0,
         default: 11.5,
         modes: None,
         logarithmic: false,
@@ -734,7 +1131,7 @@ static DENOISER: &[ParamDef] = &[
         label: "R3",
         kind: ParamKind::Slider,
         min: 0.0,
-        max: 24.0,
+        max: 48.0,
         default: 8.0,
         modes: None,
         logarithmic: false,
@@ -744,7 +1141,7 @@ static DENOISER: &[ParamDef] = &[
         label: "R4",
         kind: ParamKind::Slider,
         min: 0.0,
-        max: 24.0,
+        max: 48.0,
         default: 14.0,
         modes: None,
         logarithmic: false,
@@ -754,7 +1151,7 @@ static DENOISER: &[ParamDef] = &[
         label: "R5",
         kind: ParamKind::Slider,
         min: 0.0,
-        max: 24.0,
+        max: 48.0,
         default: 12.5115,
         modes: None,
         logarithmic: false,
@@ -764,7 +1161,7 @@ static DENOISER: &[ParamDef] = &[
         label: "R6",
         kind: ParamKind::Slider,
         min: 0.0,
-        max: 24.0,
+        max: 48.0,
         default: 8.8918,
         modes: None,
         logarithmic: false,
@@ -846,6 +1243,397 @@ static DENOISER: &[ParamDef] = &[
         min: 0.0,
         max: 1.0,
         default: 0.90,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Stability",
+        label: "Stability",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 1.0,
+        default: 0.45,
+        modes: None,
+        logarithmic: false,
+    },
+    // Parametric NR nodes (UI) — mapped onto the 6 filterbank bands each frame.
+    ParamDef {
+        key: "NR1 On",
+        label: "NR1",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR1 Freq (Hz)",
+        label: "NR1 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 120.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR1 Depth (dB)",
+        label: "NR1 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 12.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR1 Q",
+        label: "NR1 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 1.4,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR2 On",
+        label: "NR2",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR2 Freq (Hz)",
+        label: "NR2 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 240.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR2 Depth (dB)",
+        label: "NR2 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 11.5,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR2 Q",
+        label: "NR2 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 1.4,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR3 On",
+        label: "NR3",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR3 Freq (Hz)",
+        label: "NR3 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 600.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR3 Depth (dB)",
+        label: "NR3 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 8.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR3 Q",
+        label: "NR3 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 1.6,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR4 On",
+        label: "NR4",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR4 Freq (Hz)",
+        label: "NR4 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 1580.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR4 Depth (dB)",
+        label: "NR4 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 14.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR4 Q",
+        label: "NR4 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 1.5,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR5 On",
+        label: "NR5",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR5 Freq (Hz)",
+        label: "NR5 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 3000.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR5 Depth (dB)",
+        label: "NR5 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 12.5115,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR5 Q",
+        label: "NR5 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 1.8,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR6 On",
+        label: "NR6",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR6 Freq (Hz)",
+        label: "NR6 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 12000.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR6 Depth (dB)",
+        label: "NR6 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 8.8918,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR6 Q",
+        label: "NR6 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 1.6,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR7 On",
+        label: "NR7",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR7 Freq (Hz)",
+        label: "NR7 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 6000.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR7 Depth (dB)",
+        label: "NR7 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR7 Q",
+        label: "NR7 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 2.5,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR8 On",
+        label: "NR8",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR8 Freq (Hz)",
+        label: "NR8 Hz",
+        kind: ParamKind::Slider,
+        min: 20.0,
+        max: 20000.0,
+        default: 8000.0,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
+        key: "NR8 Depth (dB)",
+        label: "NR8 dB",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 48.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "NR8 Q",
+        label: "NR8 Q",
+        kind: ParamKind::Slider,
+        min: 0.3,
+        max: 12.0,
+        default: 3.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Gate Enable",
+        label: "Gate",
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Gate Knee (dB)",
+        label: "Knee",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 24.0,
+        default: 4.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Gate Ratio",
+        label: "Ratio",
+        kind: ParamKind::Slider,
+        min: 1.0,
+        max: 100.0,
+        default: 12.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Gate Attack (ms)",
+        label: "Attack",
+        kind: ParamKind::Slider,
+        min: 0.1,
+        max: 50.0,
+        default: 1.2,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Gate Release (ms)",
+        label: "Release",
+        kind: ParamKind::Slider,
+        min: 5.0,
+        max: 1000.0,
+        default: 90.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Gate Mix",
+        label: "Gate Mix",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
         modes: None,
         logarithmic: false,
     },
@@ -1030,6 +1818,16 @@ static GATE: &[ParamDef] = &[
         min: 0.0,
         max: 140.0,
         default: 100.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Mix",
+        label: "Mix",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 1.0,
+        default: 1.0,
         modes: None,
         logarithmic: false,
     },

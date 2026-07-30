@@ -5,16 +5,36 @@ use uuid::Uuid;
 
 use super::NodeName;
 
+/// Plugin format for rack dispatch (LADSPA / LV2 / CLAP / VST3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InsertFormat {
+    #[default]
+    Ladspa,
+    Lv2,
+    Clap,
+    Vst3,
+}
+
 /// One insert in a track rack (black box). Engine wires audio through it; never opens UIs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsertSlot {
     pub slot_id: Uuid,
-    /// LADSPA label (v1).
+    /// Plugin id / LADSPA label / CLAP id.
     pub plugin_key: String,
-    /// Absolute `.so` path when known (preferred); else stem.
+    /// Absolute `.so` / `.clap` / module path when known (preferred); else stem.
     pub plugin_so: String,
-    /// Effective control map for Props / conf (bypass/mix already folded in by app).
+    /// Effective control map (bypass/mix already folded in by app).
     pub controls: Vec<(String, f32)>,
+    /// Format for host dispatch. Default LADSPA for session backward compat.
+    #[serde(default)]
+    pub format: InsertFormat,
+    /// Opaque plugin state chunk (CLAP/VST3) when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_blob: Option<Vec<u8>>,
+    /// Sidechain source bus name (monitor tap), when the plugin uses aux input (P7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain_from: Option<String>,
 }
 
 /// Desired insert chain for one bus.
@@ -28,8 +48,7 @@ pub struct ChainSpec {
 }
 
 impl ChainSpec {
-    /// Canonical generation names only. Live routing after A/B must use
-    /// `live_fx_name` / `live_post_name` (see `pipeline::insert::live_wire_plan`).
+    /// Resolved physical nodes for the sealed wet path (canonical names only).
     pub fn wire_plan(&self) -> WirePlan {
         WirePlan {
             bus: self.bus.clone(),
@@ -44,14 +63,25 @@ impl ChainSpec {
     }
 }
 
-/// Topology fingerprint for Props gating (slot order + plugin keys; not bypass/knobs).
+/// Topology fingerprint for Props gating (slot order + plugin keys + IO layout; not bypass/knobs).
 pub fn inserts_signature(inserts: &[InsertSlot]) -> String {
     let body = inserts
         .iter()
-        .map(|p| format!("{}:{}", p.slot_id.simple(), normalize_ladspa_label(&p.plugin_key)))
+        .map(|p| {
+            let sc = p
+                .sidechain_from
+                .as_deref()
+                .unwrap_or("-");
+            format!(
+                "{}:{}:sc={}",
+                p.slot_id.simple(),
+                normalize_ladspa_label(&p.plugin_key),
+                sc
+            )
+        })
         .collect::<Vec<_>>()
         .join("|");
-    format!("mono2|{body}")
+    format!("stereo2|{body}")
 }
 
 /// Resolved physical nodes for the sealed wet path.

@@ -31,6 +31,16 @@ fn main() -> eframe::Result<()> {
     // Plain `cargo run` = full local workflow (plugins, ctl for waybar, clean socket).
     dev_bootstrap::run();
 
+    // Native Wayland host by default. VST3 editors float on XWayland separately
+    // (no in-rect X11 embed). Override with WINIT_UNIX_BACKEND=x11 if needed.
+    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
+        std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
+    }
+    eprintln!(
+        "buschain-control: window backend → {} (WINIT_UNIX_BACKEND)",
+        std::env::var("WINIT_UNIX_BACKEND").unwrap_or_else(|_| "?".into())
+    );
+
     let start_hidden = args.iter().any(|a| a == "--hidden");
 
     // Do not create a GL/window until the user asks.

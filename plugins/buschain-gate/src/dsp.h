@@ -17,6 +17,7 @@ typedef struct {
   float hold_ms;
   float release_ms;
   float range_db;       /* attenuation when closed (e.g. 100 ≈ mute) */
+  float mix;            /* 0 = dry .. 1 = full wet gate */
   int   bypass;
 } BuschainGateParams;
 

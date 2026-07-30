@@ -103,16 +103,17 @@ impl Theme for SpectrumTheme {
         Color32::from_rgb(0xe8, 0xea, 0xed)
     }
     fn bg_app(&self) -> Color32 {
-        Color32::from_rgb(0x12, 0x13, 0x15)
+        Color32::from_rgb(0x18, 0x1a, 0x1d)
     }
     fn bg_panel(&self) -> Color32 {
-        Color32::from_rgb(0x1a, 0x1c, 0x1f)
-    }
-    fn bg_elevated(&self) -> Color32 {
         Color32::from_rgb(0x22, 0x24, 0x28)
     }
+    fn bg_elevated(&self) -> Color32 {
+        Color32::from_rgb(0x2a, 0x2d, 0x32)
+    }
     fn bg_well(&self) -> Color32 {
-        Color32::from_rgb(0x0c, 0x0d, 0x0f)
+        // Plots / insert wells — lifted off pure black for readability
+        Color32::from_rgb(0x16, 0x18, 0x1c)
     }
     fn border(&self) -> Color32 {
         Color32::from_rgb(0x3a, 0x3d, 0x42)

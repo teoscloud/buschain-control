@@ -13,6 +13,18 @@ path = "src/bin/buschain-daemon.rs"
 name = "buschain-ctl"
 path = "src/bin/buschain-ctl.rs"
 
+[[bin]]
+name = "buschain-plugin-ui"
+path = "src/bin/buschain-plugin-ui.rs"
+
+[[bin]]
+name = "buschain-plugin-dsp"
+path = "src/bin/buschain-plugin-dsp.rs"
+
+[[bin]]
+name = "buschain-plugin-surface"
+path = "src/bin/buschain-plugin-surface.rs"
+
 [dependencies]
 buschain-engine = { path = "../engine" }
 buschain-control = { path = "../app" }
@@ -21,3 +33,7 @@ serde_json = "1"
 anyhow = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
+vst3-host = { version = "0.9", default-features = false }
+memmap2 = "0.9"
+libc = "0.2"
+xcb = "1.7"

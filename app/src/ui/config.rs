@@ -15,8 +15,12 @@ const SETTINGS_CATS: &[&str] = &[
 /// Top-level Settings tab (replaces the old single Configuration scroll).
 pub fn draw_config(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
-    design::section_label(ui, &theme, "SETTINGS");
-    ui.add_space(6.0);
+    design::page_header(
+        ui,
+        &theme,
+        "Settings",
+        "Appearance, audio clock, plugin paths, session prefs, and advanced toggles.",
+    );
 
     // Take the full CentralPanel height. A plain horizontal()+ScrollArea only
     // sized itself to the short category rail and left a huge empty gap.
@@ -230,9 +234,11 @@ fn draw_plugins(ui: &mut egui::Ui, state: &mut AppState) {
             .color(theme.text()),
     );
     ui.label(
-        RichText::new("Scan paths and discovered inserts. Mixer add-menu is LADSPA-only (v1).")
-            .size(11.0)
-            .color(theme.text_muted()),
+        RichText::new(
+            "Scan paths and discovered inserts. Mixer Add lists LADSPA, CLAP, LV2, and VST3 from this scan.",
+        )
+        .size(11.0)
+        .color(theme.text_muted()),
     );
     ui.add_space(8.0);
 
@@ -254,26 +260,33 @@ fn draw_plugins(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.add_space(6.0);
         let mut vst3 = state.session.vst3_enabled;
-        #[cfg(feature = "vst3-carla")]
+        if ui
+            .checkbox(&mut vst3, "Scan VST3 plugins (Carla discovery)")
+            .changed()
         {
-            if ui
-                .checkbox(&mut vst3, "Enable optional VST3 backend (Carla, VST3-only)")
-                .changed()
-            {
-                state.session.vst3_enabled = vst3;
-                state.rebuild_plugins();
-            }
+            state.session.vst3_enabled = vst3;
+            state.rebuild_plugins();
         }
-        #[cfg(not(feature = "vst3-carla"))]
+        let mut sandbox = state.session.sandbox_untrusted;
+        if ui
+            .checkbox(
+                &mut sandbox,
+                "Sandbox untrusted plugins (per-track SHM — crash isolates FX)",
+            )
+            .changed()
         {
-            let _ = vst3;
-            ui.label(
-                RichText::new(
-                    "VST3 backend not compiled (build with --features vst3-carla).",
-                )
-                .size(11.0)
-                .color(theme.text_muted()),
-            );
+            state.session.sandbox_untrusted = sandbox;
+            if sandbox {
+                std::env::set_var("BUSCHAIN_SANDBOX_ALL", "1");
+            } else {
+                std::env::remove_var("BUSCHAIN_SANDBOX_ALL");
+            }
+            state.dirty = true;
+            state.status = if sandbox {
+                "Plugin sandbox on — next FX rewire uses buschain-plugin-dsp".into()
+            } else {
+                "Plugin sandbox off — trusted in-process".into()
+            };
         }
 
         if design::button(ui, &theme, "Rescan plugins", true).clicked() {
@@ -313,19 +326,11 @@ fn draw_plugins(ui: &mut egui::Ui, state: &mut AppState) {
 
 pub fn draw_session(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
-    ui.label(
-        RichText::new("Session")
-            .size(15.0)
-            .strong()
-            .color(theme.text()),
-    );
-    ui.label(
-        RichText::new(
-            "Named mixer layouts under ~/.config/buschain-control/sessions/. \
-             Missing hardware is rebound softly on load.",
-        )
-        .size(11.0)
-        .color(theme.text_muted()),
+    design::page_header(
+        ui,
+        &theme,
+        "Sessions",
+        "Save and load named mixer layouts (~/.config/buschain-control/sessions/). Missing hardware rebinds softly on load.",
     );
     ui.add_space(8.0);
 

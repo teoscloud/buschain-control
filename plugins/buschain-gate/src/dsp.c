@@ -50,6 +50,7 @@ void buschain_gate_default_params(BuschainGateParams *p) {
   p->hold_ms = 80.0f;
   p->release_ms = 120.0f;
   p->range_db = 100.0f;
+  p->mix = 1.0f;
   p->bypass = 0;
 }
 
@@ -139,7 +140,10 @@ void buschain_gate_process(BuschainGateState *s,
     float coeff = want_open ? s->att_coeff : s->rel_coeff;
     s->gain = coeff * s->gain + (1.0f - coeff) * target;
 
-    out_l[i] = xl * s->gain;
-    if (stereo) out_r[i] = xr * s->gain;
+    float mix = clampf(s->p.mix, 0.0f, 1.0f);
+    float wet_l = xl * s->gain;
+    float wet_r = xr * s->gain;
+    out_l[i] = xl * (1.0f - mix) + wet_l * mix;
+    if (stereo) out_r[i] = xr * (1.0f - mix) + wet_r * mix;
   }
 }

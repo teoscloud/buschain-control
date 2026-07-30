@@ -101,6 +101,15 @@ Split from BusChain Denoiser for independent use in any LADSPA/LV2 host.
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
     lv2:index 11 ;
+    lv2:symbol "mix" ;
+    lv2:name "Mix" ;
+    lv2:default 1.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0 ;
+    rdfs:comment "Dry/wet. 0 = dry input, 1 = full gate."
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 12 ;
     lv2:symbol "bypass" ;
     lv2:name "Bypass" ;
     lv2:default 0.0 ;
@@ -109,7 +118,7 @@ Split from BusChain Denoiser for independent use in any LADSPA/LV2 host.
     lv2:portProperty lv2:toggled
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 12 ;
+    lv2:index 13 ;
     lv2:symbol "meter_gain" ;
     lv2:name "Gate Gain" ;
     lv2:minimum 0.0 ;

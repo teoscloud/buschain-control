@@ -1,6 +1,7 @@
 mod app_icons;
 mod config;
 mod devices;
+mod midi;
 mod mixer;
 mod playback;
 mod plugin_windows;
@@ -8,6 +9,7 @@ mod recording;
 
 pub use config::{draw_config, draw_session};
 pub use devices::{draw_input_devices, draw_output_devices};
+pub use midi::draw_midi;
 pub use playback::draw_playback;
 pub use recording::draw_recording;
 
@@ -43,10 +45,10 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
                     if design::button(ui, &theme, "Sessions", false).clicked() {
-                        state.tab = 5;
+                        state.tab = 6;
                     }
                     if design::button(ui, &theme, "Save as…", false).clicked() {
-                        state.tab = 5;
+                        state.tab = 6;
                         state.session_save_as_open = true;
                         state.session_save_as_name = state.session.name.clone();
                     }
@@ -55,7 +57,7 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
                     }
                     if design::button(ui, &theme, "New", false).clicked() {
                         state.new_session();
-                        state.tab = 5;
+                        state.tab = 6;
                         state.session_save_as_open = true;
                         state.session_save_as_name = "New session".into();
                     }
@@ -70,6 +72,7 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
                     "Recording",
                     "Output",
                     "Input",
+                    "MIDI",
                     "Sessions",
                     "Settings",
                 ];
@@ -114,7 +117,9 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
 
     handle_plugin_shortcuts(ctx, state);
 
+    // Bottom panels: status is outermost; analyzer sits above it on Mixer.
     if state.tab == 0 {
+        mixer::draw_mixer_analyzer_panel(ctx, state);
         mixer::draw_channel_rack_panel(ctx, state);
     }
 
@@ -130,7 +135,8 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
             2 => draw_recording(ui, state),
             3 => draw_output_devices(ui, state),
             4 => draw_input_devices(ui, state),
-            5 => draw_session(ui, state),
+            5 => draw_midi(ui, state),
+            6 => draw_session(ui, state),
             _ => draw_config(ui, state),
         });
 

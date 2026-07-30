@@ -24,6 +24,11 @@ pub struct PluginWindow {
     pub fullscreen: bool,
     /// Bumps egui window id so each open uses the full preferred size (no tiny restore).
     pub open_gen: u64,
+    /// When false, host chrome stays slim and prefers the out-of-process native GUI
+    /// (VST3). Converted egui params are opt-in via this flag.
+    pub show_converted_ui: bool,
+    /// Surface helper has received `E float` for this window.
+    pub surface_editor_attached: bool,
 }
 
 pub struct AppState {
@@ -41,8 +46,12 @@ pub struct AppState {
     pub selected_plugin_slot: Option<Uuid>,
     pub status: String,
     pub dirty: bool,
-    /// Mixer channel-rack overlay width (foreground layer).
+    /// Mixer channel-rack SidePanel width.
     pub rack_width: f32,
+    /// Collapsible bottom analyzer under mixer strips.
+    pub mixer_analyzer_open: bool,
+    /// Open analyzer panel height (drag-resizable).
+    pub mixer_analyzer_height: f32,
     /// Open plugin editors (in-app `egui::Window`s). Ordered oldest → newest;
     /// Esc closes the last entry (latest selected / focused).
     pub plugin_windows: Vec<PluginWindow>,
@@ -94,6 +103,17 @@ pub struct AppState {
     pub request_hide: bool,
     /// Cold ApplySession / ArmSession in flight — show loading chrome until done.
     pub graph_loading: bool,
+    /// Live MIDI device list + activity meters.
+    pub midi_snapshot: buschain_engine::MidiSnapshot,
+    /// Selected device for route matrix / learn filter.
+    pub midi_selected_device: Option<String>,
+    /// Learn mode status line.
+    pub midi_learn: Option<MidiLearnState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MidiLearnState {
+    pub hint: String,
 }
 
 impl AppState {
@@ -134,6 +154,8 @@ impl AppState {
             status: "BusChain Control ready — buses persist across restart".into(),
             dirty: false,
             rack_width: 360.0,
+            mixer_analyzer_open: true,
+            mixer_analyzer_height: 132.0,
             plugin_windows: Vec::new(),
             plugin_win_gen: 0,
             app_icon_cache: HashMap::new(),
@@ -163,6 +185,9 @@ impl AppState {
             request_show: false,
             request_hide: false,
             graph_loading: !via_daemon,
+            midi_snapshot: buschain_engine::MidiSnapshot::default(),
+            midi_selected_device: None,
+            midi_learn: None,
         };
         state.refresh_performance_from_device();
         if via_daemon {
@@ -170,6 +195,8 @@ impl AppState {
         } else {
             state.worker.send(Command::ApplySession(state.session.clone()));
             state.status = "Loading audio graph — FX racks starting (this can take a few seconds)…".into();
+            state.worker.send(Command::ApplyMidiConfig(state.session.clone()));
+            state.worker.send(Command::RefreshMidi);
         }
         state
     }
@@ -516,8 +543,20 @@ impl AppState {
         );
     }
 
+    /// Formats that currently get a real out-of-process GUI via `buschain-plugin-ui`.
+    pub fn insert_supports_native_editor(&self, track_id: Uuid, slot_id: Uuid) -> bool {
+        use crate::audio::plugin::PluginFormat;
+        self.session
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .and_then(|t| t.inserts.iter().find(|p| p.slot_id == slot_id))
+            .is_some_and(|p| matches!(p.id.format, PluginFormat::Vst3))
+    }
+
     /// Open a floating plugin window, or focus it if already open.
     /// Multiple editors may be open; this one becomes newest (Esc closes it first).
+    /// VST3 defaults to native editor + slim host chrome (converted egui params opt-in).
     pub fn open_plugin_window(&mut self, track_id: Uuid, slot_id: Uuid) {
         self.select_plugin(track_id, slot_id);
         if let Some(idx) = self
@@ -528,6 +567,7 @@ impl AppState {
             self.focus_plugin_window_at(idx);
             return;
         }
+        let prefer_native = self.insert_supports_native_editor(track_id, slot_id);
         let next_gen = self.plugin_win_gen.wrapping_add(1);
         self.plugin_win_gen = next_gen;
         self.plugin_windows.push(PluginWindow {
@@ -535,7 +575,209 @@ impl AppState {
             slot_id,
             fullscreen: false,
             open_gen: next_gen,
+            show_converted_ui: !prefer_native,
+            surface_editor_attached: false,
         });
+        if prefer_native {
+            self.open_native_editor(track_id, slot_id);
+        }
+    }
+
+    /// Open native editor. VST3 promotes to `buschain-plugin-surface` (DSP+GUI, live meters).
+    pub fn open_native_editor(&mut self, track_id: Uuid, slot_id: Uuid) {
+        self.harvest_track_plugin_state(track_id);
+
+        let Some(track) = self.session.tracks.iter().find(|t| t.id == track_id) else {
+            return;
+        };
+        let Some(plug) = track.inserts.iter().find(|p| p.slot_id == slot_id) else {
+            return;
+        };
+        use crate::audio::plugin::PluginFormat;
+        let format = match plug.id.format {
+            PluginFormat::Clap => "clap",
+            PluginFormat::Vst3 => "vst3",
+            PluginFormat::Lv2 => "lv2",
+            PluginFormat::Ladspa => {
+                self.status = "LADSPA has no native editor — use egui params".into();
+                return;
+            }
+        };
+        let bus = track.expected_sink_name();
+        let path = plug.id.id.clone();
+        let state_blob = plug.state_blob.clone();
+        let plugin_key = plug.id.id.clone();
+
+        // VST3 surface path: same-instance DSP+GUI (meters work).
+        if format == "vst3" && buschain_engine::surface_enabled() {
+            // Already promoted and helper is up — reopen float only (never rewire/truncate SHM).
+            if buschain_engine::slot_wants_surface(slot_id)
+                && buschain_engine::surface_ctrl_ready(slot_id)
+            {
+                if let Some(w) = self
+                    .plugin_windows
+                    .iter_mut()
+                    .find(|w| w.slot_id == slot_id)
+                {
+                    w.surface_editor_attached = false;
+                }
+                if buschain_engine::surface_send_ctrl(slot_id, "E float") {
+                    if let Some(w) = self
+                        .plugin_windows
+                        .iter_mut()
+                        .find(|w| w.slot_id == slot_id)
+                    {
+                        w.surface_editor_attached = true;
+                    }
+                    crate::hyprland_float::request_float_vst3_surfaces();
+                    self.status = "Native surface — floating editor".into();
+                } else {
+                    self.status = "Native surface — helper busy, retry…".into();
+                }
+                return;
+            }
+            buschain_engine::ensure_editor_ipc(&bus, slot_id);
+            buschain_engine::mark_surface_slot(slot_id);
+            if let Some(w) = self
+                .plugin_windows
+                .iter_mut()
+                .find(|w| w.slot_id == slot_id)
+            {
+                w.surface_editor_attached = false;
+            }
+            self.schedule_fx_rewire(track_id);
+            // Embed/float attach happens from plugin_windows once the surface ctrl is up.
+            self.status = "Native surface — promoting VST3 (DSP+GUI)…".into();
+            return;
+        }
+
+        buschain_engine::request_open_editor(&buschain_engine::OpenEditorRequest {
+            bus,
+            slot_id,
+            plugin_key,
+            plugin_path: path,
+            format: format.into(),
+            socket_path: String::new(),
+            state_blob,
+            parent_xid: None,
+            embed: false,
+        });
+        self.status = format!("Native editor — {format}");
+    }
+
+    /// Open the floating native editor once the surface helper ctrl socket is ready.
+    pub fn try_attach_surface_editor(&mut self, slot_id: Uuid) {
+        if !buschain_engine::slot_wants_surface(slot_id) {
+            return;
+        }
+        if self
+            .plugin_windows
+            .iter()
+            .any(|w| w.slot_id == slot_id && w.surface_editor_attached)
+        {
+            return;
+        }
+        if buschain_engine::surface_send_ctrl(slot_id, "E float") {
+            if let Some(w) = self
+                .plugin_windows
+                .iter_mut()
+                .find(|w| w.slot_id == slot_id)
+            {
+                w.surface_editor_attached = true;
+            }
+            crate::hyprland_float::request_float_vst3_surfaces();
+            self.status = "Native surface — floating editor".into();
+        }
+    }
+
+    pub fn destroy_surface_editor(&mut self, slot_id: Uuid) {
+        // Detach GUI before killing the helper so plugins don't paint into a dead drawable.
+        let _ = buschain_engine::surface_send_ctrl(slot_id, "E close");
+        let _ = buschain_engine::surface_send_ctrl(slot_id, "Q");
+        buschain_engine::surface_forget_ctrl(slot_id);
+    }
+
+    /// Mirror live host processor state into the session (params + state_blob).
+    /// Call before Props flush / rewire so session defaults don't stomp editor edits.
+    pub fn harvest_track_plugin_state(&mut self, track_id: Uuid) {
+        let Some(track) = self.session.tracks.iter().find(|t| t.id == track_id) else {
+            return;
+        };
+        let bus = track.expected_sink_name();
+        let snaps = buschain_engine::harvest_host_slot_states(&bus);
+        if snaps.is_empty() {
+            return;
+        }
+        let Some(track) = self.session.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        for snap in snaps {
+            let Some(plug) = track
+                .inserts
+                .iter_mut()
+                .find(|p| p.slot_id == snap.slot_id)
+            else {
+                continue;
+            };
+            if let Some(blob) = snap.state_blob {
+                if !blob.is_empty() {
+                    plug.state_blob = Some(blob);
+                }
+            }
+            for (name, val) in snap.controls {
+                let lname = name.to_ascii_lowercase();
+                if lname == "bypass" || lname == "enable" || name == "Mix" {
+                    continue;
+                }
+                if let Some((_, v)) = plug
+                    .params
+                    .iter_mut()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                {
+                    *v = val;
+                } else {
+                    plug.params.push((name, val));
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Apply out-of-process editor param events into the session param map.
+    fn drain_editor_params_into_session(&mut self) {
+        for slot_id in buschain_engine::drain_editor_closed_events() {
+            if let Some(w) = self
+                .plugin_windows
+                .iter_mut()
+                .find(|w| w.slot_id == slot_id)
+            {
+                w.surface_editor_attached = false;
+            }
+            self.status = "Native editor closed — DSP kept running".into();
+        }
+        let events = buschain_engine::drain_editor_param_events();
+        if events.is_empty() {
+            return;
+        }
+        for ev in events {
+            for track in &mut self.session.tracks {
+                let Some(plug) = track
+                    .inserts
+                    .iter_mut()
+                    .find(|p| p.slot_id == ev.slot_id)
+                else {
+                    continue;
+                };
+                // Probe order matches editor / host control indices.
+                plug.ensure_params();
+                let idx = ev.control_index as usize;
+                if let Some((_, v)) = plug.params.get_mut(idx) {
+                    *v = ev.value;
+                    self.dirty = true;
+                }
+                break;
+            }
+        }
     }
 
     /// Mark an open editor as latest-selected (drawn on top; Esc closes it first).
@@ -561,6 +803,18 @@ impl AppState {
     pub fn close_plugin_window(&mut self, track_id: Uuid, slot_id: Uuid) {
         self.plugin_windows
             .retain(|w| !(w.track_id == track_id && w.slot_id == slot_id));
+        let was_surface = buschain_engine::slot_wants_surface(slot_id);
+        // Mirror params before killing the surface helper.
+        if was_surface {
+            self.harvest_track_plugin_state(track_id);
+        }
+        self.destroy_surface_editor(slot_id);
+        buschain_engine::clear_surface_slot(slot_id);
+        buschain_engine::close_editor(slot_id);
+        if was_surface {
+            // Demote back to in-process VST3.
+            self.schedule_fx_rewire(track_id);
+        }
     }
 
     pub fn toggle_plugin_fullscreen(&mut self, track_id: Uuid, slot_id: Uuid) {
@@ -773,6 +1027,7 @@ impl AppState {
 
     /// Insert add/remove/reorder — per-slot spawn/stop + exclusive rewire.
     pub fn schedule_fx_rewire(&mut self, track_id: Uuid) {
+        self.harvest_track_plugin_state(track_id);
         self.commit(LiveChange::FxRewire { track_id });
     }
 
@@ -782,12 +1037,16 @@ impl AppState {
     }
 
     /// Knobs / mix / insert power — graph-free Props push.
+    ///
+    /// Do **not** harvest here: egui knobs already wrote the session and harvesting
+    /// would overwrite them with stale live values before the Props push.
     pub fn schedule_fx_params(&mut self, track_id: Uuid) {
         self.commit(LiveChange::FxParams { track_id });
     }
 
     /// Discrete power toggle — flush Props immediately (no coalesce wait).
     pub fn flush_fx_params_now(&mut self, track_id: Uuid) {
+        self.harvest_track_plugin_state(track_id);
         self.commit(LiveChange::FxParams { track_id });
         self.params_deadline = Some(Instant::now());
     }
@@ -798,6 +1057,11 @@ impl AppState {
 
     fn adopt_session(&mut self, session: Session) {
         self.session = session;
+        if self.session.sandbox_untrusted {
+            std::env::set_var("BUSCHAIN_SANDBOX_ALL", "1");
+        } else {
+            std::env::remove_var("BUSCHAIN_SANDBOX_ALL");
+        }
         self.theme = SpectrumTheme::from_session_rgb(self.session.accent_rgb);
         self.rebuild_plugins();
         self.selected_track = self
@@ -1062,6 +1326,7 @@ impl AppState {
     pub fn tick(&mut self) {
         self.apply_pending_track_remove();
         self.caps_probe_budget = 1;
+        self.drain_editor_params_into_session();
 
         for ev in self.worker.poll() {
             match ev {
@@ -1115,6 +1380,21 @@ impl AppState {
                     }
                 }
                 Event::Error(e) => self.status = e,
+                Event::MidiSnapshot(s) => {
+                    self.midi_snapshot = s;
+                }
+                Event::MidiLearnBound { map } => {
+                    self.session.midi_maps.retain(|m| {
+                        !(m.device_id == map.device_id
+                            && m.channel == map.channel
+                            && m.controller == map.controller)
+                    });
+                    self.session.midi_maps.push(map);
+                    self.midi_learn = None;
+                    self.dirty = true;
+                    self.status = "MIDI learn — binding saved".into();
+                    self.worker.send(Command::ApplyMidiConfig(self.session.clone()));
+                }
                 Event::SessionApplied { session, message } => {
                     // Ensure/Prune/FX-rewire return a session clone from when the
                     // cmd was queued — full adopt wipes newer assigns/faders/knobs.

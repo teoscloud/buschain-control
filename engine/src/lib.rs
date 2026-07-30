@@ -10,6 +10,8 @@ pub mod domain;
 pub mod fx_busy;
 pub mod fx_gen;
 pub mod fx_trace;
+pub mod host;
+pub mod midi;
 pub mod pipeline;
 pub mod plan;
 pub mod runtime;
@@ -25,12 +27,24 @@ pub use clock::{
 pub use contract::{ApplyReport, ClockProps, Intent};
 pub use domain::{
     bus_suffix, fx_name_for_bus, normalize_ladspa_label, post_name_for_bus, ChainEnsureMode,
-    ChainSpec, ChainState, DeviceNode, GraphSnapshot, InsertSlot, LinkSpec, NodeName, NodeRole,
-    NodeSpec, Props, WirePlan,
+    ChainSpec, ChainState, DeviceNode, GraphSnapshot, InsertFormat, InsertSlot, LinkSpec, NodeName,
+    NodeRole, NodeSpec, Props, WirePlan,
 };
 pub use plan::{BusLevel, DesiredState};
 pub use pipeline::{
     dry_spine_instant_ready, spine_instant_ready, track_path_ready, DRY_DWELL, WET_DWELL,
+};
+pub use midi::{
+    enumerate_devices, MidiAction, MidiCcMap, MidiDeviceInfo, MidiDeviceLive, MidiIntent,
+    MidiMapTarget, MidiRoute, MidiRouteTarget, MidiSnapshot,
+};
+pub use host::{
+    clear_surface_slot, close_editor, drain_editor_closed_events, drain_editor_param_events,
+    ensure_editor_ipc, harvest_host_slot_states, mark_surface_slot, probe_clap_params,
+    probe_lv2_params, probe_vst3_params, request_open_editor, slot_wants_surface, surface_ctrl_ready,
+    surface_enabled, surface_forget_ctrl, surface_send_ctrl, AudioProcessor, ClapInstance,
+    ClapParamInfo, EditorParamEvent, Lv2ParamInfo,
+    MidiEvent, OpenEditorRequest, SlotStateSnapshot, Vst3Instance, Vst3ParamInfo,
 };
 pub use runtime::Engine;
 

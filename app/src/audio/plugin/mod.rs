@@ -4,12 +4,12 @@ mod ladspa;
 mod lv2;
 mod clap_stub;
 
-#[cfg(feature = "vst3-carla")]
 mod vst3_carla;
 
 pub use catalog::{
-    apply_denoiser_preset, denoiser_preset_names, normalize_label, plugin_file_for,
-    plugin_ref_with_defaults, ui_spec_for_ref, ParamDef, ParamKind,
+    apply_denoiser_preset, denoiser_preset_names, dynamic_ui_for_ref, normalize_label,
+    plugin_file_for, plugin_ref_with_defaults, plugin_title_for_ref, ui_spec_for_ref, OwnedParamDef,
+    DynamicPluginUiSpec, ParamDef, ParamKind, PluginUiSpec,
 };
 pub use host::*;
 #[allow(unused_imports)]
@@ -63,6 +63,12 @@ pub struct PluginRef {
     #[serde(default = "new_slot_id")]
     pub slot_id: Uuid,
     pub params: Vec<(String, f32)>,
+    /// Opaque CLAP/VST3 state chunk for session restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_blob: Option<Vec<u8>>,
+    /// Sidechain source bus/track sink name (P7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain_from: Option<String>,
 }
 
 impl PluginRef {

@@ -217,6 +217,7 @@ impl DaemonState {
                     self.soft_bind();
                 }
                 Event::Status(s) | Event::Error(s) => self.status_msg = s,
+                Event::MidiSnapshot(_) | Event::MidiLearnBound { .. } => {}
                 Event::SessionApplied { session, message } => {
                     // Worker applied session is authoritative (tracks + inserts + sink names).
                     self.session = session;

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -181,6 +182,12 @@ pub enum Command {
     },
     /// Update `device.description` on an existing bus (track rename).
     SetBusDescription { name: String, description: String },
+    /// Re-scan PipeWire MIDI nodes.
+    RefreshMidi,
+    /// Apply session MIDI maps/routes to the engine runtime.
+    ApplyMidiConfig(Session),
+    /// Engine MIDI intent (list/connect/map/learn — never aconnect).
+    Midi(buschain_engine::MidiIntent),
     Shutdown,
 }
 
@@ -189,6 +196,8 @@ pub enum Event {
     Status(String),
     SessionApplied { session: Session, message: String },
     Error(String),
+    MidiSnapshot(buschain_engine::MidiSnapshot),
+    MidiLearnBound { map: buschain_engine::MidiCcMap },
 }
 
 pub struct AudioWorker {
@@ -471,7 +480,9 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
             | Command::SetSourceVolume { .. }
             | Command::SetSinkInputMute { .. }
             | Command::SetSinkInputVolume { .. }
-            | Command::Refresh) => {
+            | Command::Refresh
+            | Command::RefreshMidi
+            | Command::Midi(_)) => {
                 fast.push(m);
             }
             // Route / FX rewires are heavy — never ahead of Props/levels (knob HOL).
@@ -607,6 +618,36 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let mut fx = FilterChainRuntime::new();
     // Last session seen by the worker — used for idle GraphSupervisor ticks.
     let mut last_session: Option<Session> = None;
+    let midi_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
+    let ms_sink = Arc::clone(&midi_session);
+    let ms_bus = Arc::clone(&midi_session);
+    let track_sink: Arc<dyn Fn(uuid::Uuid) -> Option<String> + Send + Sync> =
+        Arc::new(move |id| {
+            let guard = ms_sink.lock().ok()?;
+            let session = guard.as_ref()?;
+            if id.is_nil() {
+                return session
+                    .master_id()
+                    .and_then(|mid| session.tracks.iter().find(|t| t.id == mid))
+                    .map(|t| t.expected_sink_name());
+            }
+            session
+                .tracks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.expected_sink_name())
+        });
+    let track_bus: Arc<dyn Fn(uuid::Uuid) -> Option<String> + Send + Sync> =
+        Arc::new(move |id| {
+            let guard = ms_bus.lock().ok()?;
+            let session = guard.as_ref()?;
+            session
+                .tracks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.expected_sink_name())
+        });
+    buschain_engine::midi::ensure_runtime(track_sink, track_bus);
     let mut idle_ticks: u32 = 0;
     // When Props/fast cmds last ran — skip Idempotent FX respawn briefly after.
     let mut last_cmd_at = Instant::now();
@@ -636,6 +677,10 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
 
     loop {
         flush_props_retries(&mut props_retry);
+        if let Ok(mut g) = midi_session.lock() {
+            *g = last_session.clone();
+        }
+        poll_midi_actions(&tx, &last_session, &mut muted_buses);
         // Drain completed async FX ensures (Props kept running while they worked).
         while let Ok(done) = fx_done_rx.try_recv() {
             let total = done.queued_at.elapsed().as_millis();
@@ -1370,7 +1415,58 @@ fn process_command_batch(
                     let _ = buschain_engine::backend::push_description(&name, &description);
                     let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                 }
+                Command::RefreshMidi => {
+                    let devices = last_session
+                        .as_ref()
+                        .map(|s| s.midi_devices.as_slice())
+                        .unwrap_or(&[]);
+                    let snap = buschain_engine::midi::snapshot_global(devices);
+                    let _ = tx.send(Event::MidiSnapshot(snap));
+                }
+                Command::ApplyMidiConfig(session) => {
+                    *last_session = Some(session.clone());
+                    buschain_engine::midi::apply_intent_global(
+                        buschain_engine::MidiIntent::ApplyConfig {
+                            devices: session.midi_devices.clone(),
+                            routes: session.midi_routes.clone(),
+                            maps: session.midi_maps.clone(),
+                        },
+                    );
+                    let snap =
+                        buschain_engine::midi::snapshot_global(&session.midi_devices);
+                    let _ = tx.send(Event::MidiSnapshot(snap));
+                }
+                Command::Midi(intent) => {
+                    buschain_engine::midi::apply_intent_global(intent);
+                }
             }
         }
         false
+}
+
+fn poll_midi_actions(
+    tx: &Sender<Event>,
+    last_session: &Option<Session>,
+    muted_buses: &mut HashMap<String, bool>,
+) {
+    for action in buschain_engine::midi::poll_actions_global() {
+        match action {
+            buschain_engine::MidiAction::SetTrackLevel { sink, gain_db } => {
+                let muted = last_session
+                    .as_ref()
+                    .and_then(|s| {
+                        s.tracks
+                            .iter()
+                            .find(|t| t.expected_sink_name() == sink)
+                            .map(|t| t.mute)
+                    })
+                    .unwrap_or(false);
+                muted_buses.insert(sink.clone(), muted);
+                let _ = crate::audio::engine_handle::set_levels(&sink, gain_db, muted);
+            }
+            buschain_engine::MidiAction::MapLearned { map } => {
+                let _ = tx.send(Event::MidiLearnBound { map });
+            }
+        }
+    }
 }

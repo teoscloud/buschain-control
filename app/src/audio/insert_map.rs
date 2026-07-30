@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use buschain_engine::{
-    normalize_ladspa_label, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
+    normalize_ladspa_label, ChainEnsureMode, ChainSpec, ChainState, InsertFormat, InsertSlot,
     NodeName,
 };
 
@@ -62,32 +62,167 @@ fn resolve_plugin_so_uncached(label: &str) -> String {
 }
 
 pub fn plugin_ref_to_slot(plug: &PluginRef) -> Option<InsertSlot> {
-    if plug.id.format != PluginFormat::Ladspa {
-        return None;
+    match plug.id.format {
+        PluginFormat::Ladspa => {
+            let label = normalize_label(&plug.id.id).to_string();
+            let key = normalize_ladspa_label(&label).to_string();
+            Some(InsertSlot {
+                slot_id: plug.slot_id,
+                plugin_key: key.clone(),
+                plugin_so: resolve_plugin_so(&key),
+                controls: plug.effective_control_params(),
+                format: InsertFormat::Ladspa,
+                state_blob: None,
+                sidechain_from: plug.sidechain_from.clone(),
+            })
+        }
+        PluginFormat::Clap => {
+            let path = resolve_clap_path(&plug.id.id);
+            Some(InsertSlot {
+                slot_id: plug.slot_id,
+                plugin_key: plug.id.id.clone(),
+                plugin_so: path,
+                controls: plug.effective_control_params(),
+                format: InsertFormat::Clap,
+                state_blob: plug.state_blob.clone(),
+                sidechain_from: plug.sidechain_from.clone(),
+            })
+        }
+        PluginFormat::Vst3 => {
+            let path = resolve_vst3_path(&plug.id.id);
+            Some(InsertSlot {
+                slot_id: plug.slot_id,
+                plugin_key: plug.id.id.clone(),
+                plugin_so: path,
+                controls: plug.effective_control_params(),
+                format: InsertFormat::Vst3,
+                state_blob: plug.state_blob.clone(),
+                sidechain_from: plug.sidechain_from.clone(),
+            })
+        }
+        PluginFormat::Lv2 => {
+            let (uri, bundle) = resolve_lv2_identity(&plug.id.id);
+            Some(InsertSlot {
+                slot_id: plug.slot_id,
+                plugin_key: uri,
+                plugin_so: bundle,
+                controls: plug.effective_control_params(),
+                format: InsertFormat::Lv2,
+                state_blob: plug.state_blob.clone(),
+                sidechain_from: plug.sidechain_from.clone(),
+            })
+        }
     }
-    let label = normalize_label(&plug.id.id).to_string();
-    let key = normalize_ladspa_label(&label).to_string();
-    Some(InsertSlot {
-        slot_id: plug.slot_id,
-        plugin_key: key.clone(),
-        plugin_so: resolve_plugin_so(&key),
-        controls: plug.effective_control_params(),
-    })
 }
 
 /// Props-only slot — controls matter; skip FS `.so` walks on every knob flush.
 pub fn plugin_ref_to_controls_slot(plug: &PluginRef) -> Option<InsertSlot> {
-    if plug.id.format != PluginFormat::Ladspa {
-        return None;
+    match plug.id.format {
+        PluginFormat::Ladspa => {
+            let label = normalize_label(&plug.id.id).to_string();
+            let key = normalize_ladspa_label(&label).to_string();
+            Some(InsertSlot {
+                slot_id: plug.slot_id,
+                plugin_key: key,
+                plugin_so: String::new(),
+                controls: plug.effective_control_params(),
+                format: InsertFormat::Ladspa,
+                state_blob: None,
+                sidechain_from: plug.sidechain_from.clone(),
+            })
+        }
+        PluginFormat::Clap | PluginFormat::Vst3 | PluginFormat::Lv2 => plugin_ref_to_slot(plug),
     }
-    let label = normalize_label(&plug.id.id).to_string();
-    let key = normalize_ladspa_label(&label).to_string();
-    Some(InsertSlot {
-        slot_id: plug.slot_id,
-        plugin_key: key,
-        plugin_so: String::new(),
-        controls: plug.effective_control_params(),
-    })
+}
+
+fn resolve_lv2_identity(id: &str) -> (String, String) {
+    if let Some(path) = id.strip_prefix("bundle:") {
+        return (String::new(), path.to_string());
+    }
+    (id.to_string(), String::new())
+}
+
+fn resolve_clap_path(id: &str) -> String {
+    if std::path::Path::new(id).is_file() {
+        return id.to_string();
+    }
+    let mut dirs = Vec::new();
+    if let Ok(env) = std::env::var("CLAP_PATH") {
+        for p in env.split(':').filter(|s| !s.is_empty()) {
+            dirs.push(std::path::PathBuf::from(p));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = std::path::PathBuf::from(home);
+        dirs.push(h.join(".clap"));
+        dirs.push(h.join(".local/lib/clap"));
+    }
+    dirs.push(std::path::PathBuf::from("/usr/lib/clap"));
+    let file = if id.ends_with(".clap") {
+        id.to_string()
+    } else {
+        format!("{id}.clap")
+    };
+    for dir in &dirs {
+        let p = dir.join(&file);
+        if p.is_file() {
+            return p.display().to_string();
+        }
+        // Nested vendor folders
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let cand = e.path().join(&file);
+                if cand.is_file() {
+                    return cand.display().to_string();
+                }
+            }
+        }
+    }
+    id.to_string()
+}
+
+fn resolve_vst3_path(id: &str) -> String {
+    let p = std::path::Path::new(id);
+    if p.exists() {
+        return id.to_string();
+    }
+    // Bare name / stem → search standard VST3 roots (+ VST3_PATH).
+    let mut roots = Vec::new();
+    if let Ok(env) = std::env::var("VST3_PATH") {
+        for part in env.split(':').filter(|s| !s.is_empty()) {
+            roots.push(std::path::PathBuf::from(part));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let h = std::path::PathBuf::from(home);
+        roots.push(h.join(".vst3"));
+        roots.push(h.join(".local/lib/vst3"));
+    }
+    roots.push(std::path::PathBuf::from("/usr/lib/vst3"));
+    roots.push(std::path::PathBuf::from("/usr/local/lib/vst3"));
+    roots.push(std::path::PathBuf::from("/usr/lib64/vst3"));
+
+    let file = if id.ends_with(".vst3") {
+        id.to_string()
+    } else {
+        format!("{id}.vst3")
+    };
+    for root in &roots {
+        let direct = root.join(&file);
+        if direct.exists() {
+            return direct.display().to_string();
+        }
+        // Nested vendor folders
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let cand = e.path().join(&file);
+                if cand.exists() {
+                    return cand.display().to_string();
+                }
+            }
+        }
+    }
+    id.to_string()
 }
 
 pub fn ladspa_slots(track: &Track) -> Vec<InsertSlot> {

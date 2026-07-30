@@ -54,26 +54,28 @@ pub fn migrate_recreate_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result
         let _ = create_null_sink(&hold_spec, clock);
     }
 
-    let inputs = list_sink_input_indices_on(name);
-    for idx in &inputs {
-        let _ = run_ok("pactl", &["move-sink-input", idx, "buschain_hold"]);
-    }
+    let _ = super::pulse_compat::move_sink_inputs(name, "buschain_hold");
 
     let _ = unload_named_null_sink(name);
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    create_null_sink(spec, clock)?;
+    // Prefer native null-sink create when the control plane is up.
+    if super::native::native_ready() {
+        let _ = super::native::session_ensure_null_sink(spec, clock);
+    } else {
+        create_null_sink(spec, clock)?;
+    }
 
     // App buses must be audible after migrate (levels reconcile will refine).
     if matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus) {
-        let _ = run_ok("pactl", &["set-sink-mute", name, "0"]);
-        let _ = run_ok("pactl", &["set-sink-volume", name, "100%"]);
+        let _ = super::native::native_set_levels(name, 0.0, false).or_else(|_| {
+            run_ok("pactl", &["set-sink-mute", name, "0"])?;
+            run_ok("pactl", &["set-sink-volume", name, "100%"])
+        });
         let _ = run_ok("pactl", &["suspend-sink", name, "0"]);
     }
 
-    for idx in &inputs {
-        let _ = run_ok("pactl", &["move-sink-input", idx, name]);
-    }
+    let _ = super::pulse_compat::move_sink_inputs("buschain_hold", name);
 
     // Confirm rate landed.
     for _ in 0..20 {

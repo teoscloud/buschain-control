@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 
 use crate::backend::{
-    ensure_clocked_route, link_is_live, read_signature, sink_exists, AudioBackend,
-    FilterChainRuntime, PipewireCliBackend,
+    ensure_clocked_route, link_is_live, sink_exists, AudioBackend, FilterChainRuntime,
+    PipewireNativeBackend,
 };
 use crate::clock::{
     probe_master_hw_from_sinks, probe_sink_running_rate, resolve_profile, set_graph_force_clock,
@@ -15,7 +15,7 @@ use crate::clock::{
 };
 use crate::contract::{ApplyReport, Intent};
 use crate::domain::{
-    fx_name_for_bus, post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
+    post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
     LinkSpec, NodeRole, NodeSpec, Props,
 };
 use crate::fx_gen::{any_gen_live, live_fx_name, live_post_name};
@@ -23,7 +23,7 @@ use crate::plan::DesiredState;
 use crate::pipeline;
 
 pub struct Engine {
-    backend: PipewireCliBackend,
+    backend: PipewireNativeBackend,
     desired: DesiredState,
     last_clock: GraphClock,
     fx: FilterChainRuntime,
@@ -40,7 +40,7 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
-            backend: PipewireCliBackend::new(),
+            backend: PipewireNativeBackend::new(),
             desired: DesiredState::default(),
             last_clock: GraphClock::default(),
             fx: FilterChainRuntime::new(),
@@ -232,12 +232,10 @@ impl Engine {
         let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
         let mut n = 0u32;
         for bus in buses {
-            // Both A/B generations — leaving `__stg` posts behind re-broke wet routing.
-            for post in [post_name_for_bus(&bus), crate::fx_gen::staging_post(&bus)] {
-                if sink_exists(&post) {
-                    let _ = self.backend.destroy_node(&post);
-                    n += 1;
-                }
+            let post = post_name_for_bus(&bus);
+            if sink_exists(&post) {
+                let _ = self.backend.destroy_node(&post);
+                n += 1;
             }
         }
         // Also sweep any orphan posts not in desired buses.
@@ -327,6 +325,11 @@ impl Engine {
                 self.backend.teardown_links();
                 let _ = self.backend.teardown_rate_bridges();
                 self.fx.stop_all();
+                // Tear down in-process hosts for every known bus.
+                let buses: Vec<String> = self.desired.fx_chains.keys().cloned().collect();
+                for bus in buses {
+                    let _ = crate::host::registry::teardown_host(&bus);
+                }
                 self.desired.clear_routes();
                 self.desired.bridges.clear();
                 self.desired.fx_chains.clear();
@@ -442,7 +445,7 @@ impl Engine {
                 continue;
             }
             let from = format!("{bus}.monitor");
-            // Live A/B generation — canonical-only names left `__stg` racks dry→HW.
+            // Canonical wet path — prune parallel dry bus→dest when FX host is up.
             let post = live_post_name(bus);
             let post_mon = format!("{post}.monitor");
             let fx = live_fx_name(bus);
@@ -468,7 +471,7 @@ impl Engine {
                 // Feed restore first: spine_ok requires bus→fx. After restart the
                 // feed often drops while fx/post remain — pruning post→dest then
                 // traps the bus on hold (meters via hold, silence).
-                if sink_exists(&fx) && !link_is_live(&from, &fx) {
+                if any_gen_live(bus) && !link_is_live(&from, &fx) {
                     let _ = self.backend.ensure_link_raw(&from, &fx);
                     let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                     report.push(format!("restore {bus}→fx feed"));
@@ -499,8 +502,8 @@ impl Engine {
                             let _ = self.backend.unlink_raw(&from, d);
                         }
                     }
-                } else if !sink_exists(&fx) && !any_gen_live(bus) {
-                    // Truly Building — no FX generation at all; strip premature post→dest.
+                } else if !any_gen_live(bus) {
+                    // Truly Building — no FX host at all; strip premature post→dest.
                     let mut had_post = false;
                     for d in &dests {
                         if link_is_live(&post_mon, d) {
@@ -619,15 +622,6 @@ impl Engine {
                 continue;
             }
             let fx = live_fx_name(&bus);
-            if self.fx.spawn_in_backoff(&fx)
-                || self.fx.spawn_in_backoff(&fx_name_for_bus(&bus))
-            {
-                // Still prune parallel dry+post while waiting — avoids chorus.
-                if !self.chain_is_wet(&bus) {
-                    self.prune_orphan_post(&bus, &dest);
-                }
-                continue;
-            }
             // Idle must never ForceRespawn — ProbeOnly only.
             match self.ensure_fx_chain(spec, ChainEnsureMode::ProbeOnly) {
                 Ok(ChainState::Wet(_)) => {
@@ -643,7 +637,7 @@ impl Engine {
                     // ProbeOnly fails when dest is missing even if spine is fine.
                     // Restore bus→fx feed first (common after restart), then re-arm.
                     let from = format!("{bus}.monitor");
-                    if sink_exists(&fx) && !link_is_live(&from, &fx) {
+                    if any_gen_live(&bus) && !link_is_live(&from, &fx) {
                         let _ = self.backend.ensure_link_raw(&from, &fx);
                         let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                         report.push(format!("FX {bus}: restored feed"));
@@ -664,7 +658,7 @@ impl Engine {
                                 report.push(format!("FX {bus}: re-armed egress"));
                             }
                         }
-                    } else if !sink_exists(&fx) && !any_gen_live(&bus) {
+                    } else if !any_gen_live(&bus) {
                         self.prune_orphan_post(&bus, &dest);
                     }
                     if !e.contains("backoff") && !e.contains("not audible") {
@@ -672,13 +666,13 @@ impl Engine {
                     }
                 }
                 Ok(_) => {
-                    // Building — only strip post when no FX generation exists.
-                    if !sink_exists(&fx) && !any_gen_live(&bus) {
+                    // Building — only strip post when no FX host exists.
+                    if !any_gen_live(&bus) {
                         self.prune_orphan_post(&bus, &dest);
                     }
                 }
                 Err(e) => {
-                    if !sink_exists(&fx) && !any_gen_live(&bus) {
+                    if !any_gen_live(&bus) {
                         self.prune_orphan_post(&bus, &dest);
                     }
                     report.push(format!("FX {bus}: {e:#}"));
@@ -693,7 +687,7 @@ impl Engine {
         if pipeline::arm::spine_instant_ready(bus) {
             return;
         }
-        // Live generation (may be `__stg` after A/B) — never only the canonical name.
+        // Post sink for this bus — never strip when spine is healthy.
         let post = live_post_name(bus);
         let post_mon = format!("{post}.monitor");
         if dest.is_empty() {
@@ -729,10 +723,10 @@ impl Engine {
                 // restored links when spine_ok was already true → forever on
                 // buschain_hold (meters alive via hold/bus, audible silence).
                 //
-                // CRITICAL: use live A/B generation. Canonical-only checks treated a
-                // healthy `buschain_fx_master__stg` as "missing", stripped the wet
-                // path, and fail-opened dry master→HW (plugins silently skipped).
-                if any_gen_live(master) || sink_exists(&live_fx_name(master)) {
+                // CRITICAL: gate on in-process host, not Pulse sink_exists(fx).
+                // Duplex PwFxNode is not a null-sink; canonical-only checks stripped
+                // the wet path and fail-opened dry master→HW (plugins silently skipped).
+                if any_gen_live(master) {
                     let fx = live_fx_name(master);
                     let post = live_post_name(master);
                     let post_mon = format!("{post}.monitor");
@@ -928,10 +922,12 @@ impl Engine {
                 // false-negatives under pactl load and forced ForceRespawn of
                 // every track (~10s each) while audio was already left running.
                 let want = spec.signature();
-                let live = live_fx_name(bus);
                 let post = live_post_name(bus);
-                let sig_ok = read_signature(&live).as_deref() == Some(want.as_str());
-                if !sig_ok || !sink_exists(&live) || !sink_exists(&post) {
+                // In-process host only — duplex FX is not a Pulse sink.
+                let fp_ok =
+                    crate::host::registry::host_fingerprint(bus).as_deref() == Some(want.as_str());
+                let host_ok = crate::host::registry::host_running(bus);
+                if !fp_ok || !host_ok || !sink_exists(&post) {
                     return false;
                 }
                 // Missing post→dest must NOT force ForceRespawn — adopt re-arms
@@ -1027,9 +1023,39 @@ impl Engine {
             ChainEnsureMode::Idempotent
         };
         let chains: Vec<ChainSpec> = self.desired.fx_chains.values().cloned().collect();
+        // Parallel host bring-up — filter threads + LADSPA load overlap.
+        // Then link/arm per bus (CLI link plane still serial).
+        let force_host = matches!(mode, ChainEnsureMode::ForceRespawn);
+        let need: Vec<ChainSpec> = chains
+            .iter()
+            .filter(|s| !s.inserts.is_empty())
+            .filter(|s| {
+                force_host
+                    || !crate::host::registry::host_running(s.bus.as_str())
+                    || crate::host::registry::host_fingerprint(s.bus.as_str()).as_deref()
+                        != Some(s.signature().as_str())
+            })
+            .cloned()
+            .collect();
+        if !need.is_empty() {
+            let clock = self.desired.clock.clone();
+            let t_hosts = std::time::Instant::now();
+            for (bus, r) in crate::host::registry::ensure_hosts_parallel(&need, &clock, true) {
+                if let Err(e) = r {
+                    report.push(format!("FX host {bus}: {e:#}"));
+                }
+            }
+            report.push(format!(
+                "FX hosts parallel {} in {}ms",
+                need.len(),
+                t_hosts.elapsed().as_millis()
+            ));
+        }
+        // Link/arm only — racks already published by the parallel host pass.
+        let _ = mode;
         for spec in chains {
             let bus = spec.bus.as_str().to_string();
-            match self.ensure_fx_chain(spec, mode) {
+            match self.ensure_fx_chain(spec, ChainEnsureMode::Idempotent) {
                 Ok(ChainState::Wet(_)) => report.push(format!("FX wet {bus}")),
                 Ok(ChainState::Failed(e)) => {
                     if !e.contains("backoff") {
@@ -1083,14 +1109,14 @@ impl Engine {
             }
         }
 
-        // Session barrier — wait for Master spine + unmuted insert tracks.
+        // Session barrier — host atomics + short wait (was 80×50ms CLI spine polls).
         let mut cleared = false;
-        for _ in 0..80 {
+        for _ in 0..20 {
             if self.session_barrier_clear() {
                 cleared = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
         }
         if !cleared {
             report.push("session barrier timeout — arming speakers fail-open");
@@ -1104,12 +1130,18 @@ impl Engine {
             .clone()
             .or_else(|| self.master_hw.clone())
         {
-            let wet = pipeline::arm::spine_instant_ready("buschain_master")
-                && !self.desired.fx_failed.contains("buschain_master");
+            let wet = !self.desired.fx_failed.contains("buschain_master")
+                && self.desired.fx_chains.contains_key("buschain_master")
+                && (crate::host::registry::host_running("buschain_master")
+                    || pipeline::arm::spine_instant_ready("buschain_master")
+                    || self.chain_is_wet("buschain_master"));
             if let Err(e) = pipeline::arm::arm_master_hw(&mut self.backend, &hw, wet) {
                 report.push(format!("arm Master→HW: {e:#}"));
             } else {
-                report.push(format!("armed Master→{hw}"));
+                report.push(format!(
+                    "armed Master→{hw} ({})",
+                    if wet { "wet" } else { "dry" }
+                ));
             }
         }
         self.desired.speakers_armed = true;
@@ -1169,10 +1201,7 @@ impl Engine {
     }
 
     pub fn push_fx_controls(&mut self, bus: &str, inserts: Vec<InsertSlot>) -> Result<()> {
-        let fx_name = live_fx_name(bus);
-        // Props-only — never pactl here. Existence is owns_live / .sig / last-resort
-        // sink_exists inside pipeline::insert::push_fx_controls.
-        pipeline::insert::push_fx_controls(&mut self.fx, &fx_name, &inserts)?;
+        pipeline::insert::push_fx_controls(&mut self.fx, bus, &inserts)?;
         if let Some(spec) = self.desired.fx_chains.get_mut(bus) {
             spec.inserts = inserts;
         }
@@ -1207,9 +1236,8 @@ impl Engine {
                 (spec.inserts.len(), spec.dest.clone())
             }
             _ => {
-                // Orphan / restart: treat existing FX sink as a candidate wet path.
-                let fx = live_fx_name(bus);
-                if !crate::backend::sink_exists(&fx) && !any_gen_live(bus) {
+                // Orphan / restart: treat existing FX host as a candidate wet path.
+                if !any_gen_live(bus) {
                     return ChainState::Dry;
                 }
                 let dest = if bus == "buschain_master" {
@@ -1238,8 +1266,25 @@ impl Engine {
     }
 
     /// True when bus.monitor → fx → post is carrying audio (meter / route gate).
+    /// Uses host atomics + spine probe — never shells out per idle/barrier tick.
     pub fn chain_is_wet(&mut self, bus: &str) -> bool {
-        self.chain_state(bus).is_wet()
+        if self.desired.fx_failed.contains(bus) {
+            return false;
+        }
+        if let Some(spec) = self.desired.fx_chains.get(bus) {
+            if spec.inserts.is_empty() {
+                return false;
+            }
+            if !crate::host::registry::host_running(bus) {
+                return false;
+            }
+            // Master post→HW stays gated until speakers_armed; host up is enough here.
+            if bus == "buschain_master" && !self.desired.speakers_armed {
+                return true;
+            }
+            return pipeline::arm::spine_instant_ready(bus);
+        }
+        any_gen_live(bus) && pipeline::arm::spine_instant_ready(bus)
     }
 
     pub fn stop_all_fx(&mut self) {
@@ -1310,6 +1355,14 @@ impl Engine {
 
     pub fn link_is_live(source: &str, sink: &str) -> bool {
         crate::backend::link_is_live(source, sink)
+    }
+
+    pub fn snapshot(&mut self) -> Result<crate::domain::GraphSnapshot> {
+        self.backend.snapshot()
+    }
+
+    pub fn set_default_sink(&mut self, name: &str) -> Result<bool> {
+        self.backend.set_default_sink(name)
     }
 
     pub fn resolve_profile(

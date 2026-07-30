@@ -5,10 +5,21 @@ use egui::RichText;
 
 pub fn draw_playback(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
+    design::page_header(
+        ui,
+        &theme,
+        "Playback",
+        "Apps currently playing audio. Move them onto a BusChain track, or adjust volume/mute here.",
+    );
     ui.horizontal(|ui| {
-        design::section_label(ui, &theme, "PLAYBACK — application streams (sink inputs)");
+        ui.label(
+            RichText::new("Streams")
+                .size(12.0)
+                .strong()
+                .color(theme.text_dim()),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.checkbox(&mut state.show_hidden_playback, "Show hidden");
+            ui.checkbox(&mut state.show_hidden_playback, "Show internals");
         });
     });
     ui.add_space(6.0);

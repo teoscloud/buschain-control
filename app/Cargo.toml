@@ -6,9 +6,10 @@ description = "BusChain Control — system mixer + PipeWire control surface"
 license = "MIT"
 
 [features]
-default = []
-# Optional discardable VST3 adapter (Carla VST3-only). Core never requires this.
-vst3-carla = []
+# VST3 discovery is always on (Carla scanner). Flag kept as a no-op alias.
+default = ["vst3"]
+vst3 = []
+vst3-carla = ["vst3"]
 
 [lib]
 name = "buschain_control"

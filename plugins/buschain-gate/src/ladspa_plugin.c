@@ -20,6 +20,7 @@ enum {
   L_HOLD,
   L_RELEASE,
   L_RANGE,
+  L_MIX,
   L_BYPASS,
   L_N_PORTS
 };
@@ -73,6 +74,7 @@ static void run(LADSPA_Handle instance, unsigned long n_samples) {
   params.hold_ms = pget(self, L_HOLD, params.hold_ms);
   params.release_ms = pget(self, L_RELEASE, params.release_ms);
   params.range_db = pget(self, L_RANGE, params.range_db);
+  params.mix = pget(self, L_MIX, params.mix);
   params.bypass = pget(self, L_BYPASS, 0.0f) >= 0.5f;
 
   buschain_gate_set_params(self->dsp, &params);
@@ -123,6 +125,7 @@ static void init_descriptor(void) {
   port_names[L_HOLD] = "Hold (ms)";
   port_names[L_RELEASE] = "Release (ms)";
   port_names[L_RANGE] = "Range (dB)";
+  port_names[L_MIX] = "Mix";
   port_names[L_BYPASS] = "Bypass";
 
   memset(port_hints, 0, sizeof(port_hints));
@@ -151,6 +154,10 @@ static void init_descriptor(void) {
   port_hints[L_RELEASE].UpperBound = 1000.0f;
   port_hints[L_RANGE].LowerBound = 0.0f;
   port_hints[L_RANGE].UpperBound = 140.0f;
+  port_hints[L_MIX].LowerBound = 0.0f;
+  port_hints[L_MIX].UpperBound = 1.0f;
+  port_hints[L_MIX].HintDescriptor =
+    LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_MAXIMUM;
 
   port_hints[L_BYPASS].LowerBound = 0.0f;
   port_hints[L_BYPASS].UpperBound = 1.0f;

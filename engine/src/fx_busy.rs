@@ -1,7 +1,4 @@
-//! Per-FX rebuild gate — Props must not CLI-probe during ForceRespawn stop→spawn.
-//!
-//! Keyed by `buschain_fx_*` name (the Props hot path never goes through
-//! `pipeline::insert::push_fx_controls`).
+//! Per-FX rebuild gate — suppress stale CLI probes during host ForceRespawn.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -9,10 +6,8 @@ use std::time::{Duration, Instant};
 
 struct BusyState {
     names: HashSet<String>,
-    /// Keep the gate up briefly after ForceRespawn/A/B returns so the first
-    /// post-spawn Props ticks don't race an empty pactl cache.
-    /// Per-name: A/B drops old+new guards; a single slot used to settle only
-    /// the last Drop (old) and leave the new live gen unprotected.
+    /// Keep the gate up briefly after ForceRespawn returns so the first
+    /// post-spawn reconcile ticks don't race an empty link cache.
     settle_until: HashMap<String, Instant>,
 }
 

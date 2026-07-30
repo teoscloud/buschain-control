@@ -10,6 +10,7 @@ pub mod session;
 pub mod tray;
 pub mod ui;
 pub mod withdraw;
+pub mod hyprland_float;
 
 pub use app_state::AppState;
 pub use ipc::ensure_daemon;

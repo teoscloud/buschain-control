@@ -1,23 +1,64 @@
+# Build artifacts
 **/build/
 **/target/
+/target/
 *.so
 *.o
 *.a
+*.rlib
+*.rmeta
+*.dylib
+*.dll
+*.exe
+
+# Nix / direnv
 .direnv/
 result
 result-*
+
+# Editor / IDE / agent local state
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
 *~
 .DS_Store
-/target/
+Thumbs.db
 
 # Local / secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 id_rsa*
 id_ed25519*
+*.p12
+*.pfx
+credentials.json
+secrets.*
 
 # AI agent dumps (local only — not tracked)
 /codedocs/
 
+# Runtime / debug junk
+*.log
+*.tmp
+*.temp
+core
+core.*
+*.core
+vgcore.*
+perf.data*
+*.profraw
+*.profdata
+
+# BusChain local IPC / SHM leftovers (if ever written into the tree)
+*.sock
+*.shm
+buschain-*-*.bin
+
+# Plugin / LV2 local build trees (keep sources)
+plugins/**/build/
+plugins/**/*.lv2/*.so

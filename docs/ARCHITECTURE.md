@@ -11,8 +11,9 @@
 | Live contract | `app/src/audio/live.rs` | `LiveChange` severity ladder → `AppState::commit` |
 | Worker | `app/src/audio/worker.rs` | All audio I/O off UI thread; syncs `GraphClock` then calls graph/engine |
 | **Engine** | `engine/` (`buschain-engine`) | **Only** place for PipeWire/Pulse capabilities — intents, clock, links, rate-bridges |
+| **DSP host** | `engine/src/host/` | In-process insert rack (`PwFxNode` + LADSPA `process()`); PipeWire is mixer I/O |
 | Graph shim | `app/src/audio/graph.rs` | Session orchestration (apply/rewire/levels); node create/route via engine |
-| PluginHost | `app/src/audio/plugin/` | Format backends behind traits |
+| PluginHost | `app/src/audio/plugin/` | Format backends behind traits (UI/catalog); DSP runs in engine host |
 
 **Process model:** one `buschain-control` process owns the graph
 (in-process worker + coalesce). On startup it binds
@@ -50,18 +51,26 @@ External 48 kHz mic ──► buschain_rs_* (rate bridge) ──► track bus @ 
 
 ## PipeWire mixer graph
 
+Control plane: `PipewireNativeBackend` (`engine/src/backend/native/`) owns a dedicated
+libpipewire MainLoop + registry cache for links / null-sinks / node lookup / levels
+(SPA Props) / default sink (Metadata). Pulse remains only for stream-move
+(`PulseCompat`) and emergency fallbacks.
+
 ```
-Apps ──assign──► Track null sinks ──► [LADSPA FX…] ──► Master ──► HW sink
+Apps ──assign──► Track null sinks ──► buschain_fx_* (in-process host) ──► post ──► Master ──► HW
 Inputs ─assign─► (optional rate-bridge) ──► Track bus
 ```
 
 - Master UI column is always leftmost (`Session::tracks_ui_order`).
 - No hardcoded application tracks.
+- Insert FX is **not** an OS helper: `EnsureFxChain` publishes a rack into `PwFxNode`;
+  knobs/power use a wait-free `ControlQueue` (no Props topology).
 
 ## Plugin backends
 
-- **LADSPA / LV2 / CLAP** — always compiled; scan + (LADSPA) insert into graph.
-- **VST3** — optional `vst3-carla` feature only; Carla used for VST3 discovery/load path exclusively; swappable via `PluginBackend` trait. Default build has zero Carla linkage.
+- **LADSPA** — v1 process path inside the host (`plugins/*/build/*.so`).
+- **LV2 / CLAP** — scan in app; instantiate+process on the host is follow-up.
+- **VST3** — discovery always on (Carla scanner); native host path always compiled (process activation still incomplete — see ROADMAP).
 
 ## Built-in plugins (`plugins/`)
 

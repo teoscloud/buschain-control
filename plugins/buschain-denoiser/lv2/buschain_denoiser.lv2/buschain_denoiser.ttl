@@ -15,8 +15,7 @@
   lv2:optionalFeature lv2:hardRTCapable ;
 
   rdfs:comment """
-Zero-latency, time-domain (no FFT) 6-band downward-expander denoiser.
-Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
+Zero-latency, time-domain (no FFT) 6-band spectral denoiser with optional gate.
 """ ;
 
   lv2:port [
@@ -47,8 +46,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:default -48.0 ;
     lv2:minimum -140.0 ;
     lv2:maximum 0.0 ;
-    units:unit units:db ;
-    rdfs:comment "Noise detection level. Raise (toward 0) for more reduction."
+    units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
     lv2:index 5 ;
@@ -56,7 +54,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "Range Band 1" ;
     lv2:default 8.0 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 24.0 ;
+    lv2:maximum 48.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
@@ -65,7 +63,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "Range Band 2" ;
     lv2:default 9.0 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 24.0 ;
+    lv2:maximum 48.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
@@ -74,7 +72,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "Range Band 3" ;
     lv2:default 7.0 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 24.0 ;
+    lv2:maximum 48.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
@@ -83,7 +81,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "Range Band 4" ;
     lv2:default 8.0 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 24.0 ;
+    lv2:maximum 48.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
@@ -92,7 +90,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "Range Band 5" ;
     lv2:default 12.0 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 24.0 ;
+    lv2:maximum 48.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
@@ -101,7 +99,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "Range Band 6" ;
     lv2:default 14.0 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 24.0 ;
+    lv2:maximum 48.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
@@ -128,8 +126,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:name "HF Bias" ;
     lv2:default 0.35 ;
     lv2:minimum 0.0 ;
-    lv2:maximum 1.0 ;
-    rdfs:comment "Pass HF harmonics/transients more easily (above ~1 kHz)."
+    lv2:maximum 1.0
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
     lv2:index 14 ;
@@ -141,6 +138,15 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
     lv2:index 15 ;
+    lv2:symbol "stability" ;
+    lv2:name "Stability" ;
+    lv2:default 0.45 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0 ;
+    rdfs:comment "Tames NR flicker / musical noise. Higher = smoother residual."
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 16 ;
     lv2:symbol "attack" ;
     lv2:name "Attack" ;
     lv2:default 2.5 ;
@@ -149,7 +155,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:ms
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
-    lv2:index 16 ;
+    lv2:index 17 ;
     lv2:symbol "release" ;
     lv2:name "Release" ;
     lv2:default 120.0 ;
@@ -158,24 +164,41 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:ms
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
-    lv2:index 17 ;
+    lv2:index 18 ;
     lv2:symbol "knee" ;
     lv2:name "Knee" ;
-    lv2:default 6.0 ;
+    lv2:default 4.0 ;
     lv2:minimum 0.0 ;
     lv2:maximum 24.0 ;
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
-    lv2:index 18 ;
+    lv2:index 19 ;
     lv2:symbol "ratio" ;
     lv2:name "Ratio" ;
-    lv2:default 4.0 ;
+    lv2:default 12.0 ;
     lv2:minimum 1.0 ;
     lv2:maximum 20.0
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
-    lv2:index 19 ;
+    lv2:index 20 ;
+    lv2:symbol "gate_enable" ;
+    lv2:name "Gate Enable" ;
+    lv2:portProperty lv2:toggled ;
+    lv2:default 0.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 21 ;
+    lv2:symbol "gate_mix" ;
+    lv2:name "Gate Mix" ;
+    lv2:default 1.0 ;
+    lv2:minimum 0.0 ;
+    lv2:maximum 1.0
+  ] , [
+    a lv2:ControlPort , lv2:InputPort ;
+    lv2:index 22 ;
     lv2:symbol "hpf" ;
     lv2:name "High-Pass Enable" ;
     lv2:portProperty lv2:toggled ;
@@ -184,7 +207,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:maximum 1.0
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
-    lv2:index 20 ;
+    lv2:index 23 ;
     lv2:symbol "lpf" ;
     lv2:name "Low-Pass Enable" ;
     lv2:portProperty lv2:toggled ;
@@ -193,7 +216,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:maximum 1.0
   ] , [
     a lv2:ControlPort , lv2:InputPort ;
-    lv2:index 21 ;
+    lv2:index 24 ;
     lv2:symbol "bypass" ;
     lv2:name "Bypass" ;
     lv2:portProperty lv2:toggled ;
@@ -202,7 +225,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     lv2:maximum 1.0
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 22 ;
+    lv2:index 25 ;
     lv2:symbol "meter_in_peak" ;
     lv2:name "Input Peak" ;
     lv2:minimum -140.0 ;
@@ -210,7 +233,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 23 ;
+    lv2:index 26 ;
     lv2:symbol "meter_in_min" ;
     lv2:name "Input Min" ;
     lv2:minimum -140.0 ;
@@ -218,7 +241,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 24 ;
+    lv2:index 27 ;
     lv2:symbol "meter_gr0" ;
     lv2:name "GR Band 1" ;
     lv2:minimum -24.0 ;
@@ -226,7 +249,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 25 ;
+    lv2:index 28 ;
     lv2:symbol "meter_gr1" ;
     lv2:name "GR Band 2" ;
     lv2:minimum -24.0 ;
@@ -234,7 +257,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 26 ;
+    lv2:index 29 ;
     lv2:symbol "meter_gr2" ;
     lv2:name "GR Band 3" ;
     lv2:minimum -24.0 ;
@@ -242,7 +265,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 27 ;
+    lv2:index 30 ;
     lv2:symbol "meter_gr3" ;
     lv2:name "GR Band 4" ;
     lv2:minimum -24.0 ;
@@ -250,7 +273,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 28 ;
+    lv2:index 31 ;
     lv2:symbol "meter_gr4" ;
     lv2:name "GR Band 5" ;
     lv2:minimum -24.0 ;
@@ -258,7 +281,7 @@ Tuned for game/movie playback: tames hiss and hum without heavy EQ-range damage.
     units:unit units:db
   ] , [
     a lv2:ControlPort , lv2:OutputPort ;
-    lv2:index 29 ;
+    lv2:index 32 ;
     lv2:symbol "meter_gr5" ;
     lv2:name "GR Band 6" ;
     lv2:minimum -24.0 ;

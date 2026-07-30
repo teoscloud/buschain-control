@@ -48,6 +48,55 @@ pub fn drag_sensitivity(ui: &Ui) -> f32 {
     })
 }
 
+/// Mouse-wheel adjust for hovered knobs / faders / sliders.
+/// Consumes scroll so parent `ScrollArea`s don't also move. Shift/Alt fine-tune.
+/// Wide positive ranges (e.g. Hz) step in log space.
+pub fn apply_wheel_to_value(
+    ui: &mut Ui,
+    resp: &mut egui::Response,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    if !resp.hovered() {
+        return false;
+    }
+    let (raw_y, smooth_y) = ui.input(|i| (i.raw_scroll_delta.y, i.smooth_scroll_delta.y));
+    let dy = if raw_y.abs() > 0.0 { raw_y } else { smooth_y };
+    if dy.abs() < 0.01 {
+        return false;
+    }
+    // Stop the channel-rack / plugin scroll from eating the gesture.
+    ui.ctx().input_mut(|i| {
+        i.smooth_scroll_delta = Vec2::ZERO;
+    });
+
+    let lo = *range.start();
+    let hi = *range.end();
+    let span = (hi - lo).max(1e-9);
+    let sens = drag_sensitivity(ui);
+    // ~14 px raw ≈ one physical notch on many mice.
+    let steps = if raw_y.abs() > 0.0 {
+        (raw_y / 14.0).clamp(-4.0, 4.0)
+    } else {
+        (smooth_y / 48.0).clamp(-2.5, 2.5)
+    };
+    if steps.abs() < 1e-4 {
+        return false;
+    }
+
+    let logarithmic = lo > 0.0 && hi / lo >= 16.0;
+    if logarithmic {
+        let v = (*value).clamp(lo, hi).max(lo);
+        let t = (v.ln() - lo.ln()) / (hi.ln() - lo.ln());
+        let nt = (t + steps * 0.03 * sens).clamp(0.0, 1.0);
+        *value = (lo.ln() + nt * (hi.ln() - lo.ln())).exp();
+    } else {
+        *value = (*value + steps * span * 0.03 * sens).clamp(lo, hi);
+    }
+    resp.mark_changed();
+    true
+}
+
 /// Compact icon button (Phosphor glyph). Always shows a real icon — never an empty square.
 pub fn icon_button(
     ui: &mut Ui,
@@ -185,6 +234,61 @@ pub fn mixer_pad_inert(ui: &mut Ui, theme: &dyn Theme, label: &str) -> egui::Res
         Vec2::new(32.0, 26.0),
         false,
     )
+}
+
+/// Track live LED — green when audible (`on`), dark when muted. Toggles `on`.
+pub fn track_on_led(ui: &mut Ui, theme: &dyn Theme, on: &mut bool) -> egui::Response {
+    let size = Vec2::new(34.0, 28.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter();
+    let lit = *on;
+    let bezel = theme.bg_well();
+    painter.rect_filled(rect, CornerRadius::same(4), bezel);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(4),
+        Stroke::new(1.0_f32, theme.border()),
+        egui::StrokeKind::Outside,
+    );
+    let inner = rect.shrink(2.5);
+    let fill = if lit {
+        theme.success().gamma_multiply(0.28)
+    } else {
+        theme.bg_elevated()
+    };
+    painter.rect_filled(inner, CornerRadius::same(3), fill);
+    // LED jewel
+    let led_c = if lit {
+        theme.success()
+    } else {
+        Color32::from_rgb(0x2a, 0x2c, 0x30)
+    };
+    let cx = inner.center().x;
+    let cy = inner.top() + 7.0;
+    painter.circle_filled(egui::pos2(cx, cy), 4.2, led_c);
+    if lit {
+        painter.circle_filled(egui::pos2(cx - 1.0, cy - 1.2), 1.4, Color32::WHITE);
+    }
+    painter.text(
+        egui::pos2(inner.center().x, inner.bottom() - 6.0),
+        egui::Align2::CENTER_CENTER,
+        if lit { "ON" } else { "OFF" },
+        egui::FontId::proportional(9.0),
+        if lit {
+            theme.success()
+        } else {
+            theme.text_muted()
+        },
+    );
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.on_hover_text(if lit {
+        "Mute track output"
+    } else {
+        "Unmute track"
+    })
 }
 
 fn mixer_pad_sized(
@@ -417,45 +521,90 @@ pub fn fader_db(
     );
     painter.rect_filled(fill, CornerRadius::same(2), theme.fader_fill());
 
-    // Metallic console thumb — light gray aluminum; accent only on the 0 dB edge.
+    // Skeuomorphic console fader cap — tall rectangle, bevel + grip grooves.
     let at_zero = value_db.abs() < 0.05;
     let above_zero = *value_db > 0.05;
-    let cap_fill = if above_zero {
-        Color32::from_rgb(0xd0, 0xb0, 0x70)
-    } else if at_zero {
-        Color32::from_rgb(0xf2, 0xf3, 0xf5)
-    } else {
-        theme.fader_cap()
-    };
-    let cap_w = (size.x * 0.85).clamp(16.0, 22.0);
-    let cap = Rect::from_center_size(egui::pos2(track.center().x, y), Vec2::new(cap_w, 9.0));
-    painter.rect_filled(cap, CornerRadius::same(2), cap_fill);
-    // Soft highlight on top edge of thumb
-    painter.hline(
-        egui::Rangef::new(cap.left() + 2.0, cap.right() - 2.0),
-        cap.top() + 1.5,
-        Stroke::new(1.0_f32, Color32::from_rgb(0xff, 0xff, 0xff).gamma_multiply(0.35)),
+    let cap_w = (size.x * 0.82).clamp(15.0, 20.0);
+    let cap_h = (cap_w * 1.45).clamp(20.0, 28.0); // taller than wide
+    let cap = Rect::from_center_size(egui::pos2(track.center().x, y), Vec2::new(cap_w, cap_h));
+    let r = CornerRadius::same(2);
+
+    // Soft drop shadow (bottom-right)
+    let shadow = cap.translate(egui::vec2(1.5, 2.0));
+    painter.rect_filled(
+        shadow,
+        r,
+        Color32::from_rgba_unmultiplied(0, 0, 0, 70),
     );
+
+    let body = if above_zero {
+        Color32::from_rgb(0xd4, 0xb4, 0x78)
+    } else if at_zero {
+        Color32::from_rgb(0xf0, 0xf1, 0xf3)
+    } else {
+        Color32::from_rgb(0xe4, 0xe6, 0xea) // pale aluminum
+    };
+    painter.rect_filled(cap, r, body);
+
+    // Bevel: top/left highlight, bottom/right shade
+    let bevel_hi =
+        Color32::from_rgba_unmultiplied(255, 255, 255, if above_zero { 70 } else { 110 });
+    let bevel_lo =
+        Color32::from_rgba_unmultiplied(40, 42, 48, if above_zero { 90 } else { 80 });
+    painter.hline(
+        egui::Rangef::new(cap.left() + 1.5, cap.right() - 1.5),
+        cap.top() + 1.0,
+        Stroke::new(1.25_f32, bevel_hi),
+    );
+    painter.vline(
+        cap.left() + 1.0,
+        egui::Rangef::new(cap.top() + 1.5, cap.bottom() - 1.5),
+        Stroke::new(1.0_f32, bevel_hi.gamma_multiply(0.85)),
+    );
+    painter.hline(
+        egui::Rangef::new(cap.left() + 1.5, cap.right() - 1.5),
+        cap.bottom() - 1.0,
+        Stroke::new(1.25_f32, bevel_lo),
+    );
+    painter.vline(
+        cap.right() - 1.0,
+        egui::Rangef::new(cap.top() + 1.5, cap.bottom() - 1.5),
+        Stroke::new(1.0_f32, bevel_lo),
+    );
+
+    // Three horizontal grip grooves across the face
+    let grip = Color32::from_rgb(0x5a, 0x5e, 0x64);
+    let grip_hi = Color32::from_rgba_unmultiplied(255, 255, 255, 45);
+    let cy = cap.center().y;
+    for dy in [-3.5_f32, 0.0, 3.5] {
+        let gy = cy + dy;
+        painter.hline(
+            egui::Rangef::new(cap.left() + 3.0, cap.right() - 3.0),
+            gy,
+            Stroke::new(1.35_f32, grip),
+        );
+        // Tiny highlight under each groove for depth
+        painter.hline(
+            egui::Rangef::new(cap.left() + 3.0, cap.right() - 3.0),
+            gy + 1.0,
+            Stroke::new(1.0_f32, grip_hi),
+        );
+    }
+
     painter.rect_stroke(
         cap,
-        CornerRadius::same(2),
+        r,
         Stroke::new(
             1.0_f32,
             if at_zero {
-                theme.accent()
+                theme.accent().gamma_multiply(0.85)
             } else if above_zero {
-                theme.warning()
+                theme.warning().gamma_multiply(0.75)
             } else {
-                Color32::from_rgb(0x6a, 0x6e, 0x74)
+                Color32::from_rgb(0x6e, 0x72, 0x78)
             },
         ),
         egui::StrokeKind::Outside,
-    );
-    // Cap grip line
-    painter.hline(
-        egui::Rangef::new(cap.left() + 3.0, cap.right() - 3.0),
-        cap.center().y,
-        Stroke::new(1.0_f32, Color32::from_rgb(0x55, 0x58, 0x5e)),
     );
 
     // Redraw 0 dB rail on top of fill so it stays visible under the trough
@@ -499,6 +648,9 @@ pub fn fader_db(
     if resp.double_clicked() {
         *value_db = 0.0;
         resp.mark_changed();
+    }
+    if apply_wheel_to_value(ui, &mut resp, value_db, lo..=hi) {
+        snap_zero(value_db);
     }
     resp
 }
@@ -655,8 +807,18 @@ pub fn tab_bar(
     tabs: &[&str],
     selected: &mut usize,
 ) {
+    let hints = [
+        "Channel strips & inserts",
+        "Apps playing audio",
+        "Apps capturing audio",
+        "Speakers & sinks",
+        "Mics & sources",
+        "Controllers & CC maps",
+        "Save / load layouts",
+        "Preferences",
+    ];
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         for (i, name) in tabs.iter().enumerate() {
             let on = *selected == i;
             let text = if on {
@@ -664,16 +826,28 @@ pub fn tab_bar(
             } else {
                 theme.text_muted()
             };
-            let resp = ui.add(
-                egui::Button::new(RichText::new(*name).size(12.0).strong().color(text))
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::NONE)
-                    .corner_radius(CornerRadius::ZERO),
-            );
+            let fill = if on {
+                Color32::from_rgba_unmultiplied(
+                    theme.accent().r(),
+                    theme.accent().g(),
+                    theme.accent().b(),
+                    28,
+                )
+            } else {
+                Color32::TRANSPARENT
+            };
+            let resp = ui
+                .add(
+                    egui::Button::new(RichText::new(*name).size(12.0).strong().color(text))
+                        .fill(fill)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(theme.rounding()),
+                )
+                .on_hover_text(hints.get(i).copied().unwrap_or(""));
             if on {
                 let r = resp.rect;
                 ui.painter().hline(
-                    egui::Rangef::new(r.left() + 2.0, r.right() - 2.0),
+                    egui::Rangef::new(r.left() + 4.0, r.right() - 4.0),
                     r.bottom() - 1.0,
                     Stroke::new(2.0_f32, theme.accent()),
                 );
@@ -698,19 +872,30 @@ pub fn h_slider(
 ) -> egui::Response {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).size(11.0).color(theme.text_dim()));
-        let resp = ui.add(egui::Slider::new(value, range).show_value(true));
+        let mut resp = ui.add(egui::Slider::new(value, range.clone()).show_value(true));
+        apply_wheel_to_value(ui, &mut resp, value, range);
         hide_cursor_on_drag(ui, &resp);
         resp
     })
     .inner
 }
 
-/// egui slider that hides the cursor while dragging.
+/// egui slider with wheel support + cursor hide while dragging.
+///
+/// ```ignore
+/// design::slider_drag(ui, &mut freq, 20.0..=20_000.0, |s| s.logarithmic(true).suffix(" Hz"));
+/// ```
 pub fn slider_drag(
     ui: &mut Ui,
-    slider: egui::Slider<'_>,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    configure: impl FnOnce(egui::Slider<'_>) -> egui::Slider<'_>,
 ) -> egui::Response {
-    let resp = ui.add(slider);
+    let mut resp = {
+        let slider = configure(egui::Slider::new(value, range.clone()));
+        ui.add(slider)
+    };
+    apply_wheel_to_value(ui, &mut resp, value, range);
     hide_cursor_on_drag(ui, &resp);
     resp
 }
@@ -766,6 +951,7 @@ pub fn knob_sized(
                 *value = (*value + delta).clamp(*range.start(), *range.end());
                 resp.mark_changed();
             }
+            apply_wheel_to_value(ui, &mut resp, value, range.clone());
             hide_cursor_on_drag(ui, &resp);
             resp
         })
@@ -796,24 +982,34 @@ fn lin_to_db_label(lin: f32) -> String {
     }
 }
 
-/// Soft-clipper transfer plot with a **fixed** 0 dB reference (does not rescale Y to gain).
-/// Drag horizontally to set Threshold.
+#[derive(Clone, Copy)]
+struct SoftclipVizState {
+    /// Input-level histogram (linear bins 0…view_in).
+    dens: [f32; 48],
+    /// Recent operating-point trail (input linear).
+    trail: [f32; 24],
+    trail_i: u8,
+    /// Smoothed input linear peak.
+    in_smooth: f32,
+    /// Peak-hold input (slower release) for GR readout.
+    in_hold: f32,
+    last_t: f64,
+}
+
+/// Soft-clipper transfer plot + live signal visualization.
+///
+/// Shows where program material sits on the knee: input density along X,
+/// a phosphor trail of recent operating points on the curve, and GR when
+/// the live peak is past threshold. Drag / scroll horizontally to set Threshold.
 pub fn softclip_transfer_plot(
     ui: &mut Ui,
     theme: &dyn Theme,
     threshold: &mut f32,
     post: f32,
+    peak_db: f32,
     size: Vec2,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x36, 0x47, 0x4f));
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(2),
-        Stroke::new(1.0_f32, Color32::from_rgb(0x4a, 0x5c, 0x66)),
-        egui::StrokeKind::Inside,
-    );
 
     // Leave room for axis labels
     let pad_l = 28.0;
@@ -830,15 +1026,91 @@ pub fn softclip_transfer_plot(
 
     let thres = threshold.clamp(0.05, 0.999);
     let post = post.clamp(0.0, 4.0);
-    // Fixed input span past 0 dBFS; Y is fixed to +6 dB (2×) unless gain is hotter.
+    // Fixed input span; Y tops out at +2 dB — hotter ceilings still clip visually at the top.
     let view_in = 1.2_f32;
-    let view_out = post.max(2.0) * 1.02; // at least 0…+6 dB so 0 dB never sits on the top edge
+    let view_out = 10f32.powf(2.0 / 20.0); // +2 dBFS
     let to_px = |x: f32, y: f32| {
         egui::pos2(
             plot.left() + (x / view_in).clamp(0.0, 1.0) * plot.width(),
             plot.bottom() - (y / view_out).clamp(0.0, 1.0) * plot.height(),
         )
     };
+
+    // ---- Live signal ballistics (peak → linear in) ----
+    let in_inst = if peak_db <= -88.0 {
+        0.0
+    } else {
+        10f32.powf(peak_db / 20.0).clamp(0.0, view_in)
+    };
+    let viz_id = ui.id().with("softclip_viz");
+    let now = ui.input(|i| i.time);
+    let mut viz = ui.ctx().data_mut(|d| {
+        d.get_temp::<SoftclipVizState>(viz_id).unwrap_or(SoftclipVizState {
+            dens: [0.0; 48],
+            trail: [0.0; 24],
+            trail_i: 0,
+            in_smooth: 0.0,
+            in_hold: 0.0,
+            last_t: now,
+        })
+    });
+    let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
+    viz.last_t = now;
+    let atk = 1.0 - (-dt * 40.0).exp();
+    let rel = 1.0 - (-dt * 6.0).exp();
+    let hold_rel = 1.0 - (-dt * 1.8).exp();
+    if in_inst > viz.in_smooth {
+        viz.in_smooth += (in_inst - viz.in_smooth) * atk;
+    } else {
+        viz.in_smooth += (in_inst - viz.in_smooth) * rel;
+    }
+    if in_inst > viz.in_hold {
+        viz.in_hold = in_inst;
+    } else {
+        viz.in_hold += (in_inst - viz.in_hold) * hold_rel;
+    }
+    // Density: bump bin under current peak, decay the rest.
+    let dens_n = viz.dens.len();
+    let decay = (-dt * 2.2).exp();
+    for b in &mut viz.dens {
+        *b *= decay;
+    }
+    if in_inst > 1e-4 {
+        let bi = ((in_inst / view_in) * (dens_n as f32 - 1e-3))
+            .clamp(0.0, (dens_n - 1) as f32) as usize;
+        viz.dens[bi] = (viz.dens[bi] + 0.55).min(1.0);
+        // Soft neighbor bleed so the ridge reads as continuous program energy.
+        if bi > 0 {
+            viz.dens[bi - 1] = (viz.dens[bi - 1] + 0.18).min(1.0);
+        }
+        if bi + 1 < dens_n {
+            viz.dens[bi + 1] = (viz.dens[bi + 1] + 0.18).min(1.0);
+        }
+    }
+    // Trail sample ~every frame while audio is present.
+    if in_inst > 1e-4 || viz.in_smooth > 0.02 {
+        let i = viz.trail_i as usize % viz.trail.len();
+        viz.trail[i] = viz.in_smooth;
+        viz.trail_i = viz.trail_i.wrapping_add(1);
+    }
+    let dens = viz.dens;
+    let trail = viz.trail;
+    let trail_i = viz.trail_i;
+    let in_smooth = viz.in_smooth;
+    let in_hold = viz.in_hold;
+    ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));
+    if in_inst > 1e-4 || dens.iter().any(|&d| d > 0.02) {
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0_f32, theme.border_soft()),
+        egui::StrokeKind::Inside,
+    );
 
     // Hot zone above 0 dBFS out
     let zero_y = to_px(0.0, 1.0).y;
@@ -847,14 +1119,30 @@ pub fn softclip_transfer_plot(
             egui::pos2(plot.left(), plot.top()),
             egui::pos2(plot.right(), zero_y),
         );
+        let d = theme.danger();
         painter.rect_filled(
             hot,
             0.0,
-            Color32::from_rgba_unmultiplied(180, 60, 40, 28),
+            Color32::from_rgba_unmultiplied(d.r(), d.g(), d.b(), 28),
         );
     }
 
-    let grid = Color32::from_rgba_unmultiplied(180, 200, 210, 40);
+    // Soft clipping region (input ≥ threshold) — subtle wash so the knee is obvious.
+    {
+        let x0 = to_px(thres, 0.0).x;
+        let wash = Rect::from_min_max(
+            egui::pos2(x0, plot.top()),
+            egui::pos2(plot.right(), plot.bottom()),
+        );
+        let a = theme.accent();
+        painter.rect_filled(
+            wash,
+            0.0,
+            Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 14),
+        );
+    }
+
+    let grid = theme.border_soft().gamma_multiply(0.9);
     for i in 0..=4 {
         let t = i as f32 / 4.0;
         let x = plot.left() + plot.width() * t;
@@ -863,8 +1151,7 @@ pub fn softclip_transfer_plot(
             Stroke::new(1.0_f32, grid),
         );
     }
-    // Horizontal grid at useful dB marks: -12, -6, 0, +6 (and +12 if in view)
-    for db in [-12.0_f32, -6.0, 0.0, 6.0, 12.0] {
+    for db in [-12.0_f32, -6.0, 0.0, 2.0] {
         let lin = 10f32.powf(db / 20.0);
         if lin > view_out * 1.001 {
             continue;
@@ -875,9 +1162,9 @@ pub fn softclip_transfer_plot(
             plot.x_range(),
             y,
             Stroke::new(
-                if is_zero { 1.5 } else { 1.0 },
+                if is_zero { 1.5_f32 } else { 1.0_f32 },
                 if is_zero {
-                    Color32::from_rgb(0xe8, 0xc4, 0x4a)
+                    theme.accent().gamma_multiply(0.85)
                 } else {
                     grid
                 },
@@ -893,42 +1180,70 @@ pub fn softclip_transfer_plot(
             },
             egui::FontId::proportional(9.0),
             if is_zero {
-                Color32::from_rgb(0xe8, 0xc4, 0x4a)
+                theme.accent()
             } else {
                 theme.text_muted()
             },
         );
     }
 
-    // 0 dBFS input
+    // 0 dBFS input rail
     let zero_x = to_px(1.0, 0.0).x;
     painter.vline(
         zero_x,
         plot.y_range(),
-        Stroke::new(1.5_f32, Color32::from_rgb(0xe8, 0xc4, 0x4a)),
+        Stroke::new(1.5_f32, theme.accent().gamma_multiply(0.85)),
     );
 
-    // Ceiling (post × full-scale clipped output)
-    let ceil = post;
-    if ceil > 1e-4 {
-        let cy = to_px(0.0, ceil.min(view_out)).y;
+    // Ceiling (post makeup)
+    if post > 1e-4 {
+        let cy = to_px(0.0, post.min(view_out)).y;
         painter.hline(
             plot.x_range(),
             cy,
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(240, 240, 245, 90)),
+            Stroke::new(1.0_f32, theme.text().gamma_multiply(0.35)),
         );
     }
 
-    // Unity reference (y = x) below threshold region, faint
+    // Unity reference (y = x)
     {
         let a = to_px(0.0, 0.0);
         let b = to_px(1.0_f32.min(view_in), 1.0_f32.min(view_out));
         painter.line_segment(
             [a, b],
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(160, 180, 190, 55)),
+            Stroke::new(1.0_f32, theme.text_muted().gamma_multiply(0.55)),
         );
     }
 
+    // ---- Input density “ridge” under the curve (where audio lives) ----
+    let dens_max = dens.iter().copied().fold(0.0_f32, f32::max).max(0.08);
+    let a = theme.accent();
+    let bin_w = plot.width() / dens_n as f32;
+    for (i, &d) in dens.iter().enumerate() {
+        if d < 0.02 {
+            continue;
+        }
+        let t = d / dens_max;
+        let x0 = plot.left() + i as f32 * bin_w;
+        let h = plot.height() * 0.22 * t;
+        let bar = Rect::from_min_max(
+            egui::pos2(x0 + 0.5, plot.bottom() - h),
+            egui::pos2(x0 + bin_w - 0.5, plot.bottom()),
+        );
+        let past_knee = (i as f32 + 0.5) / dens_n as f32 * view_in >= thres;
+        let col = if past_knee {
+            theme.meter_orange()
+        } else {
+            a
+        };
+        painter.rect_filled(
+            bar,
+            CornerRadius::same(1),
+            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (40.0 + t * 110.0) as u8),
+        );
+    }
+
+    // Transfer curve
     let mut pts = Vec::with_capacity(97);
     for i in 0..=96 {
         let x = view_in * (i as f32 / 96.0);
@@ -938,17 +1253,104 @@ pub fn softclip_transfer_plot(
     for w in pts.windows(2) {
         let above = w[0].1 > 1.0 || w[1].1 > 1.0;
         let col = if above {
-            Color32::from_rgb(0xf0, 0x8a, 0x6a) // hot when above 0 dBFS out
+            theme.meter_orange()
         } else {
-            Color32::from_rgb(0xf2, 0xf5, 0xf7)
+            theme.text()
         };
         painter.line_segment([w[0].2, w[1].2], Stroke::new(2.4_f32, col));
     }
 
     let knee = to_px(thres, softclip_xfer(thres, thres, post).clamp(0.0, view_out));
-    painter.circle_filled(knee, 3.2, Color32::from_rgb(0xe8, 0xec, 0xf0));
+    painter.circle_filled(knee, 3.2, theme.accent());
+    painter.circle_stroke(knee, 3.2, Stroke::new(1.0_f32, theme.border()));
 
-    // Axis captions + gain readout
+    // ---- Phosphor trail of recent operating points on the curve ----
+    let n_trail = trail.len();
+    for k in 0..n_trail {
+        // Oldest → newest
+        let age = n_trail - 1 - k;
+        let idx = trail_i.wrapping_sub(1).wrapping_sub(age as u8) as usize % n_trail;
+        let xin = trail[idx];
+        if xin < 1e-4 {
+            continue;
+        }
+        let yout = softclip_xfer(xin, thres, post);
+        let p = to_px(xin, yout.clamp(0.0, view_out));
+        let fade = (k as f32 / (n_trail as f32 - 1.0)).clamp(0.0, 1.0);
+        let alpha = (18.0 + fade * 140.0) as u8;
+        let r = 1.4 + fade * 2.2;
+        let col = if xin >= thres {
+            theme.meter_orange()
+        } else {
+            a
+        };
+        painter.circle_filled(
+            p,
+            r,
+            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha),
+        );
+    }
+
+    // ---- Live operating point + GR readout ----
+    if in_hold > 1e-4 {
+        let xin = in_smooth.max(in_hold * 0.85);
+        let y_unity = xin; // pre-curve (pre-post would be xin; post applied in xfer)
+        let y_out = softclip_xfer(xin, thres, post);
+        let p_op = to_px(xin, y_out.clamp(0.0, view_out));
+        let p_unity = to_px(xin, y_unity.clamp(0.0, view_out));
+
+        // Vertical probe at current input
+        painter.vline(
+            p_op.x,
+            plot.y_range(),
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 55),
+            ),
+        );
+
+        // GR: gap between unity path and clipped path (pre-makeup comparison).
+        let y_curve_pre = softclip_xfer(xin, thres, 1.0);
+        let gr_db = if xin > 1e-6 && y_curve_pre > 1e-6 {
+            20.0 * (y_curve_pre / xin).log10()
+        } else {
+            0.0
+        };
+        if xin > thres && gr_db < -0.05 {
+            // Shade GR between unity and curve at this X
+            let top = p_unity.y.min(p_op.y);
+            let bot = p_unity.y.max(p_op.y);
+            let gr_rect = Rect::from_min_max(
+                egui::pos2(p_op.x - 3.0, top),
+                egui::pos2(p_op.x + 3.0, bot),
+            );
+            let o = theme.meter_orange();
+            painter.rect_filled(
+                gr_rect,
+                CornerRadius::same(1),
+                Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 90),
+            );
+            painter.text(
+                egui::pos2(p_op.x + 6.0, (top + bot) * 0.5),
+                egui::Align2::LEFT_CENTER,
+                format!("{gr_db:.1} dB"),
+                egui::FontId::proportional(10.0),
+                theme.meter_orange(),
+            );
+        }
+
+        // Operating-point jewel
+        let op_col = if xin >= thres {
+            theme.meter_orange()
+        } else {
+            theme.success()
+        };
+        painter.circle_filled(p_op, 5.0, op_col);
+        painter.circle_filled(p_op, 2.0, Color32::WHITE);
+        painter.circle_stroke(p_op, 5.0, Stroke::new(1.0_f32, theme.border()));
+    }
+
+    // Axis captions + readouts
     painter.text(
         egui::pos2(plot.center().x, rect.bottom() - 2.0),
         egui::Align2::CENTER_BOTTOM,
@@ -961,15 +1363,15 @@ pub fn softclip_transfer_plot(
         egui::Align2::CENTER_BOTTOM,
         "0dB",
         egui::FontId::proportional(9.0),
-        Color32::from_rgb(0xe8, 0xc4, 0x4a),
+        theme.accent(),
     );
     let gain_txt = format!("ceil {}", lin_to_db_label(post.max(1e-6)));
     let gain_col = if post > 1.001 {
-        Color32::from_rgb(0xf0, 0x8a, 0x6a)
+        theme.meter_orange()
     } else if post < 0.999 {
         theme.text_dim()
     } else {
-        Color32::from_rgb(0xe8, 0xc4, 0x4a)
+        theme.accent()
     };
     painter.text(
         egui::pos2(plot.right() - 2.0, rect.top() + 2.0),
@@ -978,8 +1380,18 @@ pub fn softclip_transfer_plot(
         egui::FontId::proportional(10.0),
         gain_col,
     );
+    if in_hold > 1e-4 {
+        painter.text(
+            egui::pos2(plot.left() + 4.0, rect.top() + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("in {}", lin_to_db_label(in_hold)),
+            egui::FontId::proportional(10.0),
+            theme.text_dim(),
+        );
+    }
 
     let mut changed = false;
+    let mut resp = resp;
     if resp.dragged() || resp.clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
             let nx = ((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
@@ -990,47 +1402,626 @@ pub fn softclip_transfer_plot(
             }
         }
     }
+    if apply_wheel_to_value(ui, &mut resp, threshold, 0.05..=0.999) {
+        changed = true;
+    }
     hide_cursor_on_drag(ui, &resp);
-    let _ = theme;
     changed
 }
 
-/// Narrow stereo output meters (FL Soft Clipper center strip).
-pub fn softclip_meters(ui: &mut Ui, level_db: f32, size: Vec2) {
+/* ---- Theatre Drive waveshaper viz (matches buschain_builtins od_shape) ---- */
+
+fn od_shape(x: f32, character: i32) -> f32 {
+    match character {
+        1 => (x * 0.85).tanh() * 1.08, // Soft
+        2 => {
+            // Hard
+            let a = x.abs();
+            let y = if a < 1.0 {
+                a - a * a * a / 3.0
+            } else {
+                0.666_666_7
+            };
+            y.copysign(x) * 1.15
+        }
+        3 => {
+            // Diode (asymmetric)
+            let pos = if x >= 0.0 {
+                1.0 - (-x * 1.4).exp()
+            } else {
+                0.0
+            };
+            let neg = if x < 0.0 {
+                -(0.65 * (1.0 - (x * 1.8).exp()))
+            } else {
+                0.0
+            };
+            (pos + neg) * 1.2
+        }
+        _ => {
+            // Tube
+            let y = x.tanh();
+            y + 0.04 * y * y * y
+        }
+    }
+}
+
+fn od_xfer(x: f32, drive: f32, boost: bool, bias: f32, character: i32, postg: f32) -> f32 {
+    let mut gain = 1.0 + drive * drive * 36.0;
+    if boost {
+        gain *= 10.0;
+    }
+    let bias_amt = bias * 0.22;
+    let makeup = postg * (1.15 / (0.35 + drive * 0.9 + if boost { 0.8 } else { 0.0 }));
+    od_shape(x * gain + bias_amt, character) * makeup
+}
+
+#[derive(Clone, Copy)]
+struct DriveVizState {
+    dens: [f32; 40],
+    trail: [f32; 28],
+    trail_i: u8,
+    in_smooth: f32,
+    in_hold: f32,
+    last_t: f64,
+}
+
+/// Theatre Drive transfer plot — bipolar waveshaper with live density / phosphor trail / GR.
+pub fn theatre_drive_plot(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    drive: f32,
+    boost: bool,
+    bias: f32,
+    character: i32,
+    postg: f32,
+    peak_db: f32,
+    size: Vec2,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let pad_l = 26.0;
+    let pad_b = 14.0;
+    let pad_t = 14.0;
+    let pad_r = 6.0;
+    let plot = Rect::from_min_max(
+        egui::pos2(rect.left() + pad_l, rect.top() + pad_t),
+        egui::pos2(rect.right() - pad_r, rect.bottom() - pad_b),
+    );
+    if plot.width() < 8.0 || plot.height() < 8.0 {
+        return;
+    }
+
+    let drive = drive.clamp(0.0, 1.0);
+    let bias = bias.clamp(-1.0, 1.0);
+    let postg = postg.clamp(0.0, 1.0);
+    let character = character.clamp(0, 3);
+    let view = 1.35_f32; // ±view on both axes
+
+    let to_px = |x: f32, y: f32| {
+        egui::pos2(
+            plot.left() + ((x / view) * 0.5 + 0.5).clamp(0.0, 1.0) * plot.width(),
+            plot.bottom() - ((y / view) * 0.5 + 0.5).clamp(0.0, 1.0) * plot.height(),
+        )
+    };
+
+    let in_inst = if peak_db <= -88.0 {
+        0.0
+    } else {
+        10f32.powf(peak_db / 20.0).clamp(0.0, view)
+    };
+    let viz_id = ui.id().with("theatre_drive_viz");
+    let now = ui.input(|i| i.time);
+    let mut viz = ui.ctx().data_mut(|d| {
+        d.get_temp::<DriveVizState>(viz_id).unwrap_or(DriveVizState {
+            dens: [0.0; 40],
+            trail: [0.0; 28],
+            trail_i: 0,
+            in_smooth: 0.0,
+            in_hold: 0.0,
+            last_t: now,
+        })
+    });
+    let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
+    viz.last_t = now;
+    let atk = 1.0 - (-dt * 40.0).exp();
+    let rel = 1.0 - (-dt * 6.0).exp();
+    let hold_rel = 1.0 - (-dt * 1.8).exp();
+    if in_inst > viz.in_smooth {
+        viz.in_smooth += (in_inst - viz.in_smooth) * atk;
+    } else {
+        viz.in_smooth += (in_inst - viz.in_smooth) * rel;
+    }
+    if in_inst > viz.in_hold {
+        viz.in_hold = in_inst;
+    } else {
+        viz.in_hold += (in_inst - viz.in_hold) * hold_rel;
+    }
+    let dens_n = viz.dens.len();
+    let decay = (-dt * 2.2).exp();
+    for b in &mut viz.dens {
+        *b *= decay;
+    }
+    if in_inst > 1e-4 {
+        let bi = ((in_inst / view) * (dens_n as f32 - 1e-3))
+            .clamp(0.0, (dens_n - 1) as f32) as usize;
+        viz.dens[bi] = (viz.dens[bi] + 0.55).min(1.0);
+        if bi > 0 {
+            viz.dens[bi - 1] = (viz.dens[bi - 1] + 0.18).min(1.0);
+        }
+        if bi + 1 < dens_n {
+            viz.dens[bi + 1] = (viz.dens[bi + 1] + 0.18).min(1.0);
+        }
+    }
+    if in_inst > 1e-4 || viz.in_smooth > 0.02 {
+        let i = viz.trail_i as usize % viz.trail.len();
+        viz.trail[i] = viz.in_smooth;
+        viz.trail_i = viz.trail_i.wrapping_add(1);
+    }
+    let dens = viz.dens;
+    let trail = viz.trail;
+    let trail_i = viz.trail_i;
+    let in_smooth = viz.in_smooth;
+    let in_hold = viz.in_hold;
+    ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));
+    if in_inst > 1e-4 || dens.iter().any(|&d| d > 0.02) {
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0_f32, theme.border_soft()),
+        egui::StrokeKind::Inside,
+    );
+
+    let a = theme.accent();
+    let o = theme.meter_orange();
+    let grid = theme.border_soft().gamma_multiply(0.9);
+
+    // Soft saturation wash outside ±1 (hard clip territory for some chars)
+    {
+        let p_lo = to_px(-1.0, -view);
+        let p_hi = to_px(1.0, view);
+        let left = Rect::from_min_max(
+            egui::pos2(plot.left(), plot.top()),
+            egui::pos2(p_lo.x, plot.bottom()),
+        );
+        let right = Rect::from_min_max(
+            egui::pos2(p_hi.x, plot.top()),
+            egui::pos2(plot.right(), plot.bottom()),
+        );
+        let wash = Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 16);
+        painter.rect_filled(left, 0.0, wash);
+        painter.rect_filled(right, 0.0, wash);
+    }
+
+    // Grid + axes through origin
+    let origin = to_px(0.0, 0.0);
+    for v in [-1.0_f32, -0.5, 0.5, 1.0] {
+        let p = to_px(v, 0.0);
+        painter.vline(p.x, plot.y_range(), Stroke::new(1.0_f32, grid));
+        let q = to_px(0.0, v);
+        painter.hline(plot.x_range(), q.y, Stroke::new(1.0_f32, grid));
+    }
+    painter.vline(
+        origin.x,
+        plot.y_range(),
+        Stroke::new(1.25_f32, a.gamma_multiply(0.7)),
+    );
+    painter.hline(
+        plot.x_range(),
+        origin.y,
+        Stroke::new(1.25_f32, a.gamma_multiply(0.7)),
+    );
+
+    // Unity diagonal
+    painter.line_segment(
+        [to_px(-view, -view), to_px(view, view)],
+        Stroke::new(1.0_f32, theme.text_muted().gamma_multiply(0.5)),
+    );
+
+    // Input |x| density as mirrored bars from the X axis (energy at each magnitude)
+    let dens_max = dens.iter().copied().fold(0.0_f32, f32::max).max(0.08);
+    let bin_w = (plot.width() * 0.5) / dens_n as f32;
+    for (i, &d) in dens.iter().enumerate() {
+        if d < 0.02 {
+            continue;
+        }
+        let t = d / dens_max;
+        let xin = (i as f32 + 0.5) / dens_n as f32 * view;
+        let h = plot.height() * 0.14 * t;
+        for sign in [-1.0_f32, 1.0] {
+            let cx = to_px(xin * sign, 0.0).x;
+            let bar = Rect::from_min_max(
+                egui::pos2(cx - bin_w * 0.4, origin.y - h * 0.15),
+                egui::pos2(cx + bin_w * 0.4, origin.y + h),
+            );
+            // Color by how hard the shaper hits at this level
+            let y_drive = od_xfer(xin, drive, boost, bias, character, postg).abs();
+            let hot = y_drive < xin * 0.92; // compressing vs unity
+            let col = if hot { o } else { a };
+            painter.rect_filled(
+                bar,
+                CornerRadius::same(1),
+                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (36.0 + t * 100.0) as u8),
+            );
+        }
+    }
+
+    // Waveshaper curve
+    let mut pts = Vec::with_capacity(129);
+    for i in 0..=128 {
+        let x = -view + (2.0 * view) * (i as f32 / 128.0);
+        let y = od_xfer(x, drive, boost, bias, character, postg);
+        pts.push(to_px(x, y.clamp(-view, view)));
+    }
+    for w in pts.windows(2) {
+        painter.line_segment([w[0], w[1]], Stroke::new(2.35_f32, theme.text()));
+    }
+
+    // Phosphor trail (±peaks on the curve)
+    let n_trail = trail.len();
+    for k in 0..n_trail {
+        let age = n_trail - 1 - k;
+        let idx = trail_i.wrapping_sub(1).wrapping_sub(age as u8) as usize % n_trail;
+        let xin = trail[idx];
+        if xin < 1e-4 {
+            continue;
+        }
+        let fade = (k as f32 / (n_trail as f32 - 1.0)).clamp(0.0, 1.0);
+        let alpha = (16.0 + fade * 130.0) as u8;
+        let r = 1.3 + fade * 2.0;
+        for sign in [-1.0_f32, 1.0] {
+            let x = xin * sign;
+            let y = od_xfer(x, drive, boost, bias, character, postg);
+            let p = to_px(x, y.clamp(-view, view));
+            let hot = y.abs() < xin * 0.92;
+            let col = if hot { o } else { a };
+            painter.circle_filled(
+                p,
+                r,
+                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha),
+            );
+        }
+    }
+
+    // Live operating points (±)
+    if in_hold > 1e-4 {
+        let xin = in_smooth.max(in_hold * 0.85);
+        for sign in [-1.0_f32, 1.0] {
+            let x = xin * sign;
+            let y = od_xfer(x, drive, boost, bias, character, postg);
+            let p = to_px(x, y.clamp(-view, view));
+            let p_u = to_px(x, x.clamp(-view, view));
+            painter.vline(
+                p.x,
+                plot.y_range(),
+                Stroke::new(
+                    1.0_f32,
+                    Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 40),
+                ),
+            );
+            // Harmonic “squash” marker when |out| < |in| (pre-makeup-ish via unity compare)
+            if y.abs() + 1e-4 < xin {
+                let top = p.y.min(p_u.y);
+                let bot = p.y.max(p_u.y);
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        egui::pos2(p.x - 2.5, top),
+                        egui::pos2(p.x + 2.5, bot),
+                    ),
+                    CornerRadius::same(1),
+                    Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 85),
+                );
+            }
+            let op_col = if y.abs() < xin * 0.92 {
+                o
+            } else {
+                theme.success()
+            };
+            painter.circle_filled(p, 4.5, op_col);
+            painter.circle_filled(p, 1.8, Color32::WHITE);
+            painter.circle_stroke(p, 4.5, Stroke::new(1.0_f32, theme.border()));
+        }
+        let y_pos = od_xfer(xin, drive, boost, bias, character, postg);
+        let squash_db = if xin > 1e-6 {
+            20.0 * (y_pos.abs() / xin).log10()
+        } else {
+            0.0
+        };
+        if squash_db < -0.15 {
+            painter.text(
+                egui::pos2(plot.right() - 4.0, plot.top() + 14.0),
+                egui::Align2::RIGHT_TOP,
+                format!("sat {squash_db:.1} dB"),
+                egui::FontId::proportional(10.0),
+                o,
+            );
+        }
+    }
+
+    let char_name = ["Tube", "Soft", "Hard", "Diode"]
+        .get(character as usize)
+        .copied()
+        .unwrap_or("?");
+    painter.text(
+        egui::pos2(plot.left() + 4.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        if in_hold > 1e-4 {
+            format!("in {} · {char_name}", lin_to_db_label(in_hold))
+        } else {
+            char_name.into()
+        },
+        egui::FontId::proportional(10.0),
+        theme.text_dim(),
+    );
+    painter.text(
+        egui::pos2(plot.right() - 2.0, rect.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        if boost { "×10" } else { "drive" },
+        egui::FontId::proportional(10.0),
+        if boost { o } else { a },
+    );
+    painter.text(
+        egui::pos2(plot.center().x, rect.bottom() - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        "in ↔ out",
+        egui::FontId::proportional(9.0),
+        theme.text_muted(),
+    );
+}
+
+/// BusChain in-house plugin shell — compact chrome, minimal name (no meter header bar).
+pub fn inhouse_shell(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    title: &str,
+    tagline: &str,
+    peak_db: f32,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let _ = peak_db;
+    inhouse_shell_ex(ui, theme, title, tagline, peak_db, false, add_contents);
+}
+
+/// Same as [`inhouse_shell`]. `header_meters` is ignored — keep the name row minimal.
+pub fn inhouse_shell_ex(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    title: &str,
+    tagline: &str,
+    peak_db: f32,
+    _header_meters: bool,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let _ = peak_db;
+    Frame::NONE
+        .fill(theme.bg_elevated())
+        .stroke(Stroke::new(1.0_f32, theme.border_soft()))
+        .corner_radius(theme.rounding())
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            // Size to content — do NOT stretch to the window width (avoids right padding).
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .size(11.0)
+                        .strong()
+                        .color(theme.accent()),
+                );
+                if !tagline.is_empty() {
+                    ui.label(
+                        RichText::new(tagline)
+                            .size(9.0)
+                            .color(theme.text_muted()),
+                    );
+                }
+            });
+            add_contents(ui);
+        });
+}
+
+/// Page chrome for misc tabs (Playback / IO / MIDI / Settings).
+pub fn page_header(ui: &mut Ui, theme: &dyn Theme, title: &str, blurb: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(title)
+                .size(14.0)
+                .strong()
+                .color(theme.text()),
+        );
+    });
+    if !blurb.is_empty() {
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(blurb)
+                .size(11.0)
+                .color(theme.text_muted()),
+        );
+    }
+    ui.add_space(8.0);
+    let w = ui.available_width();
+    let (div, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
+    ui.painter().hline(
+        div.x_range(),
+        div.center().y,
+        Stroke::new(1.0_f32, theme.border_soft()),
+    );
+    ui.add_space(10.0);
+}
+
+/// Title strip with live stereo meters (shared by all BusChain builtins).
+pub fn inhouse_title_row(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    title: &str,
+    tagline: &str,
+    peak_db: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(title)
+                    .size(12.0)
+                    .strong()
+                    .color(theme.accent()),
+            );
+            if !tagline.is_empty() {
+                ui.label(
+                    RichText::new(tagline)
+                        .size(9.0)
+                        .color(theme.text_muted()),
+                );
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            plugin_stereo_meters(
+                ui,
+                theme,
+                peak_db,
+                Vec2::new(26.0, 44.0),
+                ("inhouse_hdr", title),
+            );
+            ui.add_space(4.0);
+            let txt = if peak_db <= -89.0 {
+                "— dB".into()
+            } else {
+                format!("{peak_db:+.0} dB")
+            };
+            ui.label(
+                RichText::new(txt)
+                    .size(10.0)
+                    .monospace()
+                    .color(if peak_db > -0.5 {
+                        theme.meter_red()
+                    } else if peak_db > -6.0 {
+                        theme.meter_orange()
+                    } else {
+                        theme.text_dim()
+                    }),
+            );
+        });
+    });
+}
+
+/// Narrow stereo peak meters for in-house plugin chrome.
+pub fn plugin_stereo_meters(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    level_db: f32,
+    size: Vec2,
+    id_salt: impl std::hash::Hash,
+) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x22, 0x26, 0x2a));
+    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0_f32, theme.border_soft()),
+        egui::StrokeKind::Inside,
+    );
 
-    let green = Color32::from_rgb(0x95, 0xd6, 0x4a);
-    let peak_col = Color32::from_rgb(0xc4, 0x8a, 0x3a);
     let min_db = -48.0_f32;
     let max_db = 6.0_f32;
-    let t = ((level_db.clamp(min_db, max_db) - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
+    let span = max_db - min_db;
+    let zero_t = ((0.0 - min_db) / span).clamp(0.0, 1.0);
+    let t = ((level_db.clamp(min_db, max_db) - min_db) / span).clamp(0.0, 1.0);
     let gap = 3.0;
-    let bar_w = ((rect.width() - gap) * 0.5).max(3.0);
+    let bar_w = ((rect.width() - gap - 4.0) * 0.5).max(3.0);
+
+    // Peak-hold state (shared for both bars — mono display of bus peak).
+    let hold_id = ui.id().with("plugin_stereo_hold").with(id_salt);
+    let now = ui.input(|i| i.time);
+    let hold_t = {
+        let mut hold = ui.ctx().data_mut(|d| {
+            d.get_temp::<MeterPeakHold>(hold_id).unwrap_or(MeterPeakHold {
+                db: min_db,
+                held_until: 0.0,
+                last_t: now,
+            })
+        });
+        let dt = (now - hold.last_t).clamp(0.0, 0.1) as f32;
+        hold.last_t = now;
+        let db = level_db.clamp(min_db, max_db);
+        if db >= hold.db - 0.05 {
+            hold.db = db.max(hold.db);
+            hold.held_until = now + 1.4;
+        } else if now >= hold.held_until {
+            hold.db = (hold.db - 18.0 * dt).max(db);
+        }
+        let ht = ((hold.db - min_db) / span).clamp(0.0, 1.0);
+        ui.ctx().data_mut(|d| d.insert_temp(hold_id, hold));
+        ht
+    };
+
     for i in 0..2 {
         let x0 = rect.left() + 2.0 + i as f32 * (bar_w + gap);
         let well = Rect::from_min_max(
             egui::pos2(x0, rect.top() + 3.0),
             egui::pos2(x0 + bar_w, rect.bottom() - 3.0),
         );
-        painter.rect_filled(well, CornerRadius::same(1), Color32::from_rgb(0x18, 0x1c, 0x20));
-        let fill_h = well.height() * t;
-        let fill = Rect::from_min_max(
-            egui::pos2(well.left(), well.bottom() - fill_h),
-            egui::pos2(well.right(), well.bottom()),
-        );
-        if fill_h > 0.5 {
-            painter.rect_filled(fill, CornerRadius::same(1), green);
+        painter.rect_filled(well, CornerRadius::same(1), theme.bg_app());
+
+        if t > 0.01 {
+            const SLICES: i32 = 32;
+            let fill_h = well.height() * t;
+            let slice_h = fill_h / SLICES as f32;
+            for s in 0..SLICES {
+                let y1 = well.bottom() - (s as f32 + 1.0) * slice_h;
+                let yb = well.bottom() - s as f32 * slice_h;
+                let y_mid = (yb + y1) * 0.5;
+                let pos = ((well.bottom() - y_mid) / well.height()).clamp(0.0, 1.0);
+                let color = if pos >= zero_t {
+                    theme.meter_red()
+                } else {
+                    let u = (pos / zero_t.max(0.001)).clamp(0.0, 1.0);
+                    if u < 0.55 {
+                        lerp_color(theme.meter_green(), theme.meter_yellow(), u / 0.55)
+                    } else {
+                        lerp_color(
+                            theme.meter_yellow(),
+                            theme.meter_orange(),
+                            ((u - 0.55) / 0.45).clamp(0.0, 1.0),
+                        )
+                    }
+                };
+                let band = Rect::from_min_max(
+                    egui::pos2(well.left(), y1.max(well.bottom() - fill_h)),
+                    egui::pos2(well.right(), yb),
+                );
+                if band.height() > 0.2 {
+                    painter.rect_filled(band, CornerRadius::ZERO, color);
+                }
+            }
         }
-        // Peak tick
-        let py = well.bottom() - fill_h;
+
+        let py = well.bottom() - well.height() * hold_t;
         painter.hline(
             egui::Rangef::new(well.left(), well.right()),
             py,
-            Stroke::new(1.5_f32, peak_col),
+            Stroke::new(1.5_f32, theme.meter_peak_hold()),
+        );
+        // 0 dBFS tick
+        let zy = well.bottom() - well.height() * zero_t;
+        painter.hline(
+            egui::Rangef::new(well.left(), well.right()),
+            zy,
+            Stroke::new(1.0_f32, theme.accent().gamma_multiply(0.45)),
         );
     }
+
+    if level_db > -85.0 {
+        ui.ctx().request_repaint();
+    }
+}
+
+/// Narrow stereo output meters (legacy name — themed BusChain chrome).
+pub fn softclip_meters(ui: &mut Ui, theme: &dyn Theme, level_db: f32, size: Vec2) {
+    plugin_stereo_meters(ui, theme, level_db, size, "softclip_meters");
 }
 
 /// Band markers — muted champagne / steel (BusChain console, not neon FL).
@@ -1147,8 +2138,699 @@ fn peq_mag_db_at(bands: &[PeqBand], out_gain_db: f32, freq_hz: f32, sr: f32) -> 
     20.0 * mag.log10() + out_gain_db
 }
 
+#[derive(Clone, Copy)]
+struct PeakSpectrumState {
+    bins: [f32; 48],
+    last_t: f64,
+}
+
+/// Peak-driven spectrum bars (smooth ballistics, static pink-ish shape — no watery wobble).
+/// Top of `plot` = 0 dBFS, bottom ≈ −60 dB.
+fn paint_peak_spectrum(
+    ui: &mut Ui,
+    plot: Rect,
+    theme: &dyn Theme,
+    peak_db: f32,
+    f_min: f32,
+    f_max: f32,
+    id_salt: impl std::hash::Hash,
+) {
+    const N: usize = 48;
+    let spec_id = ui.id().with(("peak_spectrum", id_salt));
+    let now = ui.input(|i| i.time);
+    let energy = if peak_db <= -88.0 {
+        0.0
+    } else {
+        // Map −60..0 dB → 0..1
+        ((peak_db + 60.0) / 60.0).clamp(0.0, 1.2)
+    };
+    let mut state = ui.ctx().data_mut(|d| {
+        d.get_temp::<PeakSpectrumState>(spec_id)
+            .unwrap_or(PeakSpectrumState {
+                bins: [0.0; N],
+                last_t: now,
+            })
+    });
+    let dt = (now - state.last_t).clamp(0.0, 0.08) as f32;
+    state.last_t = now;
+    let attack = 1.0 - (-dt * 28.0).exp();
+    let release = 1.0 - (-dt * 5.5).exp();
+
+    for i in 0..N {
+        let t = i as f32 / (N - 1) as f32;
+        let f = (f_min.ln() + t * (f_max.ln() - f_min.ln())).exp();
+        // Static pink-ish contour (no time-varying wobble).
+        let tilt = ((180.0 / f).sqrt() * (f / 10_000.0).sqrt().clamp(0.4, 1.0)).clamp(0.25, 1.5);
+        let hash = (((i as u32).wrapping_mul(2654435761)) >> 17) as f32 / 32767.0;
+        let target = (energy * tilt * (0.82 + 0.18 * hash)).clamp(0.0, 1.0);
+        let cur = state.bins[i];
+        let coeff = if target > cur { attack } else { release };
+        state.bins[i] = cur + (target - cur) * coeff;
+    }
+    let bins = state.bins;
+    ui.ctx().data_mut(|d| d.insert_temp(spec_id, state));
+
+    let a = theme.accent();
+    let bar_w = (plot.width() / N as f32).max(1.0);
+    let painter = ui.painter();
+    for (i, &bin) in bins.iter().enumerate() {
+        if bin < 0.008 {
+            continue;
+        }
+        let t = i as f32 / (N - 1) as f32;
+        let x = plot.left() + t * plot.width();
+        let h = plot.height() * bin;
+        let bar = Rect::from_min_max(
+            egui::pos2(x - bar_w * 0.36, plot.bottom() - h),
+            egui::pos2(x + bar_w * 0.36, plot.bottom()),
+        );
+        let alpha = (55.0 + bin * 120.0).clamp(40.0, 175.0) as u8;
+        painter.rect_filled(
+            bar,
+            CornerRadius::same(1),
+            Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), alpha),
+        );
+    }
+    if energy > 0.02 {
+        ui.ctx().request_repaint();
+    }
+}
+
+/* ---- Denoiser parametric NR (bell nodes → 6-band filterbank) ---- */
+
+/// One surgical NR bell — depth at `freq`, width from `q` (higher = pinchier).
+#[derive(Clone, Copy, Debug)]
+pub struct NrNode {
+    pub on: bool,
+    pub freq: f32,
+    pub depth_db: f32,
+    pub q: f32,
+}
+
+pub const DN_NR_MAX_NODES: usize = 8;
+/// Filterbank analysis centers — NR curve is sampled here for the DSP.
+pub const DN_ANALYSIS_HZ: [f32; 6] = [120.0, 240.0, 600.0, 1580.0, 3000.0, 12000.0];
+
+/// Log-frequency Gaussian bell depth at `f` (sum of enabled nodes).
+pub fn nr_bell_depth_at(nodes: &[NrNode], f: f32) -> f32 {
+    let f = f.max(20.0);
+    let mut d = 0.0_f32;
+    for n in nodes {
+        if !n.on || n.depth_db <= 0.05 {
+            continue;
+        }
+        let q = n.q.clamp(0.3, 12.0);
+        let x = (f.ln() - n.freq.max(20.0).ln()) * q;
+        d += n.depth_db * (-0.5 * x * x).exp();
+    }
+    d.clamp(0.0, 48.0)
+}
+
+/// Map parametric NR bells onto the 6 DSP band ranges/centers.
+/// Active nodes become band centers (so you can park on a hiss tone);
+/// empty bands stay at 0 dB pull so nature content isn't expanded for free.
+/// Low-Q (wide) bells still bleed onto nearby band centers via sampling.
+pub fn nr_nodes_to_bands(nodes: &[NrNode]) -> ([f32; 6], [f32; 6]) {
+    let mut active: Vec<NrNode> = nodes
+        .iter()
+        .copied()
+        .filter(|n| n.on && n.depth_db > 0.05)
+        .collect();
+    active.sort_by(|a, b| {
+        b.depth_db
+            .partial_cmp(&a.depth_db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if active.len() > 6 {
+        active.truncate(6);
+    }
+    active.sort_by(|a, b| {
+        a.freq
+            .partial_cmp(&b.freq)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut freqs = DN_ANALYSIS_HZ;
+    let mut ranges = [0.0_f32; 6];
+    for (i, n) in active.iter().enumerate() {
+        freqs[i] = n.freq.clamp(20.0, 20_000.0);
+        ranges[i] = n.depth_db.clamp(0.0, 48.0);
+    }
+    if active.len() < 6 {
+        let mut fillers: Vec<f32> = DN_ANALYSIS_HZ.to_vec();
+        for n in &active {
+            if let Some((idx, _)) = fillers.iter().enumerate().min_by(|(_, a), (_, b)| {
+                let da = (a.ln() - n.freq.max(20.0).ln()).abs();
+                let db = (b.ln() - n.freq.max(20.0).ln()).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                fillers.remove(idx);
+            }
+        }
+        for (j, i) in (active.len()..6).enumerate() {
+            if let Some(&f) = fillers.get(j) {
+                freqs[i] = f;
+            }
+            ranges[i] = 0.0;
+        }
+    }
+    for i in 0..6 {
+        ranges[i] = ranges[i].max(nr_bell_depth_at(nodes, freqs[i]));
+    }
+    (ranges, freqs)
+}
+
+const DN_SPEC_BINS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct HiResSpecState {
+    bins: [f32; DN_SPEC_BINS],
+    norm_hold: f32,
+    last_t: f64,
+}
+
+/// Peak-norm spectrum as discrete frequency buckets (no waves / fills / shimmer).
+/// Light bars = in (pre), darker bars = out (NR preview). Lower plot band only.
+fn paint_dual_peak_norm(
+    ui: &mut Ui,
+    plot: Rect,
+    _theme: &dyn Theme,
+    in_peak_db: f32,
+    out_peak_db: f32,
+    nodes: &[NrNode],
+    f_min: f32,
+    f_max: f32,
+) {
+    const NS: usize = DN_SPEC_BINS;
+    const SPEC_H: f32 = 0.55;
+    let spec_id = ui.id().with("denoiser_raw_buckets_v4");
+    let now = ui.input(|i| i.time);
+    let energy_in = if in_peak_db <= -88.0 {
+        0.0
+    } else {
+        ((in_peak_db + 96.0) / 96.0).clamp(0.03, 1.15)
+    };
+    let energy_out = if out_peak_db <= -88.0 {
+        0.0
+    } else {
+        ((out_peak_db + 96.0) / 96.0).clamp(0.0, 1.15)
+    };
+    let mut state = ui.ctx().data_mut(|d| {
+        d.get_temp::<HiResSpecState>(spec_id)
+            .unwrap_or(HiResSpecState {
+                bins: [0.0; DN_SPEC_BINS],
+                norm_hold: 1.0,
+                last_t: now,
+            })
+    });
+    let dt = (now - state.last_t).clamp(0.0, 0.08) as f32;
+    state.last_t = now;
+    let attack = 1.0 - (-dt * 28.0).exp();
+    let release = 1.0 - (-dt * 6.0).exp();
+
+    for i in 0..NS {
+        let t = (i as f32 + 0.5) / NS as f32;
+        let f = (f_min.ln() + t * (f_max.ln() - f_min.ln())).exp();
+        // Static bucket weights only — no animation / blur / sine shimmer.
+        let pink = (200.0 / f).sqrt().clamp(0.4, 1.6);
+        let mid = (-((f.ln() - 1600f32.ln()) / 1.1).powi(2)).exp() * 0.30;
+        let air = ((f / 5_000.0).log10()).clamp(0.0, 1.0) * 0.40;
+        let shape = (pink * 0.55 + mid + air).clamp(0.15, 2.0);
+        let target = energy_in * shape;
+        let cur = state.bins[i];
+        let coeff = if target > cur { attack } else { release };
+        state.bins[i] = cur + (target - cur) * coeff;
+    }
+    let raw_max = state.bins.iter().copied().fold(0.0_f32, f32::max).max(1e-4);
+    let norm_atk = 1.0 - (-dt * 18.0).exp();
+    let norm_rel = 1.0 - (-dt * 1.4).exp();
+    if raw_max > state.norm_hold {
+        state.norm_hold += (raw_max - state.norm_hold) * norm_atk;
+    } else {
+        state.norm_hold += (raw_max - state.norm_hold) * norm_rel;
+    }
+    let scale = 1.0 / state.norm_hold.max(1e-4);
+    let bins = state.bins;
+    ui.ctx().data_mut(|d| d.insert_temp(spec_id, state));
+
+    let painter = ui.painter();
+    let out_scale = if energy_in > 1e-4 {
+        (energy_out / energy_in).clamp(0.08, 1.0)
+    } else {
+        0.0
+    };
+    let slot = plot.width() / NS as f32;
+    let gap = (slot * 0.12).clamp(0.5, 2.0);
+
+    for i in 0..NS {
+        let t = (i as f32 + 0.5) / NS as f32;
+        let f = (f_min.ln() + t * (f_max.ln() - f_min.ln())).exp();
+        let n_in = (bins[i] * scale).clamp(0.0, 1.0);
+        let depth = nr_bell_depth_at(nodes, f);
+        let keep = (1.0 - 0.90 * (depth / 48.0)).clamp(0.05, 1.0);
+        let n_out = (n_in * keep * out_scale.max(0.25 + keep * 0.5)).clamp(0.0, 1.0);
+
+        let x0 = plot.left() + i as f32 * slot + gap * 0.5;
+        let x1 = plot.left() + (i + 1) as f32 * slot - gap * 0.5;
+        if x1 <= x0 {
+            continue;
+        }
+
+        // Light = input bucket.
+        if n_in > 0.008 {
+            let h = plot.height() * SPEC_H * n_in;
+            painter.rect_filled(
+                Rect::from_min_max(
+                    egui::pos2(x0, plot.bottom() - h),
+                    egui::pos2(x1, plot.bottom()),
+                ),
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(0xC0, 0xC0, 0xC0, 150),
+            );
+        }
+        // Dark = output bucket (inset so both read clearly).
+        if n_out > 0.008 {
+            let h = plot.height() * SPEC_H * n_out;
+            let inset = ((x1 - x0) * 0.18).clamp(0.5, 2.5);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    egui::pos2(x0 + inset, plot.bottom() - h),
+                    egui::pos2(x1 - inset, plot.bottom()),
+                ),
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(0x58, 0x58, 0x58, 200),
+            );
+        }
+    }
+
+    if energy_in > 0.02 || energy_out > 0.02 {
+        ui.ctx().request_repaint();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NrDragKind {
+    None,
+    Threshold,
+    Node(usize),
+    /// Empty-plot drag creates a node (freq + depth).
+    NewDepth,
+}
+
+/// Parametric NR graph — dual spectra + addable depth bells (freq / depth / Q).
+/// Threshold guide is always drawn/draggable (NR dig floor).
+/// Double-click empty space to add a node. Delete/Backspace removes selected.
+/// Returns true if nodes or threshold changed.
+pub fn denoiser_param_graph(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    threshold_db: &mut f32,
+    nodes: &mut Vec<NrNode>,
+    selected: &mut usize,
+    in_peak_db: f32,
+    out_peak_db: f32,
+    size: Vec2,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let pad_l = 36.0;
+    let pad_r = 10.0;
+    let pad_t = 16.0;
+    let pad_b = 20.0;
+    let plot = Rect::from_min_max(
+        egui::pos2(rect.left() + pad_l, rect.top() + pad_t),
+        egui::pos2(rect.right() - pad_r, rect.bottom() - pad_b),
+    );
+    if plot.width() < 16.0 || plot.height() < 16.0 {
+        return false;
+    }
+
+    const F_MIN: f32 = 20.0;
+    const F_MAX: f32 = 20_000.0;
+    const D_TOP: f32 = 0.0;   // 0 dB pull at top
+    const D_BOT: f32 = 48.0;  // max pull at bottom
+
+    let freq_to_x = |f: f32| {
+        let t = ((f.max(F_MIN).ln() - F_MIN.ln()) / (F_MAX.ln() - F_MIN.ln())).clamp(0.0, 1.0);
+        plot.left() + t * plot.width()
+    };
+    let x_to_freq = |x: f32| {
+        let t = ((x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+        (F_MIN.ln() + t * (F_MAX.ln() - F_MIN.ln())).exp()
+    };
+    // Depth axis: 0 at top, 48 at bottom (how hard we pull).
+    let depth_to_y = |d: f32| {
+        let t = (d.clamp(D_TOP, D_BOT) / D_BOT).clamp(0.0, 1.0);
+        plot.top() + t * plot.height()
+    };
+    let y_to_depth = |y: f32| {
+        let t = ((y - plot.top()) / plot.height()).clamp(0.0, 1.0);
+        t * D_BOT
+    };
+    // Threshold as a faint guide in the upper zone (mapped −140..0 → top third).
+    let thr_to_y = |db: f32| {
+        let t = ((db.clamp(-140.0, 0.0) + 140.0) / 140.0).clamp(0.0, 1.0);
+        plot.top() + (1.0 - t) * plot.height() * 0.35
+    };
+
+    {
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, theme.border_soft()),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    paint_dual_peak_norm(
+        ui,
+        plot,
+        theme,
+        in_peak_db,
+        out_peak_db,
+        nodes,
+        F_MIN,
+        F_MAX,
+    );
+
+    let painter = ui.painter();
+    let a = theme.accent();
+    let o = theme.meter_orange();
+    let grid = theme.border_soft().gamma_multiply(0.85);
+
+    for &d in &[0.0_f32, 12.0, 24.0, 36.0, 48.0] {
+        let y = depth_to_y(d);
+        painter.hline(plot.x_range(), y, Stroke::new(1.0_f32, grid));
+        painter.text(
+            egui::pos2(rect.left() + 4.0, y),
+            egui::Align2::LEFT_CENTER,
+            if d < 0.5 {
+                "0".into()
+            } else {
+                format!("−{d:.0}")
+            },
+            egui::FontId::proportional(9.0),
+            theme.text_muted(),
+        );
+    }
+    for &(f, lab) in &[(100.0_f32, "100"), (1_000.0, "1k"), (10_000.0, "10k")] {
+        let x = freq_to_x(f);
+        painter.vline(x, plot.y_range(), Stroke::new(1.0_f32, grid));
+        painter.text(
+            egui::pos2(x, rect.bottom() - 3.0),
+            egui::Align2::CENTER_BOTTOM,
+            lab,
+            egui::FontId::proportional(9.0),
+            theme.text_muted(),
+        );
+    }
+
+    // NR threshold guide — dig below this level; drag to set.
+    {
+        let y = thr_to_y(*threshold_db);
+        painter.hline(
+            plot.x_range(),
+            y,
+            Stroke::new(1.5_f32, a.gamma_multiply(0.85)),
+        );
+        painter.text(
+            egui::pos2(plot.right() - 2.0, y - 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("thresh {threshold_db:+.0}"),
+            egui::FontId::proportional(9.0),
+            a,
+        );
+    }
+
+    // Composite NR depth fill (sum of bells).
+    {
+        let mut pts = Vec::with_capacity(97);
+        pts.push(egui::pos2(plot.left(), depth_to_y(0.0)));
+        for i in 0..=96 {
+            let t = i as f32 / 96.0;
+            let f = (F_MIN.ln() + t * (F_MAX.ln() - F_MIN.ln())).exp();
+            let d = nr_bell_depth_at(nodes, f);
+            pts.push(egui::pos2(freq_to_x(f), depth_to_y(d)));
+        }
+        pts.push(egui::pos2(plot.right(), depth_to_y(0.0)));
+        // Fill under curve toward top (0 depth).
+        for w in pts.windows(2).skip(1).take(96) {
+            let x0 = w[0].x;
+            let x1 = w[1].x;
+            let y0 = w[0].y;
+            let y1 = w[1].y;
+            let top = depth_to_y(0.0);
+            let poly = [
+                egui::pos2(x0, top),
+                egui::pos2(x1, top),
+                egui::pos2(x1, y1),
+                egui::pos2(x0, y0),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                poly.to_vec(),
+                Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 38),
+                Stroke::NONE,
+            ));
+        }
+        for w in pts[1..pts.len() - 1].windows(2) {
+            painter.line_segment([w[0], w[1]], Stroke::new(2.0_f32, o));
+        }
+    }
+
+    if !nodes.is_empty() {
+        *selected = (*selected).min(nodes.len() - 1);
+    }
+
+    // Node handles.
+    for (i, n) in nodes.iter().enumerate() {
+        if !n.on {
+            continue;
+        }
+        let p = egui::pos2(freq_to_x(n.freq), depth_to_y(n.depth_db));
+        let sel = *selected == i;
+        let r = if sel { 6.0 } else { 4.2 };
+        painter.circle_filled(p, r, if sel { a } else { o });
+        painter.circle_stroke(p, r, Stroke::new(1.0_f32, theme.border()));
+        if sel {
+            painter.circle_stroke(
+                p,
+                r + 3.0,
+                Stroke::new(1.0_f32, a.gamma_multiply(0.6)),
+            );
+        }
+        // Q whiskers — wider = lower Q.
+        let q = n.q.clamp(0.3, 12.0);
+        let f_lo = (n.freq * (-0.55 / q).exp()).clamp(F_MIN, F_MAX);
+        let f_hi = (n.freq * (0.55 / q).exp()).clamp(F_MIN, F_MAX);
+        let y = p.y;
+        painter.line_segment(
+            [egui::pos2(freq_to_x(f_lo), y), egui::pos2(freq_to_x(f_hi), y)],
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), if sel { 160 } else { 70 }),
+            ),
+        );
+    }
+
+    painter.text(
+        egui::pos2(plot.left() + 4.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        "buckets: in/out · orange=NR · line=thresh",
+        egui::FontId::proportional(10.0),
+        theme.text_dim(),
+    );
+    painter.text(
+        egui::pos2(plot.right() - 2.0, rect.top() + 2.0),
+        egui::Align2::RIGHT_TOP,
+        "dbl-click add · scroll depth · Alt+scroll Q",
+        egui::FontId::proportional(9.0),
+        theme.text_muted(),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 2.0, rect.top() + 14.0),
+        egui::Align2::LEFT_TOP,
+        "pull",
+        egui::FontId::proportional(8.0),
+        theme.text_muted(),
+    );
+
+    let drag_id = ui.id().with("dn_nr_drag");
+    let mut drag = ui
+        .ctx()
+        .data(|d| d.get_temp::<NrDragKind>(drag_id))
+        .unwrap_or(NrDragKind::None);
+    let mut changed = false;
+    let mut pending_new: Option<(f32, f32)> = None;
+
+    let hit_node = |pos: egui::Pos2, nodes: &[NrNode]| -> Option<usize> {
+        let mut best = None;
+        let mut best_d = 14.0_f32;
+        for (i, n) in nodes.iter().enumerate() {
+            if !n.on {
+                continue;
+            }
+            let p = egui::pos2(freq_to_x(n.freq), depth_to_y(n.depth_db));
+            let d = pos.distance(p);
+            if d < best_d {
+                best_d = d;
+                best = Some(i);
+            }
+        }
+        best
+    };
+
+    if resp.drag_started() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let y_thr = thr_to_y(*threshold_db);
+            if (pos.y - y_thr).abs() < 7.0 {
+                drag = NrDragKind::Threshold;
+            } else if let Some(i) = hit_node(pos, nodes) {
+                *selected = i;
+                drag = NrDragKind::Node(i);
+            } else if nodes.len() < DN_NR_MAX_NODES {
+                drag = NrDragKind::NewDepth;
+                pending_new = Some((x_to_freq(pos.x), y_to_depth(pos.y)));
+            } else {
+                drag = NrDragKind::None;
+            }
+        }
+    }
+
+    // Create node on new-depth drag start.
+    if matches!(drag, NrDragKind::NewDepth) {
+        if let Some((f, d)) = pending_new.take() {
+            nodes.push(NrNode {
+                on: true,
+                freq: f.clamp(20.0, 20_000.0),
+                depth_db: d.clamp(0.0, 48.0),
+                q: 2.0,
+            });
+            *selected = nodes.len() - 1;
+            drag = NrDragKind::Node(*selected);
+            changed = true;
+        }
+    }
+
+    if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            match drag {
+                NrDragKind::Threshold => {
+                    // Map upper-zone drag back to threshold dB.
+                    let t = 1.0 - ((pos.y - plot.top()) / (plot.height() * 0.35)).clamp(0.0, 1.0);
+                    let db = (-140.0 + t * 140.0).clamp(-140.0, 0.0);
+                    if (db - *threshold_db).abs() > 0.05 {
+                        *threshold_db = db;
+                        changed = true;
+                    }
+                }
+                NrDragKind::Node(i) => {
+                    if let Some(n) = nodes.get_mut(i) {
+                        let f = x_to_freq(pos.x).clamp(20.0, 20_000.0);
+                        let d = y_to_depth(pos.y).clamp(0.0, 48.0);
+                        if (f - n.freq).abs() > 0.5 || (d - n.depth_db).abs() > 0.05 {
+                            n.freq = f;
+                            n.depth_db = d;
+                            n.on = true;
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if resp.drag_stopped() {
+        drag = NrDragKind::None;
+    }
+
+    if resp.double_clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if hit_node(pos, nodes).is_none() && nodes.len() < DN_NR_MAX_NODES {
+                nodes.push(NrNode {
+                    on: true,
+                    freq: x_to_freq(pos.x).clamp(20.0, 20_000.0),
+                    depth_db: y_to_depth(pos.y).clamp(0.5, 48.0),
+                    q: 2.2,
+                });
+                *selected = nodes.len() - 1;
+                changed = true;
+            }
+        }
+    } else if resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if let Some(i) = hit_node(pos, nodes) {
+                *selected = i;
+            }
+        }
+    }
+
+    // Scroll: depth on node; Alt+scroll = Q.
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        let alt = ui.input(|i| i.modifiers.alt);
+        if scroll.abs() > 0.0 && !nodes.is_empty() {
+            let i = if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                hit_node(pos, nodes).unwrap_or(*selected)
+            } else {
+                *selected
+            };
+            *selected = i.min(nodes.len().saturating_sub(1));
+            if let Some(n) = nodes.get_mut(*selected) {
+                if alt {
+                    let step = if scroll > 0.0 { -0.12 } else { 0.12 };
+                    let nq = (n.q + step).clamp(0.3, 12.0);
+                    if (nq - n.q).abs() > 1e-3 {
+                        n.q = nq;
+                        changed = true;
+                    }
+                } else {
+                    let step = if scroll > 0.0 { -0.4 } else { 0.4 };
+                    let nd = (n.depth_db + step).clamp(0.0, 48.0);
+                    if (nd - n.depth_db).abs() > 1e-3 {
+                        n.depth_db = nd;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete selected node.
+    let focused = ui.ctx().data(|d| d.get_temp::<bool>(ui.id().with("dn_nr_focus")).unwrap_or(false));
+    if (resp.hovered() || focused)
+        && !nodes.is_empty()
+        && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+    {
+        if true {
+            let i = (*selected).min(nodes.len() - 1);
+            nodes.remove(i);
+            if !nodes.is_empty() {
+                *selected = i.min(nodes.len() - 1);
+            } else {
+                *selected = 0;
+            }
+            changed = true;
+        }
+    }
+    if resp.hovered() || resp.dragged() || resp.clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(ui.id().with("dn_nr_focus"), true));
+    }
+
+    ui.ctx().data_mut(|d| d.insert_temp(drag_id, drag));
+    if drag != NrDragKind::None {
+        hide_cursor_on_drag(ui, &resp);
+        ui.ctx().request_repaint();
+    }
+    let _ = pending_new;
+    changed
+}
+
 /// Interactive parametric EQ graph (BusChain console theme). Returns true if any band changed.
 /// `selected` is 0..n bands (which node is focused for side controls).
+/// `spectrum_peak_db` drives a peak spectrum backdrop behind the response curve.
 pub fn peq_graph(
     ui: &mut Ui,
     theme: &dyn Theme,
@@ -1156,16 +2838,19 @@ pub fn peq_graph(
     out_gain_db: f32,
     selected: &mut usize,
     size: Vec2,
+    spectrum_peak_db: f32,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(2),
-        Stroke::new(1.0_f32, theme.border_soft()),
-        egui::StrokeKind::Inside,
-    );
+    {
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, theme.border_soft()),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     let pad_l = 8.0;
     let pad_r = 28.0;
@@ -1199,6 +2884,9 @@ pub fn peq_graph(
         G_MIN + t * (G_MAX - G_MIN)
     };
 
+    paint_peak_spectrum(ui, plot, theme, spectrum_peak_db, F_MIN, F_MAX, "peq");
+
+    let painter = ui.painter();
     let grid = theme.border_soft().gamma_multiply(0.85);
     let zero_line = theme.accent().gamma_multiply(0.55);
     for &f in &[50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
@@ -1213,7 +2901,7 @@ pub fn peq_graph(
         let col = if g == 0 { zero_line } else { grid };
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            Stroke::new(if g == 0 { 1.25 } else { 1.0 }, col),
+            Stroke::new(if g == 0 { 1.25_f32 } else { 1.0_f32 }, col),
         );
         painter.text(
             egui::pos2(plot.right() + 2.0, y),
@@ -1255,7 +2943,7 @@ pub fn peq_graph(
         );
     }
 
-    // Response curve — champagne accent, not neon white
+    // Frequency-response curve over the spectrum.
     let mut pts = Vec::with_capacity(128);
     for i in 0..128 {
         let t = i as f32 / 127.0;
@@ -1263,9 +2951,9 @@ pub fn peq_graph(
         let db = peq_mag_db_at(bands, out_gain_db, f, sr).clamp(G_MIN, G_MAX);
         pts.push(egui::pos2(freq_to_x(f), gain_to_y(db)));
     }
-    let curve = theme.accent().gamma_multiply(0.92);
+    let curve = theme.accent().gamma_multiply(0.95);
     for w in pts.windows(2) {
-        painter.line_segment([w[0], w[1]], Stroke::new(2.0_f32, curve));
+        painter.line_segment([w[0], w[1]], Stroke::new(2.15_f32, curve));
     }
 
     let mut changed = false;
@@ -1357,4 +3045,83 @@ pub fn peq_graph(
     }
 
     changed
+}
+
+/// Bottom analyzer: peak spectrum of the selected track (0 dBFS at top).
+/// Optional EQ response overlay when Parametric EQ is selected.
+pub fn track_analyzer(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    peak_db: f32,
+    bands: Option<&[PeqBand]>,
+    out_gain_db: f32,
+    size: Vec2,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    {
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, theme.border_soft()),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let plot = rect.shrink2(egui::vec2(8.0, 6.0));
+    if plot.width() < 8.0 || plot.height() < 8.0 {
+        return;
+    }
+
+    const F_MIN: f32 = 20.0;
+    const F_MAX: f32 = 20000.0;
+    let a = theme.accent();
+    let grid = theme.border_soft().gamma_multiply(0.75);
+
+    paint_peak_spectrum(ui, plot, theme, peak_db, F_MIN, F_MAX, "track");
+
+    let painter = ui.painter();
+    let freq_to_x = |f: f32| {
+        let t = ((f.max(F_MIN).ln() - F_MIN.ln()) / (F_MAX.ln() - F_MIN.ln())).clamp(0.0, 1.0);
+        plot.left() + t * plot.width()
+    };
+    // EQ overlay: 0 dB at top, −36 dB floor (same as spectrum ceiling).
+    let eq_to_y = |db: f32| {
+        let t = ((db.clamp(-36.0, 0.0) + 36.0) / 36.0).clamp(0.0, 1.0);
+        plot.bottom() - t * plot.height()
+    };
+
+    for &f in &[100.0, 1000.0, 10000.0] {
+        let x = freq_to_x(f);
+        painter.line_segment(
+            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+            Stroke::new(1.0_f32, grid),
+        );
+    }
+    painter.line_segment(
+        [egui::pos2(plot.left(), plot.top()), egui::pos2(plot.right(), plot.top())],
+        Stroke::new(1.25_f32, a.gamma_multiply(0.55)),
+    );
+    painter.text(
+        egui::pos2(plot.right() - 2.0, plot.top() + 1.0),
+        egui::Align2::RIGHT_TOP,
+        "0 dB",
+        egui::FontId::proportional(9.0),
+        theme.text_muted(),
+    );
+
+    if let Some(bands) = bands {
+        let mut pts = Vec::with_capacity(96);
+        for i in 0..96 {
+            let t = i as f32 / 95.0;
+            let f = (F_MIN.ln() + t * (F_MAX.ln() - F_MIN.ln())).exp();
+            let db = peq_mag_db_at(bands, out_gain_db, f, 48_000.0);
+            pts.push(egui::pos2(freq_to_x(f), eq_to_y(db)));
+        }
+        let curve = Color32::from_rgb(0xf0, 0xf2, 0xf5);
+        for w in pts.windows(2) {
+            painter.line_segment([w[0], w[1]], Stroke::new(1.6_f32, curve));
+        }
+    }
 }

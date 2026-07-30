@@ -21,6 +21,7 @@ typedef enum {
   P_HOLD,
   P_RELEASE,
   P_RANGE,
+  P_MIX,
   P_BYPASS,
   P_METER_GAIN,
   P_N_PORTS
@@ -80,6 +81,7 @@ static void run(LV2_Handle instance, uint32_t n_samples) {
   params.hold_ms = pget(self, P_HOLD, params.hold_ms);
   params.release_ms = pget(self, P_RELEASE, params.release_ms);
   params.range_db = pget(self, P_RANGE, params.range_db);
+  params.mix = pget(self, P_MIX, params.mix);
   params.bypass = pget(self, P_BYPASS, 0.0f) >= 0.5f;
 
   buschain_gate_set_params(self->dsp, &params);

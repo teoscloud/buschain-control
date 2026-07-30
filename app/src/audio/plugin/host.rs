@@ -15,8 +15,6 @@ impl PluginHost {
             Box::new(Lv2Backend::new(lv2_paths.to_vec())),
             Box::new(ClapBackend::new(clap_paths.to_vec())),
         ];
-        let _ = vst3;
-        #[cfg(feature = "vst3-carla")]
         if vst3 {
             backends.push(Box::new(super::vst3_carla::CarlaVst3Backend::new()));
         }
@@ -52,5 +50,26 @@ impl PluginHost {
                     || p.name.to_lowercase().contains("buschain")
             })
             .collect()
+    }
+
+    /// Descriptors that can be added from the Mixer (rack formats today).
+    /// LADSPA / CLAP / LV2 always; VST3 when `vst3_enabled`.
+    pub fn plugins_for_mixer_add(&self, vst3_enabled: bool) -> Vec<&PluginDescriptor> {
+        self.cache
+            .iter()
+            .filter(|p| match p.id.format {
+                PluginFormat::Ladspa => {
+                    let id = p.id.id.to_lowercase();
+                    let name = p.name.to_lowercase();
+                    !(id.contains("buschain_builtins") || name == "shadow builtins")
+                }
+                PluginFormat::Clap | PluginFormat::Lv2 => true,
+                PluginFormat::Vst3 => vst3_enabled,
+            })
+            .collect()
+    }
+
+    pub fn lv2_scan_count(&self) -> usize {
+        self.by_format(PluginFormat::Lv2).count()
     }
 }

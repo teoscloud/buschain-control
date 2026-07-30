@@ -5,8 +5,37 @@ edition = "2021"
 description = "BusChain Control engine — PipeWire/Pulse contracts, clock domains, routing"
 license = "MIT"
 
+[features]
+default = ["dsp-host", "native-pw"]
+dsp-host = ["lv2-host"]
+lv2-host = ["dep:lilv"]
+# Phase M1: ALSA sequencer MIDI reader (Linux).
+midi-alsa = ["dep:alsa"]
+# Phase F: libpipewire registry control plane (default).
+native-pw = []
+# Temporary bisect fallback to out-of-process `pipewire -c` helpers.
+fx-helper = []
+# Emergency: force CLI backend paths (kept for one release).
+pw-cli-backend = []
+# Kept for cargo CLI compat; VST3 host is always compiled.
+vst3-host = []
+
 [dependencies]
 anyhow = "1"
+libloading = "0.8"
+spa = { package = "libspa", version = "0.8" }
+spa_sys = { package = "libspa-sys", version = "0.8" }
+once_cell = "1"
+pipewire = { version = "0.8", features = ["v0_3_33", "v0_3_44", "v0_3_45"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+clap-sys = "0.5"
+clack-host = "0.1.1"
+clack-extensions = { version = "0.1.1", features = ["clack-host", "params", "latency", "state", "audio-ports", "note-ports"] }
+alsa = { version = "0.9", optional = true }
+vst3 = "0.3"
+lilv = { version = "0.2.4", optional = true }
+vst3-host = { version = "0.9", default-features = false }
+memmap2 = "0.9"
+libc = "0.2"

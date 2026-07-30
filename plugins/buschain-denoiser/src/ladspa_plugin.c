@@ -28,6 +28,13 @@ enum {
   L_HZ5,
   L_HF_BIAS,
   L_STEREO_LINK,
+  L_STABILITY,
+  L_GATE_ENABLE,
+  L_GATE_KNEE,
+  L_GATE_RATIO,
+  L_GATE_ATTACK,
+  L_GATE_RELEASE,
+  L_GATE_MIX,
   L_BYPASS,
   L_N_PORTS
 };
@@ -83,6 +90,13 @@ static void run(LADSPA_Handle instance, unsigned long n_samples) {
   params.freq_high_hz = 0.0f;
   params.hf_bias = pget(self, L_HF_BIAS, params.hf_bias);
   params.stereo_link = pget(self, L_STEREO_LINK, params.stereo_link);
+  params.stability = pget(self, L_STABILITY, params.stability);
+  params.gate_enable = pget(self, L_GATE_ENABLE, 0.0f) >= 0.5f;
+  params.knee_db = pget(self, L_GATE_KNEE, params.knee_db);
+  params.ratio = pget(self, L_GATE_RATIO, params.ratio);
+  params.attack_ms = pget(self, L_GATE_ATTACK, params.attack_ms);
+  params.release_ms = pget(self, L_GATE_RELEASE, params.release_ms);
+  params.gate_mix = pget(self, L_GATE_MIX, params.gate_mix);
   params.bypass = pget(self, L_BYPASS, 0.0f) >= 0.5f;
 
   buschain_dn_set_params(self->dsp, &params);
@@ -141,6 +155,13 @@ static void init_descriptor(void) {
   port_names[L_HZ5] = "Band 6 Freq (Hz)";
   port_names[L_HF_BIAS] = "HF Bias";
   port_names[L_STEREO_LINK] = "Stereo Link";
+  port_names[L_STABILITY] = "Stability";
+  port_names[L_GATE_ENABLE] = "Gate Enable";
+  port_names[L_GATE_KNEE] = "Gate Knee (dB)";
+  port_names[L_GATE_RATIO] = "Gate Ratio";
+  port_names[L_GATE_ATTACK] = "Gate Attack (ms)";
+  port_names[L_GATE_RELEASE] = "Gate Release (ms)";
+  port_names[L_GATE_MIX] = "Gate Mix";
   port_names[L_BYPASS] = "Bypass";
 
   memset(port_hints, 0, sizeof(port_hints));
@@ -154,7 +175,7 @@ static void init_descriptor(void) {
 
   for (int i = L_RANGE0; i <= L_RANGE5; i++) {
     port_hints[i].LowerBound = 0.0f;
-    port_hints[i].UpperBound = 24.0f;
+    port_hints[i].UpperBound = 48.0f;
   }
   for (int i = L_HZ0; i <= L_HZ5; i++) {
     port_hints[i].LowerBound = 20.0f;
@@ -167,6 +188,25 @@ static void init_descriptor(void) {
   port_hints[L_HF_BIAS].UpperBound = 1.0f;
   port_hints[L_STEREO_LINK].LowerBound = 0.0f;
   port_hints[L_STEREO_LINK].UpperBound = 1.0f;
+  port_hints[L_STABILITY].LowerBound = 0.0f;
+  port_hints[L_STABILITY].UpperBound = 1.0f;
+  port_hints[L_GATE_ENABLE].LowerBound = 0.0f;
+  port_hints[L_GATE_ENABLE].UpperBound = 1.0f;
+  port_hints[L_GATE_ENABLE].HintDescriptor =
+    LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE |
+    LADSPA_HINT_TOGGLED | LADSPA_HINT_DEFAULT_0;
+  port_hints[L_GATE_KNEE].LowerBound = 0.0f;
+  port_hints[L_GATE_KNEE].UpperBound = 24.0f;
+  port_hints[L_GATE_RATIO].LowerBound = 1.0f;
+  port_hints[L_GATE_RATIO].UpperBound = 100.0f;
+  port_hints[L_GATE_ATTACK].LowerBound = 0.1f;
+  port_hints[L_GATE_ATTACK].UpperBound = 50.0f;
+  port_hints[L_GATE_RELEASE].LowerBound = 5.0f;
+  port_hints[L_GATE_RELEASE].UpperBound = 1000.0f;
+  port_hints[L_GATE_MIX].LowerBound = 0.0f;
+  port_hints[L_GATE_MIX].UpperBound = 1.0f;
+  port_hints[L_GATE_MIX].HintDescriptor =
+    LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_MAXIMUM;
   port_hints[L_BYPASS].LowerBound = 0.0f;
   port_hints[L_BYPASS].UpperBound = 1.0f;
   port_hints[L_BYPASS].HintDescriptor =

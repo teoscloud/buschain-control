@@ -240,6 +240,15 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
+    // Never Pulse-loopback onto in-process FX filters — they are Audio/Duplex
+    // DSP nodes, not Pulse sinks; the fallback burns ~600ms and cannot work.
+    let dst = pw_node(sink);
+    if dst.starts_with("buschain_fx_") || pw_node(source).starts_with("buschain_fx_") {
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow!("pw-link ports not ready for host FX `{source}` → `{sink}`")
+        }));
+    }
+
     // Fallback: Pulse module-loopback (reliable with null-sinks).
     match load_pulse_loopback(source, sink) {
         Ok(()) => {

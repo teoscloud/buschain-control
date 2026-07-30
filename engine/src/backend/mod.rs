@@ -1,22 +1,39 @@
-//! AudioBackend trait + PipeWire CLI implementation.
+//! AudioBackend trait + PipeWire implementations (native default, CLI fallback).
 
 mod cli;
 mod fx_chain;
 mod link;
+mod native;
 mod null_sink;
+pub mod pulse_compat;
 
-pub use cli::invalidate_probe_caches;
+pub use cli::{invalidate_probe_caches, pw_link_inputs, pw_link_outputs};
 
 pub use fx_chain::{
-    find_node_id_by_name, prepare_fx_conf, push_insert_controls, read_signature, sink_exists,
-    sink_has_input, spawn_pipewire_conf_from_prepared, spawn_sidechain, spawn_sidechain_named,
-    write_signature, FilterChainRuntime,
+    cache_node_id, find_node_id_by_name, ladspa_search_path, sink_exists, sink_has_input,
+    FilterChainRuntime,
 };
+
+pub use native::{list_midi_nodes, PipewireNativeBackend};
+
+use anyhow::{anyhow, Context, Result};
+
+use crate::clock::{probe_endpoint_caps, probe_sink_running_rate, EndpointCaps, GraphClock};
+use crate::contract::ClockProps;
+use crate::domain::{
+    DeviceNode, GraphSnapshot, LinkId, LinkSpec, NodeId, NodeName, NodeRole, NodeSpec, Props,
+};
+use crate::plan::DesiredState;
 
 /// Gate outbound `{bus}.monitor` without muting the app-facing sink (avoids cork).
 /// Free fn so ForceRespawn RAII can ungated without holding `AudioBackend`.
 pub fn gate_bus_monitor(bus: &str, gated: bool) -> Result<()> {
     let mon = format!("{bus}.monitor");
+    if native::native_ready() {
+        if native::native_set_levels(&mon, if gated { -120.0 } else { 0.0 }, gated).is_ok() {
+            return Ok(());
+        }
+    }
     if gated {
         let _ = run_ok("pactl", &["set-source-mute", &mon, "1"]);
         let _ = run_ok("pactl", &["set-source-volume", &mon, "0%"]);
@@ -27,18 +44,40 @@ pub fn gate_bus_monitor(bus: &str, gated: bool) -> Result<()> {
     Ok(())
 }
 
-pub use link::{ensure_link, link_is_live, teardown_buschain_links, unlink};
+/// Prefer native registry links; fall back to CLI `pw-link` / Pulse loopback.
+pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
+    if native::native_ready() {
+        match native::native_ensure_link(source, sink) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let dst = sink.strip_suffix(".monitor").unwrap_or(sink);
+                let src = source.strip_suffix(".monitor").unwrap_or(source);
+                if dst.starts_with("buschain_fx_") || src.starts_with("buschain_fx_") {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    link::ensure_link(source, sink)
+}
+
+pub fn unlink(source: &str, sink: &str) -> Result<()> {
+    if native::native_ready() {
+        let _ = native::native_unlink(source, sink);
+    }
+    link::unlink(source, sink)
+}
+
+pub fn link_is_live(source: &str, sink: &str) -> bool {
+    if native::native_ready() && native::native_link_is_live(source, sink) {
+        return true;
+    }
+    link::link_is_live(source, sink)
+}
+
+pub use link::teardown_buschain_links;
 
 pub use null_sink::push_description;
-
-use anyhow::{anyhow, Context, Result};
-
-use crate::clock::{probe_endpoint_caps, probe_sink_running_rate, EndpointCaps, GraphClock};
-use crate::contract::ClockProps;
-use crate::domain::{
-    DeviceNode, GraphSnapshot, LinkId, LinkSpec, NodeId, NodeName, NodeRole, NodeSpec, Props,
-};
-use crate::plan::DesiredState;
 
 pub trait AudioBackend {
     fn snapshot(&mut self) -> Result<GraphSnapshot>;
@@ -95,12 +134,12 @@ impl AudioBackend for PipewireCliBackend {
     }
 
     fn ensure_link_raw(&mut self, source: &str, sink: &str) -> Result<LinkId> {
-        ensure_link(source, sink)?;
+        link::ensure_link(source, sink)?;
         Ok(LinkId(format!("{source}->{sink}")))
     }
 
     fn unlink_raw(&mut self, source: &str, sink: &str) -> Result<()> {
-        unlink(source, sink)
+        link::unlink(source, sink)
     }
 
     fn unlink_from_source_except(&mut self, source: &str, allow_sinks: &[&str]) -> u32 {
