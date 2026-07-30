@@ -29,6 +29,8 @@ pub enum Request {
     Ping,
     GetStatus,
     GetSnapshot,
+    /// Aggregate mixer JSON for Quickshell / shell panels (`buschain-ctl mixer`).
+    GetMixer,
     SetHwVolume { pct: u32 },
     AdjustHwVolume { delta: i32 },
     SetHwMute { mute: bool },
@@ -96,6 +98,12 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<Session>,
     },
+    /// Stable mixer aggregate for shell UIs (does not embed raw PwSnapshot).
+    Mixer {
+        mixer: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<Status>,
+    },
     Err {
         error: String,
     },
@@ -156,6 +164,17 @@ impl Client {
         let line = read_line(&mut stream)?;
         let resp: Response = serde_json::from_str(line.trim())?;
         Ok(resp)
+    }
+
+    /// Waybar hover-scroll: write Adjust and close — do **not** wait for a reply.
+    /// Waiting (even 20ms) plus Waybar's `exec-on-event` status made the module
+    /// drop wheel ticks so users had to spam the scroll wheel.
+    pub fn poke(req: &Request) -> Result<()> {
+        let mut stream = Self::connect()?;
+        stream.set_write_timeout(Some(Duration::from_millis(50)))?;
+        write_line(&mut stream, req)?;
+        // Drop the socket; daemon may fail writing the response — that's fine.
+        Ok(())
     }
 
     pub fn ping() -> bool {

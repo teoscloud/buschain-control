@@ -12,10 +12,10 @@ Opt out: `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`.
 
 Popup order (tray / `buschain-ctl popup` / `buschain-waybar popup` → ctl):
 
-1. Quickshell — only if `BUSCHAIN_CONTROL_QS_MIXER=1`
+1. Quickshell — if `BUSCHAIN_CONTROL_QS_MIXER=1`, toggle script, or `qs` on PATH
 2. GTK layer-shell panel
 3. egui — `buschain-control --popup`
 
 Waybar should call `buschain-waybar popup`, which prefers **ctl → tray router**
-so Hyprland’s bare PATH still gets a working panel. See
-[`docs/HANDOVER-GTK-WAYBAR.md`](../../docs/HANDOVER-GTK-WAYBAR.md).
+so Hyprland’s bare PATH still gets a working panel. Quickshell contract:
+[`docs/HANDOVER-QUICKSHELL.md`](../../docs/HANDOVER-QUICKSHELL.md).

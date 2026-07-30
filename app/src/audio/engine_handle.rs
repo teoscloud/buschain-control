@@ -266,6 +266,21 @@ pub fn reconcile(session: &Session, hw_sink: &str) -> anyhow::Result<String> {
     Ok(msg)
 }
 
+/// Route / Hotplug: links + egress only — never ForceRespawn FX racks.
+pub fn relink_routes(session: &Session, hw_sink: &str) -> anyhow::Result<String> {
+    sync_desired_from_session(session, hw_sink);
+    let (msg, buses) = with_engine(|eng| {
+        let report = eng.relink_routes()?;
+        let buses: Vec<String> = eng.desired().buses.keys().cloned().collect();
+        Ok::<_, anyhow::Error>((report.join(), buses))
+    })?;
+    for bus in buses {
+        let wet = with_engine(|eng| eng.chain_is_wet(&bus));
+        set_wet_cached(&bus, wet);
+    }
+    Ok(msg)
+}
+
 pub fn bind_master_clock(profile: &PerformanceProfile) -> anyhow::Result<String> {
     with_engine(|eng| {
         let report = eng.apply(Intent::BindMasterClock {
@@ -395,11 +410,14 @@ pub fn set_master_hw_light(hw: &str) -> anyhow::Result<String> {
 pub fn push_fx_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<()> {
     // In-process host control queue — lock-free of Engine ForceRespawn mutex.
     buschain_engine::host::registry::push_host_controls(bus, &inserts)?;
-    if let Ok(mut g) = engine_mutex().try_lock() {
-        if let Some(spec) = g.desired_mut().fx_chains.get_mut(bus) {
-            spec.inserts = inserts;
+    // Always mirror Desired — never skip on try_lock (idle reconcile must see knobs).
+    let inserts_for_desired = inserts;
+    with_engine(|eng| -> anyhow::Result<()> {
+        if let Some(spec) = eng.desired_mut().fx_chains.get_mut(bus) {
+            spec.inserts = inserts_for_desired;
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -461,6 +479,25 @@ pub fn graph_snapshot() -> anyhow::Result<buschain_engine::GraphSnapshot> {
 /// Host pre/post insert meter peaks (prefer over Pulse meter-* for FX buses).
 pub fn host_meter_peaks(bus: &str) -> Option<(f32, f32)> {
     buschain_engine::host::registry::host_meter_peaks(bus)
+}
+
+/// In-process FX host is live for this bus (prefer host meters over Pulse).
+pub fn host_is_live(bus: &str) -> bool {
+    buschain_engine::host::registry::host_is_live(bus)
+}
+
+/// Keep FFT running for `bus` and return a spectrum snapshot (post-FX when `post`).
+pub fn host_spectrum(bus: &str, post: bool) -> Option<buschain_engine::host::SpectrumFrame> {
+    buschain_engine::host::registry::host_spectrum(bus, post)
+}
+
+pub fn host_spectrum_watch(bus: &str, post: bool) {
+    buschain_engine::host::registry::host_spectrum_watch(bus, post);
+}
+
+/// Stop all host FFTs immediately (UI Idle / window withdrawn).
+pub fn host_spectrum_clear_watches() {
+    buschain_engine::host::registry::host_spectrum_clear_watches();
 }
 
 pub fn host_latency_ms(bus: &str, sample_rate: u32) -> f32 {

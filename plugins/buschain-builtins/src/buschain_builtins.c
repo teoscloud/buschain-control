@@ -18,6 +18,75 @@ static float clampf(float x, float lo, float hi) {
 }
 static float db_to_lin(float db) { return powf(10.0f, db * 0.05f); }
 
+/* One-pole coeff for ~ms time constant (zipper / param smooth). */
+static inline float ms_to_coeff(float ms, float sr) {
+  if (ms <= 0.0f || sr < 1.0f) return 0.0f;
+  return expf(-1.0f / (0.001f * ms * sr));
+}
+static inline void smooth_toward(float *cur, float tgt, float c) {
+  *cur = c * (*cur) + (1.0f - c) * tgt;
+}
+
+/* DF1 biquad. Never lerp a/b coeffs — that makes unstable intermediates
+ * (crackle → NaN → silence). Smooth params, then redesign. */
+typedef struct {
+  float b0, b1, b2, a1, a2;
+} BqCoeffs;
+
+/* isfinite() is unreliable under -ffast-math; use NaN!=NaN + magnitude. */
+static inline int f_ok(float x) { return x == x && fabsf(x) < 1.0e20f; }
+
+static inline float bq_tick(const BqCoeffs *c, float x, float *z1, float *z2) {
+  float y = c->b0 * x + *z1;
+  *z1 = c->b1 * x - c->a1 * y + *z2;
+  *z2 = c->b2 * x - c->a2 * y;
+  if (!f_ok(y) || !f_ok(*z1) || !f_ok(*z2)) {
+    *z1 = *z2 = 0.0f;
+    return 0.0f;
+  }
+  /* Kill denormals that can stall the CPU after fades. */
+  if (fabsf(*z1) < 1.0e-20f) *z1 = 0.0f;
+  if (fabsf(*z2) < 1.0e-20f) *z2 = 0.0f;
+  return y;
+}
+
+static void bq_rbj(BqCoeffs *c, float freq, float gain_db, float q, int mode, float sr) {
+  float w0 = 2.0f * (float)M_PI * clampf(freq, 20.0f, sr * 0.45f) / sr;
+  float cosw = cosf(w0), sinw = sinf(w0);
+  float A = powf(10.0f, gain_db / 40.0f);
+  q = fmaxf(q, 0.1f);
+  float alpha = sinw / (2.0f * q);
+  float b0, b1, b2, a0, a1, a2;
+  if (mode == 3) { /* HP */
+    b0 = (1 + cosw) * 0.5f; b1 = -(1 + cosw); b2 = b0;
+    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
+  } else if (mode == 4) { /* LP */
+    b0 = (1 - cosw) * 0.5f; b1 = 1 - cosw; b2 = b0;
+    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
+  } else if (mode == 1) { /* low shelf */
+    float t = 2.0f * sqrtf(A) * alpha;
+    b0 = A * ((A + 1) - (A - 1) * cosw + t);
+    b1 = 2 * A * ((A - 1) - (A + 1) * cosw);
+    b2 = A * ((A + 1) - (A - 1) * cosw - t);
+    a0 = (A + 1) + (A - 1) * cosw + t;
+    a1 = -2 * ((A - 1) + (A + 1) * cosw);
+    a2 = (A + 1) + (A - 1) * cosw - t;
+  } else if (mode == 2) { /* high shelf */
+    float t = 2.0f * sqrtf(A) * alpha;
+    b0 = A * ((A + 1) + (A - 1) * cosw + t);
+    b1 = -2 * A * ((A - 1) + (A + 1) * cosw);
+    b2 = A * ((A + 1) + (A - 1) * cosw - t);
+    a0 = (A + 1) - (A - 1) * cosw + t;
+    a1 = 2 * ((A - 1) - (A + 1) * cosw);
+    a2 = (A + 1) - (A - 1) * cosw - t;
+  } else { /* peak */
+    b0 = 1 + alpha * A; b1 = -2 * cosw; b2 = 1 - alpha * A;
+    a0 = 1 + alpha / A; a1 = -2 * cosw; a2 = 1 - alpha / A;
+  }
+  c->b0 = b0 / a0; c->b1 = b1 / a0; c->b2 = b2 / a0;
+  c->a1 = a1 / a0; c->a2 = a2 / a0;
+}
+
 /* ===================== Soft Clipper (Fruity Soft Clipper–style) =====================
  * THRES = knee start (linear below).  POST = makeup after clip.
  * Piecewise (matches FL graph shape — NOT full-range tanh):
@@ -29,6 +98,9 @@ enum { SC_IN_L, SC_IN_R, SC_OUT_L, SC_OUT_R, SC_THRES, SC_POST, SC_MIX, SC_BYPAS
 typedef struct {
   const LADSPA_Data *p[SC_N];
   LADSPA_Data *o[SC_N];
+  float sr;
+  float thres_s, post_s, mix_s;
+  int primed;
 } SoftClip;
 
 static inline float sc_xfer(float x, float thres) {
@@ -46,8 +118,10 @@ static inline float sc_xfer(float x, float thres) {
 }
 
 static LADSPA_Handle sc_inst(const LADSPA_Descriptor *d, unsigned long sr) {
-  (void)d; (void)sr;
-  return calloc(1, sizeof(SoftClip));
+  (void)d;
+  SoftClip *s = calloc(1, sizeof(SoftClip));
+  if (s) s->sr = (float)(sr ? sr : 48000);
+  return s;
 }
 static void sc_connect(LADSPA_Handle h, unsigned long port, LADSPA_Data *data) {
   SoftClip *s = h;
@@ -55,9 +129,9 @@ static void sc_connect(LADSPA_Handle h, unsigned long port, LADSPA_Data *data) {
 }
 static void sc_run(LADSPA_Handle h, unsigned long n) {
   SoftClip *s = h;
-  float thres = s->p[SC_THRES] ? clampf(*s->p[SC_THRES], 0.05f, 1.0f) : 0.5f;
-  float post = s->p[SC_POST] ? clampf(*s->p[SC_POST], 0.0f, 4.0f) : 1.0f;
-  float mix = s->p[SC_MIX] ? clampf(*s->p[SC_MIX], 0.0f, 1.0f) : 1.0f;
+  float thres_t = s->p[SC_THRES] ? clampf(*s->p[SC_THRES], 0.05f, 1.0f) : 0.5f;
+  float post_t = s->p[SC_POST] ? clampf(*s->p[SC_POST], 0.0f, 4.0f) : 1.0f;
+  float mix_t = s->p[SC_MIX] ? clampf(*s->p[SC_MIX], 0.0f, 1.0f) : 1.0f;
   const float *il = s->p[SC_IN_L], *ir = s->p[SC_IN_R];
   float *ol = s->o[SC_OUT_L], *or_ = s->o[SC_OUT_R];
   if (!il || !ol) return;
@@ -68,33 +142,92 @@ static void sc_run(LADSPA_Handle h, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
     return;
   }
+  if (!s->primed) {
+    s->thres_s = thres_t; s->post_s = post_t; s->mix_s = mix_t;
+    s->primed = 1;
+  }
+  float sc = ms_to_coeff(5.0f, s->sr > 1.0f ? s->sr : 48000.0f);
   /* Mix≈0 or Post≈0: dry pass-through. Always write outs (in-place hosts keep ol==il). */
-  if (mix < 1.0e-5f || post < 1.0e-5f) {
-    for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
+  if (mix_t < 1.0e-5f || post_t < 1.0e-5f) {
+    for (unsigned long i = 0; i < n; i++) {
+      smooth_toward(&s->mix_s, mix_t, sc);
+      smooth_toward(&s->post_s, post_t, sc);
+      ol[i] = il[i]; or_[i] = ir[i];
+    }
     return;
   }
   for (unsigned long i = 0; i < n; i++) {
-    float wl = sc_xfer(il[i], thres) * post;
-    float wr = sc_xfer(ir[i], thres) * post;
-    ol[i] = il[i] + mix * (wl - il[i]);
-    or_[i] = ir[i] + mix * (wr - ir[i]);
+    smooth_toward(&s->thres_s, thres_t, sc);
+    smooth_toward(&s->post_s, post_t, sc);
+    smooth_toward(&s->mix_s, mix_t, sc);
+    float wl = sc_xfer(il[i], s->thres_s) * s->post_s;
+    float wr = sc_xfer(ir[i], s->thres_s) * s->post_s;
+    ol[i] = il[i] + s->mix_s * (wl - il[i]);
+    or_[i] = ir[i] + s->mix_s * (wr - ir[i]);
   }
 }
 static void sc_cleanup(LADSPA_Handle h) { free(h); }
 
 /* ===================== Limiter ===================== */
-enum { LM_IN_L, LM_IN_R, LM_OUT_L, LM_OUT_R, LM_CEIL, LM_REL, LM_BYPASS, LM_N };
+enum {
+  LM_IN_L, LM_IN_R, LM_OUT_L, LM_OUT_R,
+  LM_CEIL, LM_ATK, LM_REL, LM_LOOKAHEAD, LM_KNEE, LM_INPUT, LM_MAKEUP, LM_BYPASS,
+  LM_N
+};
+
 typedef struct {
   const LADSPA_Data *p[LM_N];
   LADSPA_Data *o[LM_N];
   float env;
   float sr;
+  float ceil_sm, atk_sm, rel_sm, la_sm, knee_sm, in_sm, makeup_sm;
+  float *delay_l;
+  float *delay_r;
+  unsigned delay_cap;
+  unsigned delay_w;
+  int primed;
 } Limiter;
+
+/* Soft-knee brickwall: infinite ratio into Ceiling with knee width (dB). */
+static inline float lm_gain_db(float level_db, float ceil_db, float knee_db) {
+  if (knee_db < 0.05f) {
+    return level_db > ceil_db ? (ceil_db - level_db) : 0.0f;
+  }
+  float half = knee_db * 0.5f;
+  float lo = ceil_db - half;
+  float hi = ceil_db + half;
+  if (level_db <= lo) return 0.0f;
+  if (level_db >= hi) return ceil_db - level_db;
+  float d = level_db - lo;
+  float out_db = level_db - (d * d) / (2.0f * knee_db);
+  /* Never allow the soft curve above the hard ceiling. */
+  if (out_db > ceil_db) out_db = ceil_db;
+  return out_db - level_db;
+}
 
 static LADSPA_Handle lm_inst(const LADSPA_Descriptor *d, unsigned long sr) {
   (void)d;
   Limiter *s = calloc(1, sizeof(Limiter));
-  if (s) s->sr = (float)sr;
+  if (!s) return NULL;
+  s->sr = (float)sr;
+  /* 10 ms lookahead headroom (+ a few samples). */
+  s->delay_cap = (unsigned)(0.010f * s->sr) + 8u;
+  if (s->delay_cap < 8u) s->delay_cap = 8u;
+  s->delay_l = calloc(s->delay_cap, sizeof(float));
+  s->delay_r = calloc(s->delay_cap, sizeof(float));
+  if (!s->delay_l || !s->delay_r) {
+    free(s->delay_l);
+    free(s->delay_r);
+    free(s);
+    return NULL;
+  }
+  s->ceil_sm = -0.1f;
+  s->atk_sm = 0.1f;
+  s->rel_sm = 50.0f;
+  s->la_sm = 1.0f;
+  s->knee_sm = 0.0f;
+  s->in_sm = 0.0f;
+  s->makeup_sm = 0.0f;
   return s;
 }
 static void lm_connect(LADSPA_Handle h, unsigned long port, LADSPA_Data *data) {
@@ -103,33 +236,80 @@ static void lm_connect(LADSPA_Handle h, unsigned long port, LADSPA_Data *data) {
 }
 static void lm_run(LADSPA_Handle h, unsigned long n) {
   Limiter *s = h;
-  float ceil_db = s->p[LM_CEIL] ? *s->p[LM_CEIL] : -0.1f;
-  float rel_ms = s->p[LM_REL] ? *s->p[LM_REL] : 50.0f;
-  float ceiling = db_to_lin(ceil_db);
-  float coeff = expf(-1.0f / (0.001f * fmaxf(rel_ms, 1.0f) * s->sr));
+  float ceil_t = s->p[LM_CEIL] ? *s->p[LM_CEIL] : -0.1f;
+  float atk_t = s->p[LM_ATK] ? *s->p[LM_ATK] : 0.1f;
+  float rel_t = s->p[LM_REL] ? *s->p[LM_REL] : 50.0f;
+  float la_t = s->p[LM_LOOKAHEAD] ? *s->p[LM_LOOKAHEAD] : 1.0f;
+  float knee_t = s->p[LM_KNEE] ? *s->p[LM_KNEE] : 0.0f;
+  float in_t = s->p[LM_INPUT] ? *s->p[LM_INPUT] : 0.0f;
+  float makeup_t = s->p[LM_MAKEUP] ? *s->p[LM_MAKEUP] : 0.0f;
   const float *il = s->p[LM_IN_L], *ir = s->p[LM_IN_R];
   float *ol = s->o[LM_OUT_L], *or_ = s->o[LM_OUT_R];
-  if (!il || !ol) return;
+  if (!il || !ol || !s->delay_l || !s->delay_r) return;
   if (!ir) ir = il;
   if (!or_) or_ = ol;
   if (s->p[LM_BYPASS] && *s->p[LM_BYPASS] >= 0.5f) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
     return;
   }
+
+  float sc = ms_to_coeff(8.0f, s->sr);
+  if (!s->primed) {
+    s->ceil_sm = ceil_t;
+    s->atk_sm = atk_t;
+    s->rel_sm = rel_t;
+    s->la_sm = la_t;
+    s->knee_sm = knee_t;
+    s->in_sm = in_t;
+    s->makeup_sm = makeup_t;
+    s->primed = 1;
+  } else {
+    smooth_toward(&s->ceil_sm, ceil_t, sc);
+    smooth_toward(&s->atk_sm, atk_t, sc);
+    smooth_toward(&s->rel_sm, rel_t, sc);
+    smooth_toward(&s->la_sm, la_t, sc);
+    smooth_toward(&s->knee_sm, knee_t, sc);
+    smooth_toward(&s->in_sm, in_t, sc);
+    smooth_toward(&s->makeup_sm, makeup_t, sc);
+  }
+
+  float ca = expf(-1.0f / (0.001f * fmaxf(s->atk_sm, 0.01f) * s->sr));
+  float cr = expf(-1.0f / (0.001f * fmaxf(s->rel_sm, 1.0f) * s->sr));
+  float in_g = db_to_lin(s->in_sm);
+  float makeup_g = db_to_lin(s->makeup_sm);
+  unsigned la_samp = (unsigned)(0.001f * fmaxf(s->la_sm, 0.0f) * s->sr + 0.5f);
+  if (la_samp >= s->delay_cap) la_samp = s->delay_cap - 1u;
+
   for (unsigned long i = 0; i < n; i++) {
-    float peak = fabsf(il[i]);
-    float pr = fabsf(ir[i]);
+    float xl = il[i] * in_g;
+    float xr = ir[i] * in_g;
+    s->delay_l[s->delay_w] = xl;
+    s->delay_r[s->delay_w] = xr;
+
+    float peak = fabsf(xl);
+    float pr = fabsf(xr);
     if (pr > peak) peak = pr;
-    if (peak > s->env) s->env = peak;
-    else s->env = coeff * s->env + (1.0f - coeff) * peak;
-    float g = 1.0f;
-    if (s->env > ceiling && s->env > 1e-12f)
-      g = ceiling / s->env;
-    ol[i] = il[i] * g;
-    or_[i] = ir[i] * g;
+
+    float c = (peak > s->env) ? ca : cr;
+    s->env = c * s->env + (1.0f - c) * peak;
+
+    float level_db = 20.0f * log10f(fmaxf(s->env, 1e-12f));
+    float gr_db = lm_gain_db(level_db, s->ceil_sm, fmaxf(s->knee_sm, 0.0f));
+    float g = db_to_lin(gr_db);
+
+    unsigned r = (s->delay_w + s->delay_cap - la_samp) % s->delay_cap;
+    ol[i] = s->delay_l[r] * g * makeup_g;
+    or_[i] = s->delay_r[r] * g * makeup_g;
+    s->delay_w = (s->delay_w + 1u) % s->delay_cap;
   }
 }
-static void lm_cleanup(LADSPA_Handle h) { free(h); }
+static void lm_cleanup(LADSPA_Handle h) {
+  Limiter *s = h;
+  if (!s) return;
+  free(s->delay_l);
+  free(s->delay_r);
+  free(s);
+}
 
 /* ===================== Compressor ===================== */
 enum { CM_IN_L, CM_IN_R, CM_OUT_L, CM_OUT_R, CM_THR, CM_RATIO, CM_ATK, CM_REL, CM_MAKEUP, CM_BYPASS, CM_N };
@@ -193,54 +373,23 @@ enum { EQ_IN_L, EQ_IN_R, EQ_OUT_L, EQ_OUT_R, EQ_FREQ, EQ_GAIN, EQ_Q, EQ_MODE, EQ
 typedef struct {
   const LADSPA_Data *p[EQ_N];
   LADSPA_Data *o[EQ_N];
-  float b0, b1, b2, a1, a2, z1l, z2l, z1r, z2r;
+  BqCoeffs c;
+  float z1l, z2l, z1r, z2r;
   float sr;
-  float last_f, last_g, last_q, last_m;
+  float f_sm, g_sm, q_sm;
+  int mode_i;
+  int primed;
 } Eq;
-
-static void eq_design(Eq *s, float freq, float gain_db, float q, float mode) {
-  float w0 = 2.0f * (float)M_PI * clampf(freq, 20.0f, s->sr * 0.45f) / s->sr;
-  float cosw = cosf(w0), sinw = sinf(w0);
-  float A = powf(10.0f, gain_db / 40.0f);
-  q = fmaxf(q, 0.1f);
-  float alpha = sinw / (2.0f * q);
-  float b0, b1, b2, a0, a1, a2;
-  int m = (int)mode;
-  if (m == 3) { /* HP */
-    b0 = (1 + cosw) * 0.5f; b1 = -(1 + cosw); b2 = b0;
-    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
-  } else if (m == 4) { /* LP */
-    b0 = (1 - cosw) * 0.5f; b1 = 1 - cosw; b2 = b0;
-    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
-  } else if (m == 1) { /* low shelf */
-    float two_sqrtA_alpha = 2.0f * sqrtf(A) * alpha;
-    b0 = A * ((A + 1) - (A - 1) * cosw + two_sqrtA_alpha);
-    b1 = 2 * A * ((A - 1) - (A + 1) * cosw);
-    b2 = A * ((A + 1) - (A - 1) * cosw - two_sqrtA_alpha);
-    a0 = (A + 1) + (A - 1) * cosw + two_sqrtA_alpha;
-    a1 = -2 * ((A - 1) + (A + 1) * cosw);
-    a2 = (A + 1) + (A - 1) * cosw - two_sqrtA_alpha;
-  } else if (m == 2) { /* high shelf */
-    float two_sqrtA_alpha = 2.0f * sqrtf(A) * alpha;
-    b0 = A * ((A + 1) + (A - 1) * cosw + two_sqrtA_alpha);
-    b1 = -2 * A * ((A - 1) + (A + 1) * cosw);
-    b2 = A * ((A + 1) + (A - 1) * cosw - two_sqrtA_alpha);
-    a0 = (A + 1) - (A - 1) * cosw + two_sqrtA_alpha;
-    a1 = 2 * ((A - 1) - (A + 1) * cosw);
-    a2 = (A + 1) - (A - 1) * cosw - two_sqrtA_alpha;
-  } else { /* peak */
-    b0 = 1 + alpha * A; b1 = -2 * cosw; b2 = 1 - alpha * A;
-    a0 = 1 + alpha / A; a1 = -2 * cosw; a2 = 1 - alpha / A;
-  }
-  s->b0 = b0 / a0; s->b1 = b1 / a0; s->b2 = b2 / a0;
-  s->a1 = a1 / a0; s->a2 = a2 / a0;
-  s->last_f = freq; s->last_g = gain_db; s->last_q = q; s->last_m = mode;
-}
 
 static LADSPA_Handle eq_inst(const LADSPA_Descriptor *d, unsigned long sr) {
   (void)d;
   Eq *s = calloc(1, sizeof(Eq));
-  if (s) { s->sr = (float)sr; eq_design(s, 1000.0f, 0.0f, 0.707f, 0.0f); }
+  if (s) {
+    s->sr = (float)(sr ? sr : 48000);
+    s->f_sm = 1000.0f; s->g_sm = 0.0f; s->q_sm = 0.707f; s->mode_i = 0;
+    bq_rbj(&s->c, s->f_sm, s->g_sm, s->q_sm, s->mode_i, s->sr);
+    s->primed = 1;
+  }
   return s;
 }
 static void eq_connect(LADSPA_Handle h, unsigned long port, LADSPA_Data *data) {
@@ -252,7 +401,7 @@ static void eq_run(LADSPA_Handle h, unsigned long n) {
   float freq = s->p[EQ_FREQ] ? *s->p[EQ_FREQ] : 1000.0f;
   float gain = s->p[EQ_GAIN] ? *s->p[EQ_GAIN] : 0.0f;
   float q = s->p[EQ_Q] ? *s->p[EQ_Q] : 0.707f;
-  float mode = s->p[EQ_MODE] ? *s->p[EQ_MODE] : 0.0f;
+  int mode_i = s->p[EQ_MODE] ? (int)(*s->p[EQ_MODE]) : 0;
   const float *il = s->p[EQ_IN_L], *ir = s->p[EQ_IN_R];
   float *ol = s->o[EQ_OUT_L], *or_ = s->o[EQ_OUT_R];
   if (!il || !ol) return;
@@ -262,19 +411,23 @@ static void eq_run(LADSPA_Handle h, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
     return;
   }
-  if (freq != s->last_f || gain != s->last_g || q != s->last_q || mode != s->last_m)
-    eq_design(s, freq, gain, q, mode);
+  float sc = ms_to_coeff(6.0f, s->sr);
   for (unsigned long i = 0; i < n; i++) {
-    float x = il[i];
-    float y = s->b0 * x + s->z1l;
-    s->z1l = s->b1 * x - s->a1 * y + s->z2l;
-    s->z2l = s->b2 * x - s->a2 * y;
-    ol[i] = y;
-    x = ir[i];
-    y = s->b0 * x + s->z1r;
-    s->z1r = s->b1 * x - s->a1 * y + s->z2r;
-    s->z2r = s->b2 * x - s->a2 * y;
-    or_[i] = y;
+    if (mode_i != s->mode_i) {
+      s->mode_i = mode_i;
+      s->f_sm = freq; s->g_sm = gain; s->q_sm = q;
+      s->z1l = s->z2l = s->z1r = s->z2r = 0.0f;
+      bq_rbj(&s->c, s->f_sm, s->g_sm, s->q_sm, s->mode_i, s->sr);
+    } else {
+      int moving = fabsf(freq - s->f_sm) > 1.0e-5f || fabsf(gain - s->g_sm) > 1.0e-5f
+                || fabsf(q - s->q_sm) > 1.0e-5f;
+      smooth_toward(&s->f_sm, freq, sc);
+      smooth_toward(&s->g_sm, gain, sc);
+      smooth_toward(&s->q_sm, q, sc);
+      if (moving) bq_rbj(&s->c, s->f_sm, s->g_sm, s->q_sm, s->mode_i, s->sr);
+    }
+    ol[i] = bq_tick(&s->c, il[i], &s->z1l, &s->z2l);
+    or_[i] = bq_tick(&s->c, ir[i], &s->z1r, &s->z2r);
   }
 }
 static void eq_cleanup(LADSPA_Handle h) { free(h); }
@@ -414,66 +567,36 @@ enum {
   E8_N
 };
 typedef struct {
-  float b0, b1, b2, a1, a2;
+  BqCoeffs c;
   float z1l, z2l, z1r, z2r;
-  float last_f, last_g, last_q, last_m;
+  float f_sm, g_sm, q_sm;
+  int mode_i;
   int on;
+  int primed;
 } Eq8Band;
 typedef struct {
   const LADSPA_Data *p[E8_N];
   LADSPA_Data *o[E8_N];
   Eq8Band band[EQ8_BANDS];
   float sr;
+  float out_g_sm;
+  float mix_sm;
 } Eq8;
-
-static void e8_design(Eq8Band *b, float freq, float gain_db, float q, float mode, float sr) {
-  float w0 = 2.0f * (float)M_PI * clampf(freq, 20.0f, sr * 0.45f) / sr;
-  float cosw = cosf(w0), sinw = sinf(w0);
-  float A = powf(10.0f, gain_db / 40.0f);
-  q = fmaxf(q, 0.1f);
-  float alpha = sinw / (2.0f * q);
-  float b0, b1, b2, a0, a1, a2;
-  int m = (int)mode;
-  if (m == 3) {
-    b0 = (1 + cosw) * 0.5f; b1 = -(1 + cosw); b2 = b0;
-    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
-  } else if (m == 4) {
-    b0 = (1 - cosw) * 0.5f; b1 = 1 - cosw; b2 = b0;
-    a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
-  } else if (m == 1) {
-    float t = 2.0f * sqrtf(A) * alpha;
-    b0 = A * ((A + 1) - (A - 1) * cosw + t);
-    b1 = 2 * A * ((A - 1) - (A + 1) * cosw);
-    b2 = A * ((A + 1) - (A - 1) * cosw - t);
-    a0 = (A + 1) + (A - 1) * cosw + t;
-    a1 = -2 * ((A - 1) + (A + 1) * cosw);
-    a2 = (A + 1) + (A - 1) * cosw - t;
-  } else if (m == 2) {
-    float t = 2.0f * sqrtf(A) * alpha;
-    b0 = A * ((A + 1) + (A - 1) * cosw + t);
-    b1 = -2 * A * ((A - 1) + (A + 1) * cosw);
-    b2 = A * ((A + 1) + (A - 1) * cosw - t);
-    a0 = (A + 1) - (A - 1) * cosw + t;
-    a1 = 2 * ((A - 1) - (A + 1) * cosw);
-    a2 = (A + 1) - (A - 1) * cosw - t;
-  } else {
-    b0 = 1 + alpha * A; b1 = -2 * cosw; b2 = 1 - alpha * A;
-    a0 = 1 + alpha / A; a1 = -2 * cosw; a2 = 1 - alpha / A;
-  }
-  b->b0 = b0 / a0; b->b1 = b1 / a0; b->b2 = b2 / a0;
-  b->a1 = a1 / a0; b->a2 = a2 / a0;
-  b->last_f = freq; b->last_g = gain_db; b->last_q = q; b->last_m = mode;
-}
 
 static LADSPA_Handle e8_inst(const LADSPA_Descriptor *d, unsigned long sr) {
   (void)d;
   Eq8 *s = calloc(1, sizeof(Eq8));
   static const float def_f[EQ8_BANDS] = {60,150,400,1000,2500,5000,8000,12000};
   if (s) {
-    s->sr = (float)sr;
+    s->sr = (float)(sr ? sr : 48000);
+    s->out_g_sm = 1.0f;
+    s->mix_sm = 1.0f;
     for (int i = 0; i < EQ8_BANDS; i++) {
-      s->band[i].on = 1;
-      e8_design(&s->band[i], def_f[i], 0.0f, 0.707f, 0.0f, s->sr);
+      Eq8Band *b = &s->band[i];
+      b->on = 1;
+      b->f_sm = def_f[i]; b->g_sm = 0.0f; b->q_sm = 0.707f; b->mode_i = 0;
+      bq_rbj(&b->c, b->f_sm, b->g_sm, b->q_sm, b->mode_i, s->sr);
+      b->primed = 1;
     }
   }
   return s;
@@ -484,48 +607,60 @@ static void e8_connect(LADSPA_Handle h, unsigned long port, LADSPA_Data *data) {
 }
 static void e8_run(LADSPA_Handle h, unsigned long n) {
   Eq8 *s = h;
-  float out_g = s->p[E8_OUTGAIN] ? db_to_lin(*s->p[E8_OUTGAIN]) : 1.0f;
-  float mix = s->p[E8_MIX] ? clampf(*s->p[E8_MIX], 0.0f, 1.0f) : 1.0f;
+  float out_g_tgt = s->p[E8_OUTGAIN] ? db_to_lin(*s->p[E8_OUTGAIN]) : 1.0f;
+  float mix_tgt = s->p[E8_MIX] ? clampf(*s->p[E8_MIX], 0.0f, 1.0f) : 1.0f;
   int bypass = s->p[E8_BYPASS] && *s->p[E8_BYPASS] >= 0.5f;
   const float *il = s->p[E8_IN_L], *ir = s->p[E8_IN_R];
   float *ol = s->o[E8_OUT_L], *or_ = s->o[E8_OUT_R];
   if (!il || !ol) return;
   if (!ir) ir = il;
   if (!or_) or_ = ol;
-  if (bypass || mix < 1.0e-5f) {
+  if (bypass || mix_tgt < 1.0e-5f) {
     for (unsigned long i = 0; i < n; i++) { ol[i] = il[i]; or_[i] = ir[i]; }
+    s->mix_sm = mix_tgt;
     return;
   }
+  float freq_t[EQ8_BANDS], gain_t[EQ8_BANDS], q_t[EQ8_BANDS];
+  int mode_t[EQ8_BANDS];
   for (int bi = 0; bi < EQ8_BANDS; bi++) {
     int base = E8_B0 + bi * 5;
     float on = s->p[base] ? *s->p[base] : 1.0f;
-    float freq = s->p[base+1] ? *s->p[base+1] : 1000.0f;
-    float gain = s->p[base+2] ? *s->p[base+2] : 0.0f;
-    float q = s->p[base+3] ? *s->p[base+3] : 0.707f;
-    float mode = s->p[base+4] ? *s->p[base+4] : 0.0f;
     s->band[bi].on = on >= 0.5f;
-    Eq8Band *b = &s->band[bi];
-    if (freq != b->last_f || gain != b->last_g || q != b->last_q || mode != b->last_m)
-      e8_design(b, freq, gain, q, mode, s->sr);
+    freq_t[bi] = s->p[base+1] ? *s->p[base+1] : 1000.0f;
+    gain_t[bi] = s->p[base+2] ? *s->p[base+2] : 0.0f;
+    q_t[bi] = s->p[base+3] ? *s->p[base+3] : 0.707f;
+    mode_t[bi] = s->p[base+4] ? (int)(*s->p[base+4]) : 0;
   }
+  float sc = ms_to_coeff(6.0f, s->sr);
+  float sg = ms_to_coeff(5.0f, s->sr); /* output / mix only — safe to lerp */
   for (unsigned long i = 0; i < n; i++) {
+    smooth_toward(&s->out_g_sm, out_g_tgt, sg);
+    smooth_toward(&s->mix_sm, mix_tgt, sg);
     float l = il[i], r = ir[i];
     for (int bi = 0; bi < EQ8_BANDS; bi++) {
       Eq8Band *b = &s->band[bi];
       if (!b->on) continue;
-      float y = b->b0 * l + b->z1l;
-      b->z1l = b->b1 * l - b->a1 * y + b->z2l;
-      b->z2l = b->b2 * l - b->a2 * y;
-      l = y;
-      y = b->b0 * r + b->z1r;
-      b->z1r = b->b1 * r - b->a1 * y + b->z2r;
-      b->z2r = b->b2 * r - b->a2 * y;
-      r = y;
+      if (mode_t[bi] != b->mode_i) {
+        b->mode_i = mode_t[bi];
+        b->f_sm = freq_t[bi]; b->g_sm = gain_t[bi]; b->q_sm = q_t[bi];
+        b->z1l = b->z2l = b->z1r = b->z2r = 0.0f;
+        bq_rbj(&b->c, b->f_sm, b->g_sm, b->q_sm, b->mode_i, s->sr);
+      } else {
+        int moving = fabsf(freq_t[bi] - b->f_sm) > 1.0e-5f
+                  || fabsf(gain_t[bi] - b->g_sm) > 1.0e-5f
+                  || fabsf(q_t[bi] - b->q_sm) > 1.0e-5f;
+        smooth_toward(&b->f_sm, freq_t[bi], sc);
+        smooth_toward(&b->g_sm, gain_t[bi], sc);
+        smooth_toward(&b->q_sm, q_t[bi], sc);
+        if (moving) bq_rbj(&b->c, b->f_sm, b->g_sm, b->q_sm, b->mode_i, s->sr);
+      }
+      l = bq_tick(&b->c, l, &b->z1l, &b->z2l);
+      r = bq_tick(&b->c, r, &b->z1r, &b->z2r);
     }
-    float wl = l * out_g;
-    float wr = r * out_g;
-    ol[i] = il[i] + mix * (wl - il[i]);
-    or_[i] = ir[i] + mix * (wr - ir[i]);
+    float wl = l * s->out_g_sm;
+    float wr = r * s->out_g_sm;
+    ol[i] = il[i] + s->mix_sm * (wl - il[i]);
+    or_[i] = ir[i] + s->mix_sm * (wr - ir[i]);
   }
 }
 static void e8_cleanup(LADSPA_Handle h) { free(h); }
@@ -542,7 +677,7 @@ enum {
 };
 
 typedef struct {
-  float b0, b1, b2, a1, a2;
+  BqCoeffs c;
   float z1l, z2l, z1r, z2r;
 } OdBq;
 
@@ -555,36 +690,37 @@ typedef struct {
   float xl_lp, xr_lp;    /* one-pole split */
   float dc_x_l, dc_y_l, dc_x_r, dc_y_r;
   float prev_l, prev_r;
-  float last_color, last_postf, last_shape;
+  float color_sm, postf_sm;
+  float last_shape;
+  int primed;
 } Overdrive;
 
-static void od_bq_lp(OdBq *f, float freq, float q, float sr) {
+static void od_bq_lp(OdBq *f, float freq, float q, float sr, int clear_z) {
   float w0 = 2.0f * (float)M_PI * clampf(freq, 20.0f, sr * 0.45f) / sr;
   float cosw = cosf(w0), sinw = sinf(w0);
   float alpha = sinw / (2.0f * fmaxf(q, 0.3f));
   float b0 = (1.0f - cosw) * 0.5f, b1 = 1.0f - cosw, b2 = b0;
   float a0 = 1.0f + alpha, a1 = -2.0f * cosw, a2 = 1.0f - alpha;
-  f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0;
-  f->a1 = a1 / a0; f->a2 = a2 / a0;
+  f->c.b0 = b0 / a0; f->c.b1 = b1 / a0; f->c.b2 = b2 / a0;
+  f->c.a1 = a1 / a0; f->c.a2 = a2 / a0;
+  if (clear_z) f->z1l = f->z2l = f->z1r = f->z2r = 0.0f;
 }
 
-static void od_bq_bp(OdBq *f, float freq, float q, float sr) {
+static void od_bq_bp(OdBq *f, float freq, float q, float sr, int clear_z) {
   float w0 = 2.0f * (float)M_PI * clampf(freq, 20.0f, sr * 0.45f) / sr;
   float cosw = cosf(w0), sinw = sinf(w0);
   float alpha = sinw / (2.0f * fmaxf(q, 0.3f));
   float b0 = alpha, b1 = 0.0f, b2 = -alpha;
   float a0 = 1.0f + alpha, a1 = -2.0f * cosw, a2 = 1.0f - alpha;
-  f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0;
-  f->a1 = a1 / a0; f->a2 = a2 / a0;
+  f->c.b0 = b0 / a0; f->c.b1 = b1 / a0; f->c.b2 = b2 / a0;
+  f->c.a1 = a1 / a0; f->c.a2 = a2 / a0;
+  if (clear_z) f->z1l = f->z2l = f->z1r = f->z2r = 0.0f;
 }
 
 static inline float od_bq_tick(OdBq *f, float x, int ch) {
   float *z1 = ch ? &f->z1r : &f->z1l;
   float *z2 = ch ? &f->z2r : &f->z2l;
-  float y = f->b0 * x + *z1;
-  *z1 = f->b1 * x - f->a1 * y + *z2;
-  *z2 = f->b2 * x - f->a2 * y;
-  return y;
+  return bq_tick(&f->c, x, z1, z2);
 }
 
 static inline float od_shape(float x, int character) {
@@ -624,11 +760,12 @@ static LADSPA_Handle od_inst(const LADSPA_Descriptor *d, unsigned long sr) {
   Overdrive *s = calloc(1, sizeof(Overdrive));
   if (s) {
     s->sr = (float)(sr ? sr : 48000);
-    od_bq_lp(&s->pre, 180.0f, 0.707f, s->sr);
-    od_bq_lp(&s->post, 3200.0f, 0.707f, s->sr);
-    s->last_color = 180.0f;
-    s->last_postf = 3200.0f;
+    s->color_sm = 180.0f;
+    s->postf_sm = 3200.0f;
     s->last_shape = 0.0f;
+    od_bq_lp(&s->pre, s->color_sm, 0.707f, s->sr, 1);
+    od_bq_lp(&s->post, s->postf_sm, 0.707f, s->sr, 1);
+    s->primed = 1;
   }
   return s;
 }
@@ -667,19 +804,7 @@ static void od_run(LADSPA_Handle h, unsigned long n) {
     return;
   }
 
-  if (color != s->last_color || preshape != s->last_shape) {
-    if (preshape >= 0.5f)
-      od_bq_bp(&s->pre, color, 0.85f, s->sr);
-    else
-      od_bq_lp(&s->pre, color, 0.707f, s->sr);
-    s->last_color = color;
-    s->last_shape = preshape;
-  }
-  if (postf != s->last_postf) {
-    od_bq_lp(&s->post, postf, 0.707f, s->sr);
-    s->last_postf = postf;
-  }
-
+  float sc = ms_to_coeff(6.0f, s->sr);
   float gain = 1.0f + drive * drive * 36.0f;
   if (boost) gain *= 10.0f;
   float bias_amt = bias * 0.22f;
@@ -688,6 +813,30 @@ static void od_run(LADSPA_Handle h, unsigned long n) {
   const float dcR = 0.995f;
 
   for (unsigned long i = 0; i < n; i++) {
+    int shape_flip = (preshape >= 0.5f) != (s->last_shape >= 0.5f);
+    if (shape_flip) {
+      s->last_shape = preshape;
+      s->color_sm = color;
+      if (preshape >= 0.5f)
+        od_bq_bp(&s->pre, s->color_sm, 0.85f, s->sr, 1);
+      else
+        od_bq_lp(&s->pre, s->color_sm, 0.707f, s->sr, 1);
+    } else {
+      int moving = fabsf(color - s->color_sm) > 1.0e-4f;
+      smooth_toward(&s->color_sm, color, sc);
+      if (moving) {
+        if (preshape >= 0.5f)
+          od_bq_bp(&s->pre, s->color_sm, 0.85f, s->sr, 0);
+        else
+          od_bq_lp(&s->pre, s->color_sm, 0.707f, s->sr, 0);
+      }
+    }
+    {
+      int moving = fabsf(postf - s->postf_sm) > 1.0e-4f;
+      smooth_toward(&s->postf_sm, postf, sc);
+      if (moving) od_bq_lp(&s->post, s->postf_sm, 0.707f, s->sr, 0);
+    }
+
     float in_l = il[i], in_r = ir[i];
 
     s->xl_lp = split_c * s->xl_lp + (1.0f - split_c) * in_l;
@@ -780,18 +929,30 @@ static void init_all(void) {
   D[0].Properties=LADSPA_PROPERTY_HARD_RT_CAPABLE;
   D[0].instantiate=sc_inst; D[0].connect_port=sc_connect; D[0].run=sc_run; D[0].cleanup=sc_cleanup;
 
-  /* Limiter 392011 */
+  /* Limiter 392011 — brickwall + attack/lookahead/knee/input/makeup */
   PN[1][0]="Input L"; PN[1][1]="Input R"; PN[1][2]="Output L"; PN[1][3]="Output R";
-  PN[1][4]="Ceiling (dB)"; PN[1][5]="Release (ms)"; PN[1][6]="Bypass";
+  PN[1][4]="Ceiling (dB)"; PN[1][5]="Attack (ms)"; PN[1][6]="Release (ms)";
+  PN[1][7]="Lookahead (ms)"; PN[1][8]="Soft Knee (dB)";
+  PN[1][9]="Input (dB)"; PN[1][10]="Makeup (dB)"; PN[1][11]="Bypass";
   for (int i=0;i<4;i++) PD[1][i]=(i<2)?(LADSPA_PORT_INPUT|LADSPA_PORT_AUDIO):(LADSPA_PORT_OUTPUT|LADSPA_PORT_AUDIO);
   for (int i=4;i<LM_N;i++) PD[1][i]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
   memset(PH[1],0,sizeof(PH[1]));
   PH[1][4].LowerBound=-24; PH[1][4].UpperBound=0;
   PH[1][4].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_HIGH;
-  PH[1][5].LowerBound=1; PH[1][5].UpperBound=500;
-  PH[1][5].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_MIDDLE;
-  PH[1][6].LowerBound=0; PH[1][6].UpperBound=1;
-  PH[1][6].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_TOGGLED|LADSPA_HINT_DEFAULT_0;
+  PH[1][5].LowerBound=0.01f; PH[1][5].UpperBound=50;
+  PH[1][5].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_LOW;
+  PH[1][6].LowerBound=1; PH[1][6].UpperBound=500;
+  PH[1][6].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_MIDDLE;
+  PH[1][7].LowerBound=0; PH[1][7].UpperBound=10;
+  PH[1][7].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_LOW;
+  PH[1][8].LowerBound=0; PH[1][8].UpperBound=12;
+  PH[1][8].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_0;
+  PH[1][9].LowerBound=-24; PH[1][9].UpperBound=24;
+  PH[1][9].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_0;
+  PH[1][10].LowerBound=-24; PH[1][10].UpperBound=24;
+  PH[1][10].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_DEFAULT_0;
+  PH[1][11].LowerBound=0; PH[1][11].UpperBound=1;
+  PH[1][11].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_TOGGLED|LADSPA_HINT_DEFAULT_0;
   D[1].UniqueID=392011; D[1].Label="buschain_limiter"; D[1].Name="BusChain Limiter";
   D[1].Maker="BusChain Control"; D[1].Copyright="MIT"; D[1].PortCount=LM_N;
   D[1].PortDescriptors=PD[1]; D[1].PortNames=PN[1]; D[1].PortRangeHints=PH[1];
@@ -859,7 +1020,7 @@ static void init_all(void) {
   D[4].Properties=LADSPA_PROPERTY_HARD_RT_CAPABLE;
   D[4].instantiate=pt_inst; D[4].connect_port=pt_connect; D[4].run=pt_run; D[4].cleanup=pt_cleanup;
 
-  /* EQ8 392015 */
+  /* Equalizer 392015 */
   {
     static const float def_f[EQ8_BANDS] = {60,150,400,1000,2500,5000,8000,12000};
     static char names[E8_N][24];
@@ -901,7 +1062,7 @@ static void init_all(void) {
     PD[5][E8_BYPASS]=LADSPA_PORT_INPUT|LADSPA_PORT_CONTROL;
     PH[5][E8_BYPASS].LowerBound=0; PH[5][E8_BYPASS].UpperBound=1;
     PH[5][E8_BYPASS].HintDescriptor=LADSPA_HINT_BOUNDED_BELOW|LADSPA_HINT_BOUNDED_ABOVE|LADSPA_HINT_TOGGLED|LADSPA_HINT_DEFAULT_0;
-    D[5].UniqueID=392015; D[5].Label="buschain_eq8"; D[5].Name="BusChain EQ 8-Band";
+    D[5].UniqueID=392015; D[5].Label="buschain_equalizer"; D[5].Name="Equalizer";
     D[5].Maker="BusChain Control"; D[5].Copyright="MIT"; D[5].PortCount=E8_N;
     D[5].PortDescriptors=PD[5]; D[5].PortNames=PN[5]; D[5].PortRangeHints=PH[5];
     D[5].Properties=LADSPA_PROPERTY_HARD_RT_CAPABLE;

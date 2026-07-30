@@ -5,8 +5,9 @@ fn usage() -> ! {
         "buschain-ctl — talk to BusChain Control (tray app embedded IPC)\n\n\
          Usage:\n\
            buschain-ctl ping|status\n\
+           buschain-ctl mixer\n\
            buschain-ctl hw-vol get|set <pct>|up [n]|down [n]|mute on|off|toggle\n\
-           buschain-ctl playback list|vol <index> <pct>|mute <index> on|off|toggle\n\
+           buschain-ctl playback list|vol <index> <pct>|mute <index> on|off|toggle|move <index> <sink>\n\
            buschain-ctl track vol <id> <db>|mute <id> on|off|toggle\n\
            buschain-ctl devices list\n\
            buschain-ctl default sink|source <name>\n\
@@ -34,11 +35,7 @@ fn print_status_waybar(st: &buschain_control::ipc::Status) {
     } else {
         "online"
     };
-    // Compact waybar label: icon + percent only (device name stays in tooltip).
-    // Include sink name so the waybar scroll helper can pactl the Master HW
-    // directly without a second IPC round-trip.
     let sink = st.master_hw.as_deref().unwrap_or("").replace('"', "'");
-    // Master HW never advertises boost — clamp label + percentage at 100.
     let pct = st.hw_volume_pct.min(100);
     println!(
         "{{\"text\":\"{} {}%\",\"tooltip\":\"{}\\n{} · {} Hz q{}\\n{}\",\"percentage\":{},\"class\":\"{}\",\"sink\":\"{}\",\"muted\":{}}}",
@@ -56,11 +53,13 @@ fn print_status_waybar(st: &buschain_control::ipc::Status) {
     );
 }
 
-fn is_buschain_node(name: &str) -> bool {
-    name.starts_with("buschain_")
-        || name.starts_with("easyeffects_")
-        || name.contains("filter-chain")
-        || name == "auto_null"
+fn print_mixer_from_snapshot(
+    status: Option<&buschain_control::ipc::Status>,
+    snapshot: Option<&buschain_control::audio::graph::PwSnapshot>,
+    session: Option<&buschain_control::session::Session>,
+) {
+    let out = buschain_control::mixer_api::build_mixer_json(status, snapshot, session);
+    println!("{out}");
 }
 
 fn main() {
@@ -72,6 +71,7 @@ fn main() {
     let req = match cmd.as_str() {
         "ping" => Request::Ping,
         "status" => Request::GetStatus,
+        "mixer" => Request::GetMixer,
         "hw-vol" => {
             let sub = args.first().map(|s| s.as_str()).unwrap_or("get");
             match sub {
@@ -125,7 +125,6 @@ fn main() {
                     let mute = match mode {
                         "on" | "1" | "true" => true,
                         "off" | "0" | "false" => false,
-                        // Cached snapshot — never force a full pactl refresh for mute toggle.
                         "toggle" => match Client::call(&Request::GetSnapshot) {
                             Ok(Response::Ok {
                                 snapshot: Some(snap),
@@ -141,6 +140,14 @@ fn main() {
                         _ => usage(),
                     };
                     Request::SetSinkInputMute { index, mute }
+                }
+                "move" => {
+                    let index: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let sink = args.get(2).cloned().unwrap_or_default();
+                    if sink.is_empty() {
+                        usage();
+                    }
+                    Request::MoveSinkInput { index, sink }
                 }
                 _ => usage(),
             }
@@ -166,7 +173,29 @@ fn main() {
                     let mute = match mode {
                         "on" | "1" | "true" => true,
                         "off" | "0" | "false" => false,
-                        "toggle" => true, // daemon has no cheap read; mixer sends explicit on/off
+                        "toggle" => match Client::call(&Request::GetMixer) {
+                            Ok(Response::Mixer { mixer, .. }) => mixer
+                                .get("tracks")
+                                .and_then(|t| t.as_array())
+                                .and_then(|arr| {
+                                    arr.iter().find(|t| {
+                                        t.get("id").and_then(|v| v.as_str()) == Some(&id.to_string())
+                                    })
+                                })
+                                .and_then(|t| t.get("mute").and_then(|v| v.as_bool()))
+                                .map(|m| !m)
+                                .unwrap_or(true),
+                            Ok(Response::Ok {
+                                session: Some(sess),
+                                ..
+                            }) => sess
+                                .tracks
+                                .iter()
+                                .find(|t| t.id == id)
+                                .map(|t| !t.mute)
+                                .unwrap_or(true),
+                            _ => true,
+                        },
                         _ => usage(),
                     };
                     Request::SetTrackMixer {
@@ -253,14 +282,34 @@ fn main() {
         _ => usage(),
     };
 
-    // HW volume / mute need the short timeout — waybar scroll must not wait on
-    // a 5s IPC budget when the daemon is briefly busy.
-    let resp = if matches!(cmd.as_str(), "hw-vol" | "status" | "ping") {
+    // Waybar on-scroll: poke and exit — never wait for a reply.
+    let hw_scroll = cmd == "hw-vol"
+        && matches!(
+            args.first().map(|s| s.as_str()),
+            Some("up") | Some("down")
+        );
+    if hw_scroll {
+        match Client::poke(&req) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("buschain-ctl: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let resp = if matches!(
+        cmd.as_str(),
+        "hw-vol" | "status" | "ping" | "popup" | "mixer"
+    ) {
         Client::call_fast(&req).or_else(|_| Client::call(&req))
     } else {
         Client::call(&req)
     };
     match resp {
+        Ok(Response::Mixer { mixer, .. }) => {
+            println!("{mixer}");
+        }
         Ok(Response::Ok {
             message,
             status,
@@ -276,8 +325,6 @@ fn main() {
                         return;
                     }
                 }
-                // Scroll path: print JSON for instant module text; waybar script signals once.
-                // Do not pkill here — double-signal races make scroll feel sticky.
                 if matches!(sub, "up" | "down" | "set" | "mute") {
                     if let Some(st) = &status {
                         print_status_waybar(st);
@@ -294,125 +341,16 @@ fn main() {
             if (cmd == "playback" && args.first().map(|s| s.as_str()) == Some("list"))
                 || cmd == "devices"
             {
-                let st = status.clone().or_else(|| match Client::call(&Request::GetStatus) {
-                    Ok(Response::Ok {
-                        status: Some(s), ..
-                    }) => Some(s),
-                    _ => None,
-                });
-                let sess = session.as_ref();
-                let master = sess
-                    .and_then(|s| s.master_output.clone())
-                    .or_else(|| st.as_ref().and_then(|s| s.master_hw.clone()));
-                let default_sink = snapshot
+                let st = status
                     .as_ref()
-                    .and_then(|s| s.default_sink.clone());
-                let default_source = snapshot
-                    .as_ref()
-                    .and_then(|s| s.default_source.clone());
-
-                let streams: Vec<serde_json::Value> = snapshot
-                    .as_ref()
-                    .map(|snap| {
-                        snap.sink_inputs
-                            .iter()
-                            .filter(|s| s.is_user_app())
-                            .map(|s| {
-                                serde_json::json!({
-                                    "index": s.index,
-                                    "name": s.display_name(),
-                                    "meta": s.sink_or_source,
-                                    "volume_pct": s.volume_pct,
-                                    "mute": s.mute,
-                                    "icon_name": s.icon_name,
-                                    "binary": s.binary,
-                                    "app_id": s.app_id,
-                                    "application": s.application,
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let sinks: Vec<serde_json::Value> = snapshot
-                    .as_ref()
-                    .map(|snap| {
-                        snap.sinks
-                            .iter()
-                            .filter(|s| !is_buschain_node(&s.name))
-                            .map(|s| {
-                                serde_json::json!({
-                                    "name": s.name,
-                                    "desc": s.description,
-                                    "volume_pct": s.volume_pct,
-                                    "mute": s.mute,
-                                    "is_master": master.as_deref() == Some(s.name.as_str()),
-                                    "is_default": default_sink.as_deref() == Some(s.name.as_str()),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let sources: Vec<serde_json::Value> = snapshot
-                    .as_ref()
-                    .map(|snap| {
-                        snap.sources
-                            .iter()
-                            .filter(|s| !is_buschain_node(&s.name) && !s.name.contains(".monitor"))
-                            .map(|s| {
-                                serde_json::json!({
-                                    "name": s.name,
-                                    "desc": s.description,
-                                    "volume_pct": s.volume_pct,
-                                    "mute": s.mute,
-                                    "is_default": default_source.as_deref() == Some(s.name.as_str()),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let tracks: Vec<serde_json::Value> = sess
-                    .map(|s| {
-                        s.tracks
-                            .iter()
-                            .map(|t| {
-                                let kind = if t.kind.is_master() {
-                                    "master"
-                                } else {
-                                    "track"
-                                };
-                                serde_json::json!({
-                                    "id": t.id.to_string(),
-                                    "name": t.name,
-                                    "kind": kind,
-                                    "gain_db": t.gain_db,
-                                    "mute": t.mute,
-                                    "bus": t.expected_sink_name(),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let out = serde_json::json!({
-                    "status": st.as_ref().map(|s| serde_json::json!({
-                        "master_hw": s.master_hw,
-                        "master_hw_desc": s.master_hw_desc,
-                        "hw_volume_pct": s.hw_volume_pct,
-                        "hw_mute": s.hw_mute,
-                        "session_name": s.session_name,
-                        "sample_rate": s.sample_rate,
-                    })),
-                    "streams": streams,
-                    "sinks": sinks,
-                    "sources": sources,
-                    "tracks": tracks,
-                    "default_sink": default_sink,
-                    "default_source": default_source,
-                });
-                println!("{out}");
+                    .cloned()
+                    .or_else(|| match Client::call(&Request::GetStatus) {
+                        Ok(Response::Ok {
+                            status: Some(s), ..
+                        }) => Some(s),
+                        _ => None,
+                    });
+                print_mixer_from_snapshot(st.as_ref(), snapshot.as_ref(), session.as_ref());
                 return;
             }
             if let Some(list) = sessions {
@@ -438,6 +376,16 @@ fn main() {
             std::process::exit(1);
         }
         Err(e) => {
+            if cmd == "status" || cmd == "ping" {
+                let tip = format!("buschain-control not running ({e})")
+                    .replace('\\', "\\\\")
+                    .replace('"', "'")
+                    .replace('\n', " ");
+                println!(
+                    "{{\"text\":\"vol —\",\"tooltip\":\"{tip}\",\"class\":\"offline\",\"percentage\":0,\"muted\":false,\"sink\":\"\"}}"
+                );
+                std::process::exit(0);
+            }
             eprintln!("buschain-ctl: {e:#}");
             eprintln!("Is buschain-control running? (Hyprland: exec-once = buschain-control --hidden)");
             std::process::exit(1);

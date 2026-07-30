@@ -191,10 +191,31 @@ pub enum Command {
     Shutdown,
 }
 
+/// Why a session snapshot was pushed to the UI (typed — no string matching).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAppliedKind {
+    Full,
+    Ensure,
+    FxRewire,
+    Route,
+    Clock,
+    Levels,
+    Other,
+}
+
 pub enum Event {
     Snapshot(PwSnapshot),
     Status(String),
-    SessionApplied { session: Session, message: String },
+    SessionApplied {
+        session: Session,
+        message: String,
+        kind: SessionAppliedKind,
+    },
+    /// Host FX gen-swap finished for a track bus.
+    FxReady {
+        track_id: uuid::Uuid,
+        bus: String,
+    },
     Error(String),
     MidiSnapshot(buschain_engine::MidiSnapshot),
     MidiLearnBound { map: buschain_engine::MidiCcMap },
@@ -319,6 +340,7 @@ fn daemon_client_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<Event>) {
                 } else {
                     message
                 },
+                kind: SessionAppliedKind::Full,
             });
         } else if let Some(st) = status {
             let _ = ev_tx.send(Event::Status(st.message));
@@ -378,6 +400,7 @@ fn daemon_client_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<Event>) {
                             let _ = ev_tx.send(Event::SessionApplied {
                                 session: sess,
                                 message: message.clone(),
+                                kind: SessionAppliedKind::Other,
                             });
                         } else if let Some(st) = status {
                             let _ = ev_tx.send(Event::Status(st.message));
@@ -385,6 +408,7 @@ fn daemon_client_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<Event>) {
                             let _ = ev_tx.send(Event::Status(message));
                         }
                     }
+                    Ok(Response::Mixer { .. }) => {}
                     Ok(Response::Err { error }) => {
                         let _ = ev_tx.send(Event::Error(error));
                     }
@@ -534,19 +558,15 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
     // Buses before PlaceApp; FX/ApplySession after so assign isn't starved by rewire.
     fast.append(&mut ensure);
     fast.append(&mut place);
+    // Union: routes and per-track FX both keep — routes must not discard FX rewires.
     for (track_id, session) in rewire_fx {
         heavy.push(Command::RewireTrackFx { session, track_id });
     }
     if let Some(s) = session_routes {
-        // Full-session route supersedes per-track FX in the same batch.
-        heavy.retain(|c| {
-            !matches!(
-                c,
-                Command::RewireTrackFx { .. } | Command::HotplugTrack { .. }
-            )
-        });
         heavy.push(Command::RewireSessionRoutes(s));
     }
+    crate::audio::adaptive::AdaptivePolicy::global()
+        .set_queue_depth(fast.len() + ensure.len() + place.len() + heavy.len());
     fast.append(&mut heavy);
     fast
 }
@@ -614,10 +634,62 @@ fn schedule_props_retry(
     );
 }
 
+/// Deferred PlaceApp — bus may still be spawning; never block the command loop.
+struct PlaceRetry {
+    sink: String,
+    after: Instant,
+    attempts: u8,
+    last_err: String,
+}
+
+fn flush_place_retries(
+    place_retry: &mut HashMap<String, PlaceRetry>,
+    tx: &Sender<Event>,
+) {
+    let due: Vec<String> = place_retry
+        .iter()
+        .filter(|(_, r)| Instant::now() >= r.after)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for app_key in due {
+        let Some(retry) = place_retry.remove(&app_key) else {
+            continue;
+        };
+        match graph::place_app_on_sink(&app_key, &retry.sink) {
+            Ok(n) => {
+                let _ = tx.send(Event::Status(format!(
+                    "Placed {n} stream(s) → {}",
+                    retry.sink
+                )));
+                let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+            }
+            Err(e) if retry.attempts < 6 => {
+                place_retry.insert(
+                    app_key,
+                    PlaceRetry {
+                        sink: retry.sink,
+                        after: Instant::now()
+                            + Duration::from_millis(80 + u64::from(retry.attempts) * 40),
+                        attempts: retry.attempts + 1,
+                        last_err: format!("{e:#}"),
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Error(format!(
+                    "place app: {} (retry: {e:#})",
+                    retry.last_err
+                )));
+            }
+        }
+    }
+}
+
 fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let mut fx = FilterChainRuntime::new();
     // Last session seen by the worker — used for idle GraphSupervisor ticks.
     let mut last_session: Option<Session> = None;
+    let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
     let midi_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
     let ms_sink = Arc::clone(&midi_session);
     let ms_bus = Arc::clone(&midi_session);
@@ -677,6 +749,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
 
     loop {
         flush_props_retries(&mut props_retry);
+        flush_place_retries(&mut place_retry, &tx);
         if let Ok(mut g) = midi_session.lock() {
             *g = last_session.clone();
         }
@@ -734,9 +807,21 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                     {
                         schedule_props_retry(&mut props_retry, bus, inserts);
                     }
+                    let bus = done
+                        .session
+                        .tracks
+                        .iter()
+                        .find(|t| t.id == done.track_id)
+                        .map(|t| t.expected_sink_name())
+                        .unwrap_or_default();
+                    let _ = tx.send(Event::FxReady {
+                        track_id: done.track_id,
+                        bus,
+                    });
                     let _ = tx.send(Event::SessionApplied {
                         session: done.session,
                         message,
+                        kind: SessionAppliedKind::FxRewire,
                     });
                 }
                 Err(e) => {
@@ -773,6 +858,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                         &mut last_session,
                         &mut muted_buses,
                         &mut props_retry,
+                        &mut place_retry,
                         &tx,
                         &fx_job_tx,
                     ) {
@@ -798,7 +884,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                             }
                             let batch = coalesce_commands(batch);
                             last_cmd_at = Instant::now();
-                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
+                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
                                 return;
                             }
                             continue;
@@ -817,7 +903,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                                 }
                                 let batch = coalesce_commands(batch);
                                 last_cmd_at = Instant::now();
-                                if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx)
+                                if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx)
                                 {
                                     return;
                                 }
@@ -838,7 +924,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                             }
                             let batch = coalesce_commands(batch);
                             last_cmd_at = Instant::now();
-                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
+                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
                                 return;
                             }
                             continue;
@@ -864,7 +950,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                         }
                         let batch = coalesce_commands(batch);
                         last_cmd_at = Instant::now();
-                        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
+                        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
                             return;
                         }
                         continue;
@@ -882,7 +968,7 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
         }
         let batch = coalesce_commands(batch);
         last_cmd_at = Instant::now();
-        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &tx, &fx_job_tx) {
+        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
             return;
         }
     }
@@ -895,6 +981,7 @@ fn process_command_batch(
     last_session: &mut Option<Session>,
     muted_buses: &mut HashMap<String, bool>,
     props_retry: &mut HashMap<String, PropsRetry>,
+    place_retry: &mut HashMap<String, PlaceRetry>,
     tx: &Sender<Event>,
     fx_job_tx: &Sender<FxEnsureJob>,
 ) -> bool {
@@ -936,7 +1023,7 @@ fn process_command_batch(
                                 Ok(route_msg) => {
                                     let message = format!("{clock_msg} · {route_msg}");
                                     *last_session = Some(session.clone());
-                                    let _ = tx.send(Event::SessionApplied { session, message });
+                                    let _ = tx.send(Event::SessionApplied { session, message, kind: SessionAppliedKind::Other });
                                     let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                                 }
                                 Err(e) => {
@@ -976,7 +1063,7 @@ fn process_command_batch(
                                         let message = format!("{clock_msg} · {route_msg}");
                                         *last_session = Some(session.clone());
                                         let _ =
-                                            tx.send(Event::SessionApplied { session, message });
+                                            tx.send(Event::SessionApplied { session, message, kind: SessionAppliedKind::Other });
                                         let _ =
                                             tx.send(Event::Snapshot(graph::refresh_snapshot()));
                                     }
@@ -992,6 +1079,7 @@ fn process_command_batch(
                                 let _ = tx.send(Event::SessionApplied {
                                     session,
                                     message: format!("Device clock → {device}"),
+                                    kind: SessionAppliedKind::Clock,
                                 });
                                 let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                             }
@@ -1012,7 +1100,7 @@ fn process_command_batch(
                     match graph::apply_session(&mut session, &mut fx, graph::ApplyKind::Full) {
                         Ok(message) => {
                             *last_session = Some(session.clone());
-                            let _ = tx.send(Event::SessionApplied { session, message });
+                            let _ = tx.send(Event::SessionApplied { session, message, kind: SessionAppliedKind::Other });
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                         }
                         Err(e) => {
@@ -1031,7 +1119,11 @@ fn process_command_batch(
                     ) {
                         Ok(message) => {
                             *last_session = Some(session.clone());
-                            let _ = tx.send(Event::SessionApplied { session, message });
+                            let _ = tx.send(Event::SessionApplied {
+                                session,
+                                message,
+                                kind: SessionAppliedKind::Route,
+                            });
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                         }
                         Err(e) => {
@@ -1174,7 +1266,11 @@ fn process_command_batch(
                                 }
                             }
                             *last_session = Some(session.clone());
-                            let _ = tx.send(Event::SessionApplied { session, message });
+                            let _ = tx.send(Event::SessionApplied {
+                                session,
+                                message,
+                                kind: SessionAppliedKind::Ensure,
+                            });
                             // Surface the new bus in Output / Playback immediately
                             // (idle full snapshot is ~30s).
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
@@ -1189,7 +1285,11 @@ fn process_command_batch(
                     removed_bus,
                 } => match graph::prune_removed_track(&session, &mut fx, &removed_bus) {
                     Ok(message) => {
-                        let _ = tx.send(Event::SessionApplied { session, message });
+                        let _ = tx.send(Event::SessionApplied {
+                            session,
+                            message,
+                            kind: SessionAppliedKind::Ensure,
+                        });
                         let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                     }
                     Err(e) => {
@@ -1327,21 +1427,16 @@ fn process_command_batch(
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                         }
                         Err(e) => {
-                            // Bus may still be spawning — one retry after a short wait.
-                            std::thread::sleep(Duration::from_millis(80));
-                            match graph::place_app_on_sink(&app_key, &sink) {
-                                Ok(n) => {
-                                    let _ = tx.send(Event::Status(format!(
-                                        "Placed {n} stream(s) → {sink}"
-                                    )));
-                                    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
-                                }
-                                Err(e2) => {
-                                    let _ = tx.send(Event::Error(format!(
-                                        "place app: {e:#} (retry: {e2:#})"
-                                    )));
-                                }
-                            }
+                            // Defer retry — never sleep on the Props/levels thread.
+                            place_retry.insert(
+                                app_key.clone(),
+                                PlaceRetry {
+                                    sink: sink.clone(),
+                                    after: Instant::now() + Duration::from_millis(80),
+                                    attempts: 1,
+                                    last_err: format!("{e:#}"),
+                                },
+                            );
                         }
                     }
                 }
@@ -1462,6 +1557,8 @@ fn poll_midi_actions(
                     })
                     .unwrap_or(false);
                 muted_buses.insert(sink.clone(), muted);
+                // Same path as UI faders — Desired + PW level together.
+                let _ = graph::apply_one_track_volume(&sink, gain_db);
                 let _ = crate::audio::engine_handle::set_levels(&sink, gain_db, muted);
             }
             buschain_engine::MidiAction::MapLearned { map } => {

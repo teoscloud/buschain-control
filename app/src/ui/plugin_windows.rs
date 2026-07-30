@@ -14,15 +14,16 @@ use crate::ui::mixer::{draw_plugin_params, draw_sidechain_picker};
 /// Preferred *width* — tight to content (no empty right pad).
 fn preferred_width(label: &str) -> f32 {
     match label {
-        "buschain_eq8" => 520.0,
+        "buschain_equalizer" | "buschain_eq8" => 680.0,
         "buschain_softclip" => 400.0,
         "buschain_overdrive" => 620.0,
         "buschain_denoiser" => 700.0,
         "buschain_pitch" => 280.0,
         "buschain_gate" => 360.0,
+        "buschain_reverb" => 780.0,
         "buschain_eq" => 300.0,
         "buschain_compressor" => 360.0,
-        "buschain_limiter" => 280.0,
+        "buschain_limiter" => 540.0,
         _ => 340.0,
     }
 }

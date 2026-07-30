@@ -6,12 +6,14 @@ mod mixer;
 mod playback;
 mod plugin_windows;
 mod recording;
+pub mod runtime;
 
 pub use config::{draw_config, draw_session};
 pub use devices::{draw_input_devices, draw_output_devices};
 pub use midi::draw_midi;
 pub use playback::draw_playback;
 pub use recording::draw_recording;
+pub use runtime::{UiRuntime, VizMode, IDLE_REPAINT_MS, LIVE_REPAINT_MS};
 
 use crate::app_state::AppState;
 use crate::design::{self, Theme};
@@ -151,8 +153,8 @@ pub fn draw(ctx: &egui::Context, state: &mut AppState) {
 fn draw_graph_loading_overlay(ctx: &egui::Context, state: &AppState) {
     let theme = state.theme;
     let screen = ctx.screen_rect();
-    // Paint dimmer on a layer — never allocate full-screen in an Area (that
-    // grew the viewport on startup and left a blank band under the mixer).
+    // Dimmer on Foreground — message must sit *above* this (Tooltip), or the
+    // prompt itself gets washed out under the same veil as the mixer.
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("graph_loading_dim"),
@@ -160,37 +162,40 @@ fn draw_graph_loading_overlay(ctx: &egui::Context, state: &AppState) {
     painter.rect_filled(
         screen,
         0.0,
-        egui::Color32::from_rgba_unmultiplied(12, 14, 18, 200),
+        egui::Color32::from_rgba_unmultiplied(8, 10, 14, 160),
     );
+    // Don't full-screen-allocate an Area here — that grew the viewport on
+    // startup. Dimmer is paint-only; prompt lives on a higher Order.
+
     let msg = if state.status.starts_with("Loading audio graph") {
         state.status.as_str()
     } else {
         "Loading audio graph — starting FX racks…"
     };
+    let card_bg = egui::Color32::from_rgb(28, 32, 40);
+    let title = egui::Color32::from_rgb(236, 240, 248);
+    let subtitle = egui::Color32::from_rgb(168, 176, 192);
     egui::Window::new("graph_loading_msg")
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
+        .order(egui::Order::Tooltip)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(
             egui::Frame::NONE
-                .fill(egui::Color32::from_rgba_unmultiplied(22, 26, 34, 240))
-                .corner_radius(8.0)
-                .inner_margin(egui::Margin::symmetric(20, 16))
+                .fill(card_bg)
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(24, 18))
                 .stroke(egui::Stroke::new(1.0_f32, theme.border_soft())),
         )
         .show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            ui.label(
-                egui::RichText::new(msg)
-                    .size(15.0)
-                    .color(theme.text()),
-            );
-            ui.add_space(6.0);
+            ui.set_max_width(440.0);
+            ui.label(egui::RichText::new(msg).size(16.0).strong().color(title));
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("App is awake — PipeWire helpers can take a few seconds.")
-                    .size(12.0)
-                    .color(theme.text_muted()),
+                    .size(12.5)
+                    .color(subtitle),
             );
         });
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -265,26 +270,48 @@ pub fn draw_popup(ctx: &egui::Context, state: &mut AppState) {
                         .strong()
                         .color(theme.accent()),
                 );
-                if let Some(sink) = state.snapshot.sinks.iter().find(|s| s.name == hw_name) {
-                    let mut mute = sink.mute;
+                let hw_snap = state
+                    .snapshot
+                    .sinks
+                    .iter()
+                    .find(|s| s.name == hw_name)
+                    .map(|s| (s.mute, s.volume_pct));
+                if let Some((hw_mute, hw_pct)) = hw_snap {
+                    let mut mute = hw_mute;
                     ui.horizontal(|ui| {
                         if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
                             .changed()
                         {
-                            state.worker.send(Command::SetSinkMute {
-                                name: hw_name.clone(),
+                            // One writer with waybar/GTK — embedded IPC hw-vol path.
+                            let _ = crate::ipc::Client::call_fast(&crate::ipc::Request::SetHwMute {
                                 mute,
+                            })
+                            .or_else(|_| {
+                                crate::ipc::Client::call(&crate::ipc::Request::SetHwMute { mute })
                             });
+                            if let Some(s) =
+                                state.snapshot.sinks.iter_mut().find(|s| s.name == hw_name)
+                            {
+                                s.mute = mute;
+                            }
                         }
                     });
-                    let mut vol = (sink.volume_pct as f32).min(100.0);
+                    let mut vol = (hw_pct as f32).min(100.0);
                     if design::h_slider(ui, &theme, &mut vol, 0.0..=100.0, "HW volume")
                         .changed()
                     {
-                        state.worker.send(Command::SetSinkVolume {
-                            name: hw_name.clone(),
-                            pct: vol.clamp(0.0, 100.0) as u32,
+                        let pct = vol.clamp(0.0, 100.0) as u32;
+                        let _ = crate::ipc::Client::call_fast(&crate::ipc::Request::SetHwVolume {
+                            pct,
+                        })
+                        .or_else(|_| {
+                            crate::ipc::Client::call(&crate::ipc::Request::SetHwVolume { pct })
                         });
+                        if let Some(s) =
+                            state.snapshot.sinks.iter_mut().find(|s| s.name == hw_name)
+                        {
+                            s.volume_pct = pct;
+                        }
                     }
                 } else {
                     ui.label(

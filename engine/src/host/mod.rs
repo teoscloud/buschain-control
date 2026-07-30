@@ -12,6 +12,7 @@ mod processor;
 mod rack;
 mod remote;
 mod slot;
+mod spectrum;
 mod surface;
 mod ui_bridge;
 mod vst3;
@@ -20,6 +21,8 @@ pub mod node;
 pub mod node_latency;
 pub mod orphan;
 pub mod registry;
+
+pub use spectrum::{SpectrumFrame, SpectrumBus, ANALYSIS_N, FFT_N, HOP, MAG_N};
 
 pub use clap::{has_clap_entry, probe_clap_params, ClapInstance, ClapParamInfo};
 pub use control::{ControlMsg, ControlQueue};
@@ -130,6 +133,73 @@ mod tests {
         assert!((l[0] - 2.0).abs() < 1e-6);
     }
 
+    /// Plugin Bypass port must track ControlMsg::bypass (Pitch-style power).
+    #[test]
+    fn bypass_msg_syncs_plugin_power_port() {
+        struct WithBypass {
+            bypass: f32,
+        }
+        impl AudioProcessor for WithBypass {
+            fn prepare(&mut self, _: u32, _: u32) {}
+            fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                if self.bypass >= 0.5 {
+                    return;
+                }
+                for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                    *l *= 2.0;
+                    *r *= 2.0;
+                }
+            }
+            fn set_control(&mut self, index: usize, value: f32) {
+                if index == 0 {
+                    self.bypass = value;
+                }
+            }
+            fn control_count(&self) -> usize {
+                1
+            }
+            fn control_name(&self, index: usize) -> Option<&str> {
+                if index == 0 {
+                    Some("Bypass")
+                } else {
+                    None
+                }
+            }
+            fn control_value(&self, index: usize) -> Option<f32> {
+                if index == 0 {
+                    Some(self.bypass)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let id = Uuid::new_v4();
+        let mut slot = Slot::new(id, "pitch".into(), Box::new(WithBypass { bypass: 1.0 }));
+        slot.prepare(48_000, 64);
+        // Simulate rebuild-while-off: host wet, plugin port still bypassed.
+        slot.set_bypassed(false);
+        slot.fade.snap(false);
+        let mut rack = Rack {
+            generation: 1,
+            fingerprint: "t".into(),
+            slots: vec![slot],
+            sample_rate: 48_000,
+            max_block: 64,
+        };
+        let mut l = vec![1.0f32; 8];
+        let mut r = vec![1.0f32; 8];
+        rack.process(&mut l, &mut r);
+        assert!((l[0] - 1.0).abs() < 1e-6, "stuck Bypass=1 keeps dry");
+
+        rack.apply_controls(&[ControlMsg::bypass(id, false)]);
+        l.fill(1.0);
+        r.fill(1.0);
+        rack.process(&mut l, &mut r);
+        assert!((l[0] - 2.0).abs() < 1e-6, "power-on must clear plugin Bypass");
+        assert!((rack.slots[0].processor.control_value(0).unwrap_or(1.0) - 0.0).abs() < 1e-6);
+    }
+
     #[test]
     fn gen_swap_under_mock_rt() {
         let q = Arc::new(ControlQueue::new());
@@ -198,6 +268,7 @@ mod tests {
                     "buschain_gain",
                     "bc_gain",
                     "shadow_gain",
+                    "buschain_equalizer",
                     "buschain_eq8",
                     "buschain_eq",
                 ] {

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# BusChain Master HW scroll strip — always-on layer-shell hit target.
+# Develop: BUSCHAIN_CONTROL_PYTHON from nix develop runs legacy/*.py live.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+PY="$ROOT/legacy/buschain-scroll-strip.py"
+FLAKE_ROOT="$(cd "$ROOT/../.." && pwd)"
+
+if [[ ! -f "$PY" ]]; then
+  echo "buschain-scroll-strip: missing $PY" >&2
+  exit 1
+fi
+
+export GTK_ICON_THEME_NAME="${GTK_ICON_THEME_NAME:-Adwaita}"
+
+python_has_gi() {
+  local py="$1"
+  [[ -x "$py" ]] || return 1
+  "$py" -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("GtkLayerShell", "0.1"); from gi.repository import Gtk, GtkLayerShell' >/dev/null 2>&1
+}
+
+if [[ -n "${BUSCHAIN_CONTROL_PYTHON:-}" && -x "${BUSCHAIN_CONTROL_PYTHON}" ]]; then
+  exec "$BUSCHAIN_CONTROL_PYTHON" "$PY" "$@"
+fi
+
+if command -v python3 >/dev/null 2>&1 && python_has_gi "$(command -v python3)"; then
+  exec "$(command -v python3)" "$PY" "$@"
+fi
+
+if command -v buschain-scroll-strip >/dev/null 2>&1; then
+  wrapped="$(command -v buschain-scroll-strip)"
+  wrapped_res="$(readlink -f "$wrapped" 2>/dev/null || echo "$wrapped")"
+  if [[ "$wrapped_res" != "$SELF" && "$wrapped" != "$SELF" ]]; then
+    exec "$wrapped" "$@"
+  fi
+fi
+
+if command -v nix >/dev/null 2>&1; then
+  exec nix --extra-experimental-features 'nix-command flakes' run \
+    "$FLAKE_ROOT#buschain-scroll-strip" -- "$@"
+fi
+
+echo "buschain-scroll-strip: no pygobject + GtkLayerShell Python found." >&2
+echo "  Use: nix develop && cargo run -- --hidden" >&2
+exit 1

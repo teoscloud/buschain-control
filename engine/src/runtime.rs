@@ -1223,6 +1223,39 @@ impl Engine {
         Ok(report)
     }
 
+    /// Route / Hotplug: Desired sync already applied — relink egress + Master HW only.
+    /// Never ForceRespawn / reconcile_fx.
+    pub fn relink_routes(&mut self) -> Result<ApplyReport> {
+        if !self.desired.speakers_armed && !self.desired.buses.is_empty() {
+            return self.arm_session(true);
+        }
+        let mut report = ApplyReport::default();
+        // Re-arm every bus egress from Desired (listen / outs / Master).
+        let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
+        for bus in buses {
+            let dests = self
+                .desired
+                .bus_egress
+                .get(&bus)
+                .cloned()
+                .unwrap_or_default();
+            let keep_fx = self
+                .desired
+                .fx_chains
+                .get(&bus)
+                .is_some_and(|c| !c.inserts.is_empty());
+            if let Err(e) = self.arm_track_egress(&bus, keep_fx, &dests) {
+                report.push(format!("relink {bus}: {e:#}"));
+            }
+        }
+        self.prune_parallel_fx_routes(&mut report);
+        self.reconcile_master_and_default(&mut report)?;
+        if report.messages.is_empty() {
+            report.push("relink routes ok");
+        }
+        Ok(report)
+    }
+
     pub fn teardown_fx_chain(&mut self, bus: &str) -> Result<()> {
         pipeline::insert::teardown_fx_chain(&mut self.fx, &mut self.backend, bus)?;
         self.desired.remove_fx_chain(bus);

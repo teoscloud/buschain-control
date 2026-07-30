@@ -35,6 +35,29 @@ pub fn hide_cursor_on_drag(ui: &Ui, resp: &egui::Response) {
     }
 }
 
+/// Hide + lock the OS cursor while `active` so the pointer stays put for orbit / fine drag.
+/// Releases grab on the falling edge (`state_id` tracks the previous frame).
+pub fn capture_cursor_while(ui: &Ui, active: bool, state_id: egui::Id) {
+    let was_active = ui.ctx().data(|d| d.get_temp::<bool>(state_id).unwrap_or(false));
+    if active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        if !was_active {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                egui::viewport::CursorGrab::Locked,
+            ));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        }
+    } else if was_active {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::None,
+        ));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(state_id, active));
+}
+
 /// DAW-style fine control: Shift = 0.1×, Alt = 0.05×. Ctrl reserved for shortcuts.
 pub fn drag_sensitivity(ui: &Ui) -> f32 {
     ui.input(|i| {
@@ -141,50 +164,85 @@ pub fn text_tool_button(ui: &mut Ui, theme: &dyn Theme, label: &str) -> egui::Re
     )
 }
 
+/// Green/red LED tone matched to the selection accent's value + saturation.
+fn accent_matched_led(accent: Color32, green: bool) -> Color32 {
+    let ar = accent.r() as f32 / 255.0;
+    let ag = accent.g() as f32 / 255.0;
+    let ab = accent.b() as f32 / 255.0;
+    let amax = ar.max(ag).max(ab).max(1e-3_f32);
+    let amin = ar.min(ag).min(ab);
+    let sat = ((amax - amin) / amax).clamp(0.15_f32, 0.85_f32);
+    let val = amax.clamp(0.35_f32, 0.92_f32);
+
+    // Unit green / red hue directions (console, not neon).
+    let (hr, hg, hb) = if green {
+        (0.38_f32, 0.78_f32, 0.52_f32)
+    } else {
+        (0.82_f32, 0.36_f32, 0.32_f32)
+    };
+    let hmax = hr.max(hg).max(hb);
+    let nr = hr / hmax;
+    let ng = hg / hmax;
+    let nb = hb / hmax;
+
+    let mix = |n: f32| ((1.0 - sat) * val + sat * n * val).clamp(0.0, 1.0);
+    Color32::from_rgb(
+        (mix(nr) * 255.0) as u8,
+        (mix(ng) * 255.0) as u8,
+        (mix(nb) * 255.0) as u8,
+    )
+}
+
+/// Analog LED jewel — green when lit, red when dark. No bezel / border / text.
+fn analog_led_jewel(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    on: &mut bool,
+    size: Vec2,
+    hover_on: &str,
+    hover_off: &str,
+) -> egui::Response {
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter();
+    let lit = *on;
+    let led = accent_matched_led(theme.accent(), lit);
+
+    let r = (rect.width().min(rect.height()) * 0.36).clamp(5.0, 8.0);
+    let c = rect.center();
+    // Tight outer glow (kept smaller than the jewel face)
+    painter.circle_filled(
+        c,
+        r * 1.22,
+        Color32::from_rgba_unmultiplied(led.r(), led.g(), led.b(), if lit { 36 } else { 24 }),
+    );
+    painter.circle_filled(c, r, led);
+    painter.circle_filled(
+        egui::pos2(c.x - r * 0.28, c.y - r * 0.32),
+        r * 0.30,
+        Color32::from_rgba_unmultiplied(255, 255, 255, if lit { 90 } else { 40 }),
+    );
+
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.on_hover_text(if lit { hover_on } else { hover_off })
+}
+
 /// Power / enable toggle for inserts. `on == true` means the plugin is active (not bypassed).
 pub fn power_toggle(
     ui: &mut Ui,
     theme: &dyn Theme,
     on: &mut bool,
 ) -> egui::Response {
-    let fill = if *on {
-        theme.success().gamma_multiply(0.35)
-    } else {
-        theme.bg_well()
-    };
-    let stroke = Stroke::new(
-        1.0_f32,
-        if *on {
-            theme.success()
-        } else {
-            theme.border()
-        },
-    );
-    let icon = egui_phosphor::regular::POWER;
-    let color = if *on {
-        theme.success()
-    } else {
-        theme.text_muted()
-    };
-    let mut resp = ui
-        .add(
-            egui::Button::new(RichText::new(icon).size(15.0).color(color))
-                .fill(fill)
-                .stroke(stroke)
-                .corner_radius(theme.rounding())
-                .min_size(Vec2::new(28.0, 24.0)),
-        )
-        .on_hover_text(if *on {
-            "Disable insert"
-        } else {
-            "Enable insert"
-        });
-    if resp.clicked() {
-        *on = !*on;
-        // Buttons don't set changed by default — callers rely on .changed().
-        resp.mark_changed();
-    }
-    resp
+    analog_led_jewel(
+        ui,
+        theme,
+        on,
+        Vec2::new(28.0, 24.0),
+        "Disable insert",
+        "Enable insert",
+    )
 }
 
 pub fn toggle_chip(
@@ -236,59 +294,16 @@ pub fn mixer_pad_inert(ui: &mut Ui, theme: &dyn Theme, label: &str) -> egui::Res
     )
 }
 
-/// Track live LED — green when audible (`on`), dark when muted. Toggles `on`.
+/// Track live LED — green when audible (`on`), red when muted. Just the light.
 pub fn track_on_led(ui: &mut Ui, theme: &dyn Theme, on: &mut bool) -> egui::Response {
-    let size = Vec2::new(34.0, 28.0);
-    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
-    let painter = ui.painter();
-    let lit = *on;
-    let bezel = theme.bg_well();
-    painter.rect_filled(rect, CornerRadius::same(4), bezel);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(4),
-        Stroke::new(1.0_f32, theme.border()),
-        egui::StrokeKind::Outside,
-    );
-    let inner = rect.shrink(2.5);
-    let fill = if lit {
-        theme.success().gamma_multiply(0.28)
-    } else {
-        theme.bg_elevated()
-    };
-    painter.rect_filled(inner, CornerRadius::same(3), fill);
-    // LED jewel
-    let led_c = if lit {
-        theme.success()
-    } else {
-        Color32::from_rgb(0x2a, 0x2c, 0x30)
-    };
-    let cx = inner.center().x;
-    let cy = inner.top() + 7.0;
-    painter.circle_filled(egui::pos2(cx, cy), 4.2, led_c);
-    if lit {
-        painter.circle_filled(egui::pos2(cx - 1.0, cy - 1.2), 1.4, Color32::WHITE);
-    }
-    painter.text(
-        egui::pos2(inner.center().x, inner.bottom() - 6.0),
-        egui::Align2::CENTER_CENTER,
-        if lit { "ON" } else { "OFF" },
-        egui::FontId::proportional(9.0),
-        if lit {
-            theme.success()
-        } else {
-            theme.text_muted()
-        },
-    );
-    if resp.clicked() {
-        *on = !*on;
-        resp.mark_changed();
-    }
-    resp.on_hover_text(if lit {
-        "Mute track output"
-    } else {
-        "Unmute track"
-    })
+    analog_led_jewel(
+        ui,
+        theme,
+        on,
+        Vec2::new(34.0, 28.0),
+        "Mute track output",
+        "Unmute track",
+    )
 }
 
 fn mixer_pad_sized(
@@ -525,7 +540,7 @@ pub fn fader_db(
     let at_zero = value_db.abs() < 0.05;
     let above_zero = *value_db > 0.05;
     let cap_w = (size.x * 0.82).clamp(15.0, 20.0);
-    let cap_h = (cap_w * 1.45).clamp(20.0, 28.0); // taller than wide
+    let cap_h = (cap_w * 1.85).clamp(28.0, 38.0); // taller throw-cap
     let cap = Rect::from_center_size(egui::pos2(track.center().x, y), Vec2::new(cap_w, cap_h));
     let r = CornerRadius::same(2);
 
@@ -572,11 +587,13 @@ pub fn fader_db(
         Stroke::new(1.0_f32, bevel_lo),
     );
 
-    // Three horizontal grip grooves across the face
+    // Five horizontal grip grooves (extra line above + below the prior trio)
     let grip = Color32::from_rgb(0x5a, 0x5e, 0x64);
     let grip_hi = Color32::from_rgba_unmultiplied(255, 255, 255, 45);
     let cy = cap.center().y;
-    for dy in [-3.5_f32, 0.0, 3.5] {
+    let grip_span = (cap_h * 0.28).clamp(5.5, 9.0);
+    for i in -2..=2 {
+        let dy = i as f32 * (grip_span * 0.5);
         let gy = cy + dy;
         painter.hline(
             egui::Rangef::new(cap.left() + 3.0, cap.right() - 3.0),
@@ -931,18 +948,31 @@ pub fn knob_sized(
             let (rect, mut resp) =
                 ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
             let painter = ui.painter();
-            let r = size * 0.42;
-            painter.circle_filled(rect.center(), r, theme.bg_well());
-            painter.circle_stroke(rect.center(), r, Stroke::new(1.5_f32, theme.border()));
+            let c = rect.center();
+            let r = size * 0.40;
+
+            // Modern console knob — flat dark disc, single indicator line.
+            let body = Color32::from_rgb(0x32, 0x34, 0x38);
+            let face = Color32::from_rgb(0x3e, 0x41, 0x46);
+            let rim = Color32::from_rgb(0x22, 0x24, 0x28);
+            let pip = Color32::from_rgb(0xe6, 0xe7, 0xe9);
+
+            painter.circle_filled(
+                c + egui::vec2(0.8, 1.2),
+                r,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 55),
+            );
+            painter.circle_filled(c, r, body);
+            painter.circle_filled(c, r * 0.86, face);
+            painter.circle_stroke(c, r, Stroke::new(1.15_f32, rim));
+
             let t = (*value - *range.start()) / (*range.end() - *range.start()).max(1e-6);
             let ang = -std::f32::consts::FRAC_PI_2 - 0.75 * std::f32::consts::PI
                 + t.clamp(0.0, 1.0) * 1.5 * std::f32::consts::PI;
-            let tip = rect.center() + Vec2::angled(ang) * (r * 0.75);
-            painter.line_segment(
-                [rect.center(), tip],
-                Stroke::new(2.5_f32, Color32::WHITE),
-            );
-            painter.circle_filled(rect.center(), 2.5, Color32::WHITE);
+            let outer = c + Vec2::angled(ang) * (r * 0.72);
+            let inner = c + Vec2::angled(ang) * (r * 0.18);
+            painter.line_segment([inner, outer], Stroke::new(2.2_f32, pip));
+
             if resp.dragged() {
                 let sens = drag_sensitivity(ui);
                 let span = *range.end() - *range.start();
@@ -1104,7 +1134,7 @@ pub fn softclip_transfer_plot(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
     painter.rect_stroke(
         rect,
         CornerRadius::same(2),
@@ -1409,6 +1439,494 @@ pub fn softclip_transfer_plot(
     changed
 }
 
+/* ---- Limiter transfer + GR history (matches buschain_builtins lm_gain_db) ---- */
+
+fn limiter_gr_db(level_db: f32, ceil_db: f32, knee_db: f32) -> f32 {
+    if knee_db < 0.05 {
+        if level_db > ceil_db {
+            ceil_db - level_db
+        } else {
+            0.0
+        }
+    } else {
+        let half = knee_db * 0.5;
+        let lo = ceil_db - half;
+        let hi = ceil_db + half;
+        if level_db <= lo {
+            0.0
+        } else if level_db >= hi {
+            ceil_db - level_db
+        } else {
+            let d = level_db - lo;
+            let mut out_db = level_db - (d * d) / (2.0 * knee_db);
+            if out_db > ceil_db {
+                out_db = ceil_db;
+            }
+            out_db - level_db
+        }
+    }
+}
+
+fn limiter_xfer_db(level_db: f32, ceil_db: f32, knee_db: f32, makeup_db: f32) -> f32 {
+    level_db + limiter_gr_db(level_db, ceil_db, knee_db) + makeup_db
+}
+
+#[derive(Clone, Copy)]
+struct LimiterVizState {
+    dens: [f32; 48],
+    trail: [f32; 24],
+    trail_i: u8,
+    in_smooth: f32,
+    in_hold: f32,
+    /// Scrolling GR history (−dB, positive magnitude).
+    gr_hist: [f32; 96],
+    gr_i: u8,
+    last_t: f64,
+}
+
+/// Limiter transfer plot + GR history strip.
+///
+/// Unity → ceiling fold (soft knee when set), density / phosphor trail, live GR.
+/// Drag vertically (or scroll) to set Ceiling.
+pub fn limiter_transfer_plot(
+    ui: &mut Ui,
+    theme: &dyn Theme,
+    ceiling_db: &mut f32,
+    knee_db: f32,
+    input_db: f32,
+    makeup_db: f32,
+    peak_db: f32,
+    size: Vec2,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+
+    let pad_l = 28.0;
+    let pad_b = 4.0;
+    let pad_t = 14.0;
+    let pad_r = 6.0;
+    let gr_h = (rect.height() * 0.22).clamp(28.0, 44.0);
+    let gap = 4.0;
+    let plot = Rect::from_min_max(
+        egui::pos2(rect.left() + pad_l, rect.top() + pad_t),
+        egui::pos2(
+            rect.right() - pad_r,
+            rect.bottom() - pad_b - gr_h - gap,
+        ),
+    );
+    let gr_strip = Rect::from_min_max(
+        egui::pos2(rect.left() + pad_l, plot.bottom() + gap),
+        egui::pos2(rect.right() - pad_r, rect.bottom() - pad_b),
+    );
+    if plot.width() < 8.0 || plot.height() < 8.0 {
+        return false;
+    }
+
+    let ceil = ceiling_db.clamp(-24.0, 0.0);
+    let knee = knee_db.clamp(0.0, 12.0);
+    let makeup = makeup_db.clamp(-24.0, 24.0);
+    let input_g = input_db.clamp(-24.0, 24.0);
+
+    const DB_MIN: f32 = -36.0;
+    const DB_MAX: f32 = 6.0;
+    let db_span = DB_MAX - DB_MIN;
+    let to_px = |xin_db: f32, yout_db: f32| {
+        egui::pos2(
+            plot.left() + ((xin_db - DB_MIN) / db_span).clamp(0.0, 1.0) * plot.width(),
+            plot.bottom() - ((yout_db - DB_MIN) / db_span).clamp(0.0, 1.0) * plot.height(),
+        )
+    };
+
+    // Peak is post-rack-ish; treat as detector input after Input gain.
+    let in_inst = if peak_db <= -88.0 {
+        DB_MIN
+    } else {
+        (peak_db + input_g).clamp(DB_MIN, DB_MAX)
+    };
+
+    let viz_id = ui.id().with("limiter_viz");
+    let now = ui.input(|i| i.time);
+    let mut viz = ui.ctx().data_mut(|d| {
+        d.get_temp::<LimiterVizState>(viz_id).unwrap_or(LimiterVizState {
+            dens: [0.0; 48],
+            trail: [0.0; 24],
+            trail_i: 0,
+            in_smooth: DB_MIN,
+            in_hold: DB_MIN,
+            gr_hist: [0.0; 96],
+            gr_i: 0,
+            last_t: now,
+        })
+    });
+    let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
+    viz.last_t = now;
+    let atk = 1.0 - (-dt * 40.0).exp();
+    let rel = 1.0 - (-dt * 6.0).exp();
+    let hold_rel = 1.0 - (-dt * 1.8).exp();
+    if in_inst > viz.in_smooth {
+        viz.in_smooth += (in_inst - viz.in_smooth) * atk;
+    } else {
+        viz.in_smooth += (in_inst - viz.in_smooth) * rel;
+    }
+    if in_inst > viz.in_hold {
+        viz.in_hold = in_inst;
+    } else {
+        viz.in_hold += (in_inst - viz.in_hold) * hold_rel;
+    }
+
+    let dens_n = viz.dens.len();
+    let decay = (-dt * 2.2).exp();
+    for b in &mut viz.dens {
+        *b *= decay;
+    }
+    if in_inst > DB_MIN + 0.5 {
+        let t = ((in_inst - DB_MIN) / db_span).clamp(0.0, 1.0 - 1e-3);
+        let bi = (t * (dens_n as f32 - 1e-3)) as usize;
+        viz.dens[bi] = (viz.dens[bi] + 0.55).min(1.0);
+        if bi > 0 {
+            viz.dens[bi - 1] = (viz.dens[bi - 1] + 0.18).min(1.0);
+        }
+        if bi + 1 < dens_n {
+            viz.dens[bi + 1] = (viz.dens[bi + 1] + 0.18).min(1.0);
+        }
+    }
+    if in_inst > DB_MIN + 0.5 || viz.in_smooth > DB_MIN + 1.0 {
+        let i = viz.trail_i as usize % viz.trail.len();
+        viz.trail[i] = viz.in_smooth;
+        viz.trail_i = viz.trail_i.wrapping_add(1);
+    }
+
+    let gr_now = -limiter_gr_db(viz.in_smooth, ceil, knee);
+    {
+        let i = viz.gr_i as usize % viz.gr_hist.len();
+        viz.gr_hist[i] = gr_now.max(0.0);
+        viz.gr_i = viz.gr_i.wrapping_add(1);
+    }
+
+    let dens = viz.dens;
+    let trail = viz.trail;
+    let trail_i = viz.trail_i;
+    let in_smooth = viz.in_smooth;
+    let in_hold = viz.in_hold;
+    let gr_hist = viz.gr_hist;
+    let gr_i = viz.gr_i;
+    ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));
+    if in_inst > DB_MIN + 0.5 || dens.iter().any(|&d| d > 0.02) || gr_now > 0.05 {
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0_f32, theme.border_soft()),
+        egui::StrokeKind::Inside,
+    );
+
+    // Hot zone above 0 dBFS out
+    let zero_y = to_px(0.0, 0.0).y;
+    if DB_MAX > 0.0 {
+        let hot = Rect::from_min_max(
+            egui::pos2(plot.left(), plot.top()),
+            egui::pos2(plot.right(), zero_y),
+        );
+        let d = theme.danger();
+        painter.rect_filled(
+            hot,
+            0.0,
+            Color32::from_rgba_unmultiplied(d.r(), d.g(), d.b(), 28),
+        );
+    }
+
+    // Limiting region (input ≥ ceiling − knee/2)
+    {
+        let start = (ceil - knee * 0.5).clamp(DB_MIN, DB_MAX);
+        let x0 = to_px(start, 0.0).x;
+        let wash = Rect::from_min_max(
+            egui::pos2(x0, plot.top()),
+            egui::pos2(plot.right(), plot.bottom()),
+        );
+        let a = theme.accent();
+        painter.rect_filled(
+            wash,
+            0.0,
+            Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 14),
+        );
+    }
+
+    let grid = theme.border_soft().gamma_multiply(0.9);
+    for db in [-24.0_f32, -12.0, -6.0, 0.0] {
+        let p = to_px(db, db);
+        painter.vline(
+            p.x,
+            plot.y_range(),
+            Stroke::new(1.0_f32, grid),
+        );
+        painter.hline(
+            plot.x_range(),
+            p.y,
+            Stroke::new(
+                if (db - 0.0).abs() < 0.01 {
+                    1.5_f32
+                } else {
+                    1.0_f32
+                },
+                if (db - 0.0).abs() < 0.01 {
+                    theme.accent().gamma_multiply(0.85)
+                } else {
+                    grid
+                },
+            ),
+        );
+        painter.text(
+            egui::pos2(plot.left() - 2.0, p.y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{db:+.0}"),
+            egui::FontId::proportional(9.0),
+            if (db - 0.0).abs() < 0.01 {
+                theme.accent()
+            } else {
+                theme.text_muted()
+            },
+        );
+    }
+
+    // Unity reference
+    {
+        let a = to_px(DB_MIN, DB_MIN);
+        let b = to_px(DB_MAX, DB_MAX);
+        painter.line_segment(
+            [a, b],
+            Stroke::new(1.0_f32, theme.text_muted().gamma_multiply(0.55)),
+        );
+    }
+
+    // Ceiling line (pre-makeup)
+    {
+        let cy = to_px(0.0, ceil + makeup).y;
+        painter.hline(
+            plot.x_range(),
+            cy,
+            Stroke::new(1.2_f32, theme.meter_orange().gamma_multiply(0.85)),
+        );
+        painter.text(
+            egui::pos2(plot.right() - 2.0, cy),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("ceil {ceil:+.1}"),
+            egui::FontId::proportional(9.0),
+            theme.meter_orange(),
+        );
+    }
+
+    // Density ridge
+    let dens_max = dens.iter().copied().fold(0.0_f32, f32::max).max(0.08);
+    let a = theme.accent();
+    let bin_w = plot.width() / dens_n as f32;
+    for (i, &d) in dens.iter().enumerate() {
+        if d < 0.02 {
+            continue;
+        }
+        let t = d / dens_max;
+        let x0 = plot.left() + i as f32 * bin_w;
+        let h = plot.height() * 0.22 * t;
+        let bar = Rect::from_min_max(
+            egui::pos2(x0 + 0.5, plot.bottom() - h),
+            egui::pos2(x0 + bin_w - 0.5, plot.bottom()),
+        );
+        let xin = DB_MIN + (i as f32 + 0.5) / dens_n as f32 * db_span;
+        let past = xin >= ceil - knee * 0.5;
+        let col = if past {
+            theme.meter_orange()
+        } else {
+            a
+        };
+        painter.rect_filled(
+            bar,
+            CornerRadius::same(1),
+            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (40.0 + t * 110.0) as u8),
+        );
+    }
+
+    // Transfer curve
+    let mut pts = Vec::with_capacity(97);
+    for i in 0..=96 {
+        let x = DB_MIN + db_span * (i as f32 / 96.0);
+        let y = limiter_xfer_db(x, ceil, knee, makeup);
+        pts.push((x, y, to_px(x, y.clamp(DB_MIN, DB_MAX))));
+    }
+    for w in pts.windows(2) {
+        let limited = w[0].1 < w[0].0 + makeup - 0.05 || w[1].1 < w[1].0 + makeup - 0.05;
+        let col = if limited {
+            theme.meter_orange()
+        } else {
+            theme.text()
+        };
+        painter.line_segment([w[0].2, w[1].2], Stroke::new(2.4_f32, col));
+    }
+
+    let knee_pt = to_px(
+        ceil,
+        limiter_xfer_db(ceil, ceil, knee, makeup).clamp(DB_MIN, DB_MAX),
+    );
+    painter.circle_filled(knee_pt, 3.2, theme.accent());
+    painter.circle_stroke(knee_pt, 3.2, Stroke::new(1.0_f32, theme.border()));
+
+    // Phosphor trail
+    let n_trail = trail.len();
+    for k in 0..n_trail {
+        let age = n_trail - 1 - k;
+        let idx = trail_i.wrapping_sub(1).wrapping_sub(age as u8) as usize % n_trail;
+        let xin = trail[idx];
+        if xin < DB_MIN + 0.5 {
+            continue;
+        }
+        let yout = limiter_xfer_db(xin, ceil, knee, makeup);
+        let p = to_px(xin, yout.clamp(DB_MIN, DB_MAX));
+        let fade = (k as f32 / (n_trail as f32 - 1.0)).clamp(0.0, 1.0);
+        let alpha = (18.0 + fade * 140.0) as u8;
+        let r = 1.4 + fade * 2.2;
+        let col = if xin >= ceil - knee * 0.5 {
+            theme.meter_orange()
+        } else {
+            a
+        };
+        painter.circle_filled(
+            p,
+            r,
+            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha),
+        );
+    }
+
+    // Live operating point + GR
+    if in_hold > DB_MIN + 0.5 {
+        let xin = in_smooth.max(in_hold - 1.0);
+        let y_out = limiter_xfer_db(xin, ceil, knee, makeup);
+        let y_unity = xin + makeup;
+        let p_op = to_px(xin, y_out.clamp(DB_MIN, DB_MAX));
+        let p_unity = to_px(xin, y_unity.clamp(DB_MIN, DB_MAX));
+        painter.vline(
+            p_op.x,
+            plot.y_range(),
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 55),
+            ),
+        );
+        let gr_db = limiter_gr_db(xin, ceil, knee);
+        if gr_db < -0.05 {
+            let top = p_unity.y.min(p_op.y);
+            let bot = p_unity.y.max(p_op.y);
+            let gr_rect = Rect::from_min_max(
+                egui::pos2(p_op.x - 3.0, top),
+                egui::pos2(p_op.x + 3.0, bot),
+            );
+            let o = theme.meter_orange();
+            painter.rect_filled(
+                gr_rect,
+                CornerRadius::same(1),
+                Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 90),
+            );
+            painter.text(
+                egui::pos2(p_op.x + 6.0, (top + bot) * 0.5),
+                egui::Align2::LEFT_CENTER,
+                format!("{gr_db:.1} dB"),
+                egui::FontId::proportional(10.0),
+                theme.meter_orange(),
+            );
+        }
+        let op_col = if gr_db < -0.05 {
+            theme.meter_orange()
+        } else {
+            theme.success()
+        };
+        painter.circle_filled(p_op, 5.0, op_col);
+        painter.circle_filled(p_op, 2.0, Color32::WHITE);
+        painter.circle_stroke(p_op, 5.0, Stroke::new(1.0_f32, theme.border()));
+    }
+
+    painter.text(
+        egui::pos2(plot.left() + 4.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        if in_hold > DB_MIN + 0.5 {
+            format!("in {in_hold:+.1} dB")
+        } else {
+            "in —".into()
+        },
+        egui::FontId::proportional(10.0),
+        theme.text_dim(),
+    );
+
+    // GR history strip
+    {
+        painter.rect_filled(
+            gr_strip,
+            CornerRadius::same(1),
+            theme.bg_well().gamma_multiply(0.85),
+        );
+        painter.text(
+            egui::pos2(gr_strip.left() - 2.0, gr_strip.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "GR",
+            egui::FontId::proportional(9.0),
+            theme.text_muted(),
+        );
+        const GR_MAX: f32 = 24.0;
+        let n = gr_hist.len();
+        let bw = gr_strip.width() / n as f32;
+        let o = theme.meter_orange();
+        for k in 0..n {
+            let age = n - 1 - k;
+            let idx = gr_i.wrapping_sub(1).wrapping_sub(age as u8) as usize % n;
+            let g = gr_hist[idx].clamp(0.0, GR_MAX);
+            if g < 0.05 {
+                continue;
+            }
+            let h = (g / GR_MAX) * gr_strip.height();
+            let x0 = gr_strip.left() + k as f32 * bw;
+            let bar = Rect::from_min_max(
+                egui::pos2(x0 + 0.3, gr_strip.bottom() - h),
+                egui::pos2(x0 + bw - 0.3, gr_strip.bottom()),
+            );
+            let alpha = (50.0 + (g / GR_MAX) * 160.0) as u8;
+            painter.rect_filled(
+                bar,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), alpha),
+            );
+        }
+        if gr_now > 0.05 {
+            painter.text(
+                egui::pos2(gr_strip.right() - 2.0, gr_strip.top() + 1.0),
+                egui::Align2::RIGHT_TOP,
+                format!("−{gr_now:.1} dB"),
+                egui::FontId::proportional(9.0),
+                theme.meter_orange(),
+            );
+        }
+    }
+
+    let mut changed = false;
+    let mut resp = resp;
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            // Vertical drag sets ceiling (ignore GR strip).
+            if pos.y <= plot.bottom() + gap * 0.5 {
+                let ny = ((plot.bottom() - pos.y) / plot.height()).clamp(0.0, 1.0);
+                let new_c = (DB_MIN + ny * db_span - makeup).clamp(-24.0, 0.0);
+                if (*ceiling_db - new_c).abs() > 0.01 {
+                    *ceiling_db = new_c;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if apply_wheel_to_value(ui, &mut resp, ceiling_db, -24.0..=0.0) {
+        changed = true;
+    }
+    hide_cursor_on_drag(ui, &resp);
+    changed
+}
+
 /* ---- Theatre Drive waveshaper viz (matches buschain_builtins od_shape) ---- */
 
 fn od_shape(x: f32, character: i32) -> f32 {
@@ -1568,7 +2086,7 @@ pub fn theatre_drive_plot(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
     painter.rect_stroke(
         rect,
         CornerRadius::same(2),
@@ -2046,7 +2564,7 @@ pub struct PeqBand {
     pub mode: i32,
 }
 
-fn peq_biquad_coeffs(b: &PeqBand, sr: f32) -> (f32, f32, f32, f32, f32) {
+pub fn peq_biquad_coeffs(b: &PeqBand, sr: f32) -> (f32, f32, f32, f32, f32) {
     let w0 = 2.0 * std::f32::consts::PI * b.freq.clamp(20.0, sr * 0.45) / sr;
     let cosw = w0.cos();
     let sinw = w0.sin();
@@ -2103,7 +2621,7 @@ fn peq_biquad_coeffs(b: &PeqBand, sr: f32) -> (f32, f32, f32, f32, f32) {
     (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
 }
 
-fn peq_mag_db_at(bands: &[PeqBand], out_gain_db: f32, freq_hz: f32, sr: f32) -> f32 {
+pub fn peq_mag_db_at(bands: &[PeqBand], out_gain_db: f32, freq_hz: f32, sr: f32) -> f32 {
     let w = 2.0 * std::f32::consts::PI * freq_hz / sr;
     let (zr, zi) = (w.cos(), -w.sin());
     // z^{-1}, z^{-2}
@@ -2139,13 +2657,14 @@ fn peq_mag_db_at(bands: &[PeqBand], out_gain_db: f32, freq_hz: f32, sr: f32) -> 
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct PeakSpectrumState {
     bins: [f32; 48],
     last_t: f64,
 }
 
-/// Peak-driven spectrum bars (smooth ballistics, static pink-ish shape — no watery wobble).
-/// Top of `plot` = 0 dBFS, bottom ≈ −60 dB.
+/// Legacy peak-shaped bars (unused by Equalizer/Analyzer — kept for Denoiser-era sketches).
+#[allow(dead_code)]
 fn paint_peak_spectrum(
     ui: &mut Ui,
     plot: Rect,
@@ -2494,7 +3013,7 @@ pub fn denoiser_param_graph(
 
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
         painter.rect_stroke(
             rect,
             CornerRadius::same(2),
@@ -2828,9 +3347,8 @@ pub fn denoiser_param_graph(
     changed
 }
 
-/// Interactive parametric EQ graph (BusChain console theme). Returns true if any band changed.
-/// `selected` is 0..n bands (which node is focused for side controls).
-/// `spectrum_peak_db` drives a peak spectrum backdrop behind the response curve.
+/// Legacy PEQ graph — superseded by [`crate::design::eq_chart`].
+#[allow(dead_code)]
 pub fn peq_graph(
     ui: &mut Ui,
     theme: &dyn Theme,
@@ -2843,7 +3361,7 @@ pub fn peq_graph(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
         painter.rect_stroke(
             rect,
             CornerRadius::same(2),
@@ -3047,8 +3565,8 @@ pub fn peq_graph(
     changed
 }
 
-/// Bottom analyzer: peak spectrum of the selected track (0 dBFS at top).
-/// Optional EQ response overlay when Parametric EQ is selected.
+/// Legacy track analyzer — superseded by [`crate::design::eq_chart`].
+#[allow(dead_code)]
 pub fn track_analyzer(
     ui: &mut Ui,
     theme: &dyn Theme,
@@ -3060,7 +3578,7 @@ pub fn track_analyzer(
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
         painter.rect_stroke(
             rect,
             CornerRadius::same(2),

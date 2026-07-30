@@ -39,7 +39,8 @@ window.background {
   border: 1px solid alpha(#f7f5ff, 0.10);
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
   margin: 6px;
-  padding: 14px 16px 16px 16px;
+  /* Tighter top — no title row */
+  padding: 10px 16px 14px 16px;
 }
 
 .title {
@@ -159,7 +160,7 @@ button.star-btn:checked {
 }
 
 button.use-btn {
-  padding: 5px 14px;
+  padding: 5px 12px;
   border-radius: 999px;
   font-size: 11px;
   font-weight: 600;
@@ -167,6 +168,15 @@ button.use-btn {
 }
 button.use-btn:hover {
   background-color: alpha(#f7f5ff, 0.16);
+}
+/* Active role pills on Output/Input device rows */
+button.use-btn.role-default.role-active {
+  background-color: alpha(#f7f5ff, 0.22);
+  color: #f7f5ff;
+}
+button.use-btn.role-hw.role-active {
+  background-color: alpha(#e6c35c, 0.28);
+  color: #ffe8a3;
 }
 
 .hw-card {
@@ -254,7 +264,7 @@ button.use-btn:hover {
 .stream-pct {
   font-size: 11px;
   font-weight: 700;
-  font-variant-numeric: tabular-nums;
+  /* GTK3 CssProvider rejects font-variant-numeric — keep stderr clean. */
   color: #e6c35c;
   padding-top: 2px;
   min-width: 0;

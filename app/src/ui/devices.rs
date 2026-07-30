@@ -432,14 +432,34 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                             }
                         }
                         if !is_app_bus {
+                            let sink_name = sink.name.clone();
                             let mut mute = sink.mute;
                             if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
                                 .changed()
                             {
-                                state.worker.send(Command::SetSinkMute {
-                                    name: sink.name.clone(),
-                                    mute,
-                                });
+                                if is_active_hw {
+                                    let _ = crate::ipc::Client::call_fast(
+                                        &crate::ipc::Request::SetHwMute { mute },
+                                    )
+                                    .or_else(|_| {
+                                        crate::ipc::Client::call(&crate::ipc::Request::SetHwMute {
+                                            mute,
+                                        })
+                                    });
+                                } else {
+                                    state.worker.send(Command::SetSinkMute {
+                                        name: sink_name.clone(),
+                                        mute,
+                                    });
+                                }
+                                if let Some(s) = state
+                                    .snapshot
+                                    .sinks
+                                    .iter_mut()
+                                    .find(|s| s.name == sink_name)
+                                {
+                                    s.mute = mute;
+                                }
                             }
                         }
                     });
@@ -456,14 +476,34 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                     );
                 } else {
                     // Hardware sinks: hard-cap at 100% (apps/tracks may boost).
+                    // Master HW shares waybar/GTK `hw-vol` — never a second writer.
+                    let sink_name = sink.name.clone();
                     let mut vol = (sink.volume_pct as f32).min(100.0);
                     if design::h_slider(ui, &theme, &mut vol, 0.0..=100.0, "Volume")
                         .changed()
                     {
-                        state.worker.send(Command::SetSinkVolume {
-                            name: sink.name.clone(),
-                            pct: vol.clamp(0.0, 100.0) as u32,
-                        });
+                        let pct = vol.clamp(0.0, 100.0) as u32;
+                        if is_active_hw {
+                            let _ = crate::ipc::Client::call_fast(
+                                &crate::ipc::Request::SetHwVolume { pct },
+                            )
+                            .or_else(|_| {
+                                crate::ipc::Client::call(&crate::ipc::Request::SetHwVolume { pct })
+                            });
+                        } else {
+                            state.worker.send(Command::SetSinkVolume {
+                                name: sink_name.clone(),
+                                pct,
+                            });
+                        }
+                        if let Some(s) = state
+                            .snapshot
+                            .sinks
+                            .iter_mut()
+                            .find(|s| s.name == sink_name)
+                        {
+                            s.volume_pct = pct;
+                        }
                     }
                 }
                 if !is_shadow {

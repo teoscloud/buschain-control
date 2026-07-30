@@ -178,6 +178,11 @@ impl Rack {
                 } => {
                     if let Some(idx) = self.slot_index(slot_id) {
                         self.slots[idx].set_bypassed(bypassed);
+                        // Host fade alone is not enough for plugins with their own
+                        // Bypass/Enable ports (e.g. Pitch). Props historically skipped
+                        // named bypass pushes; after rebuild-while-off the port stayed
+                        // at 1.0 and power-on sounded like a multi-second no-op.
+                        sync_power_ports(&mut self.slots[idx], bypassed);
                     }
                 }
             }
@@ -204,6 +209,22 @@ impl Rack {
     /// Offline render helper (freeze/bounce) — not RT.
     pub fn render_offline(&mut self, left: &mut [f32], right: &mut [f32]) {
         self.process(left, right);
+    }
+}
+
+fn sync_power_ports(slot: &mut Slot, bypassed: bool) {
+    let n = slot.processor.control_count();
+    for ci in 0..n {
+        let Some(name) = slot.processor.control_name(ci) else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("bypass") {
+            slot.processor
+                .set_control(ci, if bypassed { 1.0 } else { 0.0 });
+        } else if name.eq_ignore_ascii_case("enable") {
+            slot.processor
+                .set_control(ci, if bypassed { 0.0 } else { 1.0 });
+        }
     }
 }
 

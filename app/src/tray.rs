@@ -135,6 +135,8 @@ pub fn ensure_started() {
 pub fn wait_until_show() -> HeadlessWait {
     ensure_started();
     let mut state = AppState::new();
+    // No window → Idle viz (pause Pulse meters / clear FFT watches).
+    state.sleep_visualization();
     eprintln!("buschain-control: headless tray (no window until Show)");
 
     loop {

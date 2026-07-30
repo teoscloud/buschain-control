@@ -13,6 +13,16 @@ pub trait Theme: Send + Sync {
     fn bg_panel(&self) -> Color32;
     fn bg_elevated(&self) -> Color32;
     fn bg_well(&self) -> Color32;
+    /// Plugin plot / analyzer wells — mid between deep well and elevated chrome.
+    fn bg_chart(&self) -> Color32 {
+        let a = self.bg_well();
+        let b = self.bg_elevated();
+        Color32::from_rgb(
+            ((a.r() as u16 + b.r() as u16) / 2) as u8,
+            ((a.g() as u16 + b.g() as u16) / 2) as u8,
+            ((a.b() as u16 + b.b() as u16) / 2) as u8,
+        )
+    }
     fn border(&self) -> Color32;
     fn border_soft(&self) -> Color32;
     fn text(&self) -> Color32;

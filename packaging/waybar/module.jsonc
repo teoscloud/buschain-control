@@ -1,26 +1,35 @@
-// BusChain Control — Waybar custom module
+// BusChain Control — Waybar custom module (only rice touch required)
 //
-// 1. Add "custom/buschain-control" to modules-left or modules-right.
-// 2. Merge this object into your waybar config.
-// 3. Paste packaging/waybar/style.css into your style.css (or restyle).
-// 4. Start the tray: buschain-control --hidden
+// Product loop:
+//   1. Start tray: buschain-control --hidden → IPC
+//   2. Scroll + mixer popup: Quickshell (preferred) or GTK fallback
+//      QS: BUSCHAIN_CONTROL_QS_MIXER=1 BUSCHAIN_CONTROL_QS_STRIP=1
+//      See docs/HANDOVER-QUICKSHELL.md
+//   3. Merge this object + add "custom/buschain-control" to a modules-* list
 //
-// Prefer PATH names after a packaged install / Home Manager module.
-// For a git checkout without install, use absolute paths to
+// Volume scroll is strip-owned (QS or GTK). Do NOT add on-scroll-up/down —
+// Waybar discards SMOOTH magnitude. Pill: status + signal 9. Click → popup.
+//
+// Strip geometry (QS PanelWindow or GTK strip):
+//   BUSCHAIN_CONTROL_SCROLL_ANCHOR=left|right
+//   BUSCHAIN_CONTROL_SCROLL_MARGIN_TOP / _MARGIN_X / _WIDTH / _HEIGHT
+// Disable GTK strip spawn: BUSCHAIN_CONTROL_SCROLL_STRIP=0 or QS_STRIP=1
+//
+// Packaged: short PATH names. Git checkout: absolute paths to
+//   <checkout>/target/debug/buschain-ctl
 //   <checkout>/packaging/waybar/buschain-waybar
 //
-// Click → popup (GTK layer-shell panel by default) · scroll → Master HW volume.
+// Do not wrap scroll with pkill. Do not vendor the mixer into Home Manager.
 {
   "custom/buschain-control": {
     "format": "{}",
     "return-type": "json",
-    "exec": "buschain-waybar status",
+    "exec": "buschain-ctl status",
     "interval": 3,
     "signal": 9,
-    "exec-on-event": true,
+    // Scroll is the strip — do not re-run status on every wheel tick.
+    "exec-on-event": false,
     "on-click": "buschain-waybar popup",
-    "on-scroll-up": "buschain-waybar up",
-    "on-scroll-down": "buschain-waybar down",
     "tooltip": true
   }
 }

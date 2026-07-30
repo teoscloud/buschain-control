@@ -18,6 +18,7 @@ impl LadspaBackend {
         for rel in [
             "plugins/buschain-denoiser/build",
             "plugins/buschain-gate/build",
+            "plugins/buschain-reverb/build",
             "plugins/buschain-builtins/build",
         ] {
             paths.push(rel.into());
@@ -64,13 +65,18 @@ impl PluginBackend for LadspaBackend {
                     if line.is_empty() {
                         continue;
                     }
+                    // Forgotten Parametric label — Equalizer is `buschain_equalizer` only.
+                    if line.contains("buschain_eq8") {
+                        continue;
+                    }
                     // Typical: "buschain_denoiser (392001/0)" or similar — keep whole line as id
+                    let pretty = pretty_ladspa_name(line);
                     plugins.push(PluginDescriptor {
                         id: PluginId {
                             format: PluginFormat::Ladspa,
                             id: line.to_string(),
                         },
-                        name: line.to_string(),
+                        name: pretty,
                         maker: "LADSPA".into(),
                         path: None,
                     });
@@ -103,8 +109,8 @@ impl PluginBackend for LadspaBackend {
         for (id, name) in [
             ("buschain_denoiser", "BusChain Denoiser"),
             ("buschain_gate", "BusChain Gate"),
-            ("buschain_eq8", "Parametric EQ"),
-            ("buschain_eq", "BusChain EQ 1-Band"),
+            ("buschain_equalizer", "Equalizer"),
+            ("buschain_eq", "EQ 1-Band"),
             ("buschain_compressor", "BusChain Compressor"),
             ("buschain_limiter", "BusChain Limiter"),
             ("buschain_softclip", "Soft Clipper"),
@@ -124,5 +130,21 @@ impl PluginBackend for LadspaBackend {
             }
         }
         plugins
+    }
+}
+
+fn pretty_ladspa_name(line: &str) -> String {
+    let head = line.split_whitespace().next().unwrap_or(line);
+    match head {
+        "buschain_equalizer" => "Equalizer".into(),
+        "buschain_softclip" => "Soft Clipper".into(),
+        "buschain_overdrive" => "Theatre Drive".into(),
+        "buschain_eq" => "EQ 1-Band".into(),
+        "buschain_compressor" => "BusChain Compressor".into(),
+        "buschain_limiter" => "BusChain Limiter".into(),
+        "buschain_pitch" => "BusChain Pitch".into(),
+        "buschain_gate" => "BusChain Gate".into(),
+        "buschain_denoiser" => "BusChain Denoiser".into(),
+        _ => line.to_string(),
     }
 }

@@ -1,7 +1,7 @@
 //! Per-bus insert host registry — node + control queue + published rack.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Result};
@@ -13,15 +13,83 @@ use crate::clock::GraphClock;
 use crate::domain::{normalize_ladspa_label, ChainSpec, InsertSlot};
 
 use super::control::ControlMsg;
-use super::node::PwFxNode;
+use super::node::{HostRtState, PwFxNode};
 use super::rack::Rack;
 
 static REGISTRY: Lazy<Mutex<HashMap<String, HostTrack>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Lock-free-of-REGISTRY UI reads: bus → HostRtState (peaks / spectrum).
+static STATE_MAP: Lazy<Mutex<HashMap<String, Arc<HostRtState>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Freshest Props (bypass/knobs) per bus — survives gen-swap.
+///
+/// ForceRespawn builds from an ensure-job snapshot that can be older than a
+/// power toggle already applied to the previous rack. Without this overlay,
+/// publish brings the insert back wet until FxEnsureDone re-pushes (seconds).
+static LAST_CONTROLS: Lazy<Mutex<HashMap<String, Vec<InsertSlot>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 pub struct HostTrack {
     pub node: PwFxNode,
     pub fingerprint: String,
+}
+
+fn remember_controls(bus: &str, inserts: &[InsertSlot]) {
+    if let Ok(mut g) = LAST_CONTROLS.lock() {
+        g.insert(bus.to_string(), inserts.to_vec());
+    }
+}
+
+fn forget_controls(bus: &str) {
+    if let Ok(mut g) = LAST_CONTROLS.lock() {
+        g.remove(bus);
+    }
+}
+
+/// Overlay remembered bypass/knobs onto a topology insert list (same slot_ids).
+fn with_last_controls(bus: &str, inserts: &[InsertSlot]) -> Vec<InsertSlot> {
+    let mut out = inserts.to_vec();
+    let Ok(g) = LAST_CONTROLS.lock() else {
+        return out;
+    };
+    let Some(last) = g.get(bus) else {
+        return out;
+    };
+    for ins in &mut out {
+        let Some(prev) = last.iter().find(|p| p.slot_id == ins.slot_id) else {
+            continue;
+        };
+        for (name, val) in &prev.controls {
+            if let Some((_, v)) = ins
+                .controls
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            {
+                *v = *val;
+            } else {
+                ins.controls.push((name.clone(), *val));
+            }
+        }
+    }
+    out
+}
+
+fn publish_host_state(bus: &str, state: Arc<HostRtState>) {
+    if let Ok(mut g) = STATE_MAP.lock() {
+        g.insert(bus.to_string(), state);
+    }
+}
+
+fn unpublish_host_state(bus: &str) {
+    if let Ok(mut g) = STATE_MAP.lock() {
+        g.remove(bus);
+    }
+}
+
+fn host_state(bus: &str) -> Option<Arc<HostRtState>> {
+    STATE_MAP.lock().ok()?.get(bus).cloned()
 }
 
 /// Ensure filter node + publish rack from inserts. Returns fx node name.
@@ -46,7 +114,9 @@ pub fn ensure_host(
         let mut reg = REGISTRY.lock().unwrap();
         if let Some(track) = reg.get_mut(bus) {
             if !force_rebuild && track.fingerprint == want_fp && track.node.is_running() {
-                push_insert_controls_to_queue(&track.node, inserts);
+                publish_host_state(bus, Arc::clone(&track.node.state));
+                let live = with_last_controls(bus, inserts);
+                push_insert_controls_to_queue(&track.node, &live);
                 return Ok(fx_name);
             }
             // Rebuild rack off-lock below when we only need a gen-swap.
@@ -55,13 +125,16 @@ pub fn ensure_host(
                 // Capture live CLAP/VST3 state before the old rack is dropped.
                 let snaps = harvest_from_node(&track.node);
                 drop(reg);
-                let mut inserts_owned = inserts.to_vec();
+                let mut inserts_owned = with_last_controls(&bus_owned, inserts);
                 apply_harvest_to_inserts(&mut inserts_owned, &snaps);
+                // Power toggles during ensure win over harvest (skip bypass ports).
+                inserts_owned = with_last_controls(&bus_owned, &inserts_owned);
                 let rack = Rack::build(&inserts_owned, sr, quantum, &path)?;
                 let mut reg = REGISTRY.lock().unwrap();
                 if let Some(track) = reg.get_mut(&bus_owned) {
                     track.fingerprint = want_fp;
                     track.node.publish_rack(rack);
+                    push_insert_controls_to_queue(&track.node, &inserts_owned);
                 }
                 drop(reg);
                 crate::host::node_latency::publish_bus_latency(&bus_owned);
@@ -73,9 +146,11 @@ pub fn ensure_host(
     crate::host::orphan::sweep_orphan_helpers_once();
 
     // Start filter + build rack without holding the registry (other buses can proceed).
+    let inserts_live = with_last_controls(bus, inserts);
     let node = PwFxNode::start(bus, sr, quantum)?;
-    let rack = Rack::build(inserts, sr, quantum, &path)?;
+    let rack = Rack::build(&inserts_live, sr, quantum, &path)?;
     node.publish_rack(rack);
+    push_insert_controls_to_queue(&node, &inserts_live);
     let bus_owned = bus.to_string();
 
     let mut reg = REGISTRY.lock().unwrap();
@@ -86,11 +161,13 @@ pub fn ensure_host(
             if let Some(track) = reg.get_mut(bus) {
                 if track.fingerprint != want_fp {
                     let snaps = harvest_from_node(&track.node);
-                    let mut inserts_owned = inserts.to_vec();
+                    let mut inserts_owned = with_last_controls(bus, inserts);
                     apply_harvest_to_inserts(&mut inserts_owned, &snaps);
+                    inserts_owned = with_last_controls(bus, &inserts_owned);
                     let rack = Rack::build(&inserts_owned, sr, quantum, &path)?;
                     track.fingerprint = want_fp;
                     track.node.publish_rack(rack);
+                    push_insert_controls_to_queue(&track.node, &inserts_owned);
                 }
             }
             drop(reg);
@@ -98,6 +175,7 @@ pub fn ensure_host(
             return Ok(fx_name);
         }
     }
+    publish_host_state(&bus_owned, Arc::clone(&node.state));
     reg.insert(
         bus_owned.clone(),
         HostTrack {
@@ -237,6 +315,9 @@ pub fn apply_harvest_to_inserts(inserts: &mut [crate::domain::InsertSlot], snaps
 }
 
 pub fn push_host_controls(bus: &str, inserts: &[InsertSlot]) -> Result<()> {
+    // Always remember — even if topology mismatches — so the next gen-swap
+    // publishes with the user's power/knobs, not a stale ensure snapshot.
+    remember_controls(bus, inserts);
     let reg = REGISTRY.lock().unwrap();
     let track = reg
         .get(bus)
@@ -251,50 +332,30 @@ pub fn push_host_controls(bus: &str, inserts: &[InsertSlot]) -> Result<()> {
 }
 
 fn push_insert_controls_to_queue(node: &PwFxNode, inserts: &[InsertSlot]) {
-    let index_map: Vec<(uuid::Uuid, bool, Vec<(u32, f32)>)> = {
-        let Some(arc) = node.state.load_rack_arc() else {
-            return;
-        };
-        let Ok(rack) = arc.try_lock() else {
-            for ins in inserts {
+    // Resolve via published control_index — never take the rack Mutex (Props never drop).
+    let index = node
+        .state
+        .control_index
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    for ins in inserts {
+        let bypassed = insert_bypassed(ins);
+        node.state
+            .queue
+            .push(ControlMsg::bypass(ins.slot_id, bypassed));
+        for (name, val) in &ins.controls {
+            let lname = name.to_ascii_lowercase();
+            // Still push Bypass/Enable as params — ControlMsg::bypass also syncs
+            // ports, but dual write keeps Desired/plugin ports aligned if a
+            // consumer only drains Param messages.
+            if let Some(&ci) = index.get(&(ins.slot_id, lname)) {
                 node.state
                     .queue
-                    .push(ControlMsg::bypass(ins.slot_id, insert_bypassed(ins)));
+                    .push(ControlMsg::param(ins.slot_id, ci, *val));
             }
-            return;
-        };
-        inserts
-            .iter()
-            .map(|ins| {
-                let bypassed = insert_bypassed(ins);
-                let mut params = Vec::new();
-                if let Some(slot_idx) = rack.slot_index(ins.slot_id) {
-                    let slot = &rack.slots[slot_idx];
-                    for (name, val) in &ins.controls {
-                        let lname = name.to_ascii_lowercase();
-                        if lname == "bypass" || lname == "enable" {
-                            continue;
-                        }
-                        if let Some(ci) = (0..slot.processor.control_count()).find(|&i| {
-                            slot.processor
-                                .control_name(i)
-                                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                        }) {
-                            params.push((ci as u32, *val));
-                        }
-                    }
-                }
-                (ins.slot_id, bypassed, params)
-            })
-            .collect()
-    };
-
-    for (slot_id, bypassed, params) in index_map {
-        node.state.queue.push(ControlMsg::bypass(slot_id, bypassed));
-        for (control_index, value) in params {
-            node.state
-                .queue
-                .push(ControlMsg::param(slot_id, control_index, value));
         }
     }
 }
@@ -318,7 +379,10 @@ pub fn teardown_host(bus: &str) {
         track.node.stop();
     }
     drop(reg);
+    unpublish_host_state(bus);
+    forget_controls(bus);
     super::pdc::remove_bus(bus);
+    super::node_latency::apply_all_pdc_delays();
 }
 
 /// Non-RT: set Master-bus PDC delay on the live host.
@@ -329,10 +393,39 @@ pub fn set_host_pdc_delay(bus: &str, samples: u32) {
     }
 }
 
-/// Host meter peaks (pre, post) — lock-free atomics.
+/// Host meter peaks (pre, post) — reads STATE_MAP (not REGISTRY).
 pub fn host_meter_peaks(bus: &str) -> Option<(f32, f32)> {
-    let reg = REGISTRY.lock().ok()?;
-    reg.get(bus).map(|t| t.node.state.meter_peaks())
+    host_state(bus).map(|s| s.meter_peaks())
+}
+
+/// True when an in-process host exists for `bus` (UI meter routing).
+pub fn host_is_live(bus: &str) -> bool {
+    host_state(bus).is_some_and(|s| s.running.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Mark spectrum interest for `bus` so the RT path runs FFTs.
+/// `post` selects post-FX vs pre-FX (only one side is computed).
+pub fn host_spectrum_watch(bus: &str, post: bool) {
+    if let Some(s) = host_state(bus) {
+        s.spectrum.watch(post);
+    }
+}
+
+/// Drop spectrum interest on every host bus (UI Idle / window withdrawn).
+pub fn host_spectrum_clear_watches() {
+    let Ok(g) = STATE_MAP.lock() else {
+        return;
+    };
+    for s in g.values() {
+        s.spectrum.clear_watch();
+    }
+}
+
+/// Snapshot pre (`post=false`) or post-FX spectrum magnitudes.
+pub fn host_spectrum(bus: &str, post: bool) -> Option<super::SpectrumFrame> {
+    let s = host_state(bus)?;
+    s.spectrum.watch(post);
+    Some(s.spectrum.snapshot(post))
 }
 
 pub fn host_running(bus: &str) -> bool {

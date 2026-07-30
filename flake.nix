@@ -79,6 +79,7 @@
       ] ++ eguiLibs ++ vst3PluginRuntimeLibs;
 
       gtkMixer = import ./packaging/nix/gtk-mixer.nix { inherit pkgs; };
+      gtkScrollStrip = import ./packaging/nix/gtk-scroll-strip.nix { inherit pkgs; };
 
       buschainControlPkg = rustPlatform.buildRustPackage {
         pname = "buschain-control";
@@ -116,6 +117,7 @@
 
           ln -s ${gtkMixer}/bin/buschain-mixer-gtk $out/bin/buschain-mixer-gtk
           ln -s ${gtkMixer}/bin/buschain-mixer $out/bin/buschain-mixer
+          ln -s ${gtkScrollStrip}/bin/buschain-scroll-strip $out/bin/buschain-scroll-strip
 
           # Reference snippets for user rice (not auto-installed into ~/.config).
           install -m644 packaging/waybar/module.jsonc \
@@ -174,6 +176,7 @@
         buschain-ctl = buschainControlPkg;
         buschain-waybar = buschainControlPkg;
         buschain-mixer-gtk = gtkMixer;
+        buschain-scroll-strip = gtkScrollStrip;
       };
 
       apps.${system} = {
@@ -232,27 +235,33 @@
           gtk-layer-shell
           gobject-introspection
           (python3.withPackages (ps: [ ps.pygobject3 ]))
-          # Wrapped mixer (gi + layer-shell) — required for waybar/tray popup in develop.
+          # Wrapped mixer + scroll strip (gi + layer-shell) for waybar/tray.
           gtkMixer
+          gtkScrollStrip
         ] ++ eguiLibs ++ vst3PluginRuntimeLibs;
         # Host + in-process VST3/CLAP + buschain-plugin-ui/dsp share this path.
         LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (eguiLibs ++ vst3PluginRuntimeLibs);
         shellHook = ''
           export CARGO_TARGET_DIR="$PWD/target"
-          export LADSPA_PATH="$PWD/plugins/buschain-denoiser/build:$PWD/plugins/buschain-gate/build:$PWD/plugins/buschain-builtins/build:''${LADSPA_PATH:-}"
-          export LV2_PATH="$PWD/plugins/buschain-denoiser/build:$PWD/plugins/buschain-gate/build:$PWD/plugins/buschain-builtins/build:''${LV2_PATH:-}"
+          export LADSPA_PATH="$PWD/plugins/buschain-denoiser/build:$PWD/plugins/buschain-gate/build:$PWD/plugins/buschain-reverb/build:$PWD/plugins/buschain-builtins/build:''${LADSPA_PATH:-}"
+          export LV2_PATH="$PWD/plugins/buschain-denoiser/build:$PWD/plugins/buschain-gate/build:$PWD/plugins/buschain-reverb/build:$PWD/plugins/buschain-builtins/build:''${LV2_PATH:-}"
           # Prefer freshly built helpers next to cargo target (plugin UI / sandbox DSP).
-          export PATH="$PWD/target/debug:$PWD/target/release:$PWD/packaging/waybar:$PATH"
+          export PATH="$PWD/target/debug:$PWD/target/release:$PWD/packaging/waybar:$PWD/packaging/scroll-strip:$PATH"
           export BUSCHAIN_CONTROL_CTL="$PWD/target/debug/buschain-ctl"
-          # Prefer nix-wrapped mixer from this shell (not the bare packaging/ launcher).
-          export BUSCHAIN_CONTROL_MIXER="$(command -v buschain-mixer-gtk)"
+          # Pin the pygobject interpreter so tray/waybar children don't pick /usr/bin/python3.
+          export BUSCHAIN_CONTROL_PYTHON="$(command -v python3)"
+          # Checkout launcher runs legacy/*.py with that Python (live UI edits).
+          export BUSCHAIN_CONTROL_MIXER="$PWD/packaging/mixer/buschain-mixer-gtk"
           export BUSCHAIN_CONTROL_MIXER_CSS="$PWD/packaging/mixer/legacy/style.css"
+          export BUSCHAIN_CONTROL_SCROLL_STRIP_BIN="$PWD/packaging/scroll-strip/buschain-scroll-strip"
           export BUSCHAIN_CONTROL_USE_GTK_MIXER=1
-          chmod +x "$PWD/packaging/waybar/buschain-waybar" 2>/dev/null || true
+          chmod +x "$PWD/packaging/mixer/buschain-mixer-gtk" "$PWD/packaging/waybar/buschain-waybar" "$PWD/packaging/scroll-strip/buschain-scroll-strip" 2>/dev/null || true
           echo "BusChain Control — cargo run  (plugins + ctl + tray + IPC)"
           echo "  hidden: cargo run -- --hidden"
           echo "  ctl:    cargo ctl -- status"
-          echo "  waybar: buschain-waybar popup → GTK ($BUSCHAIN_CONTROL_MIXER)"
+          echo "  mixer:  $BUSCHAIN_CONTROL_MIXER"
+          echo "  scroll: $BUSCHAIN_CONTROL_SCROLL_STRIP_BIN"
+          echo "  python: $BUSCHAIN_CONTROL_PYTHON"
           echo "  vst3:   LD_LIBRARY_PATH includes freetype/cairo/curl/alsa/… for plugin dlopen"
           echo "  helpers: cargo build -p buschain-tools --bin buschain-plugin-ui --bin buschain-plugin-dsp --bin buschain-plugin-surface"
           echo "  window:  Wayland host (default); VST3 editors float on XWayland"

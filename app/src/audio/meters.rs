@@ -32,6 +32,8 @@ enum MeterCmd {
     SetTargets(Vec<MeterTap>),
     /// Tear down and recreate all streams (same tap names after null-sink migrate).
     ForceRebuild,
+    /// Pause Pulse peeks while the UI is Idle / withdrawn.
+    SetPaused(bool),
     Shutdown,
 }
 
@@ -70,6 +72,11 @@ impl MeterHub {
     /// Force stream recreate — call after clock bind / bus migrate (names unchanged).
     pub fn force_rebuild(&self) {
         let _ = self.cmd_tx.send(MeterCmd::ForceRebuild);
+    }
+
+    /// Drop monitor streams and stop peeking while the window is Idle.
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.cmd_tx.send(MeterCmd::SetPaused(paused));
     }
 
     /// Current meter reading in dBFS (−inf shown as −90).
@@ -144,6 +151,7 @@ fn meter_loop(
     let mut meters: Vec<TrackMeter> = Vec::new();
     let mut pending_targets: Option<Vec<MeterTap>> = None;
     let mut last_targets: Vec<MeterTap> = Vec::new();
+    let mut paused = false;
 
     while alive.load(Ordering::SeqCst) {
         let mut force = false;
@@ -151,6 +159,19 @@ fn meter_loop(
             match cmd_rx.try_recv() {
                 Ok(MeterCmd::SetTargets(t)) => pending_targets = Some(t),
                 Ok(MeterCmd::ForceRebuild) => force = true,
+                Ok(MeterCmd::SetPaused(p)) => {
+                    if p && !paused {
+                        ml.lock();
+                        for mut m in meters.drain(..) {
+                            let _ = m.stream.disconnect();
+                        }
+                        ml.unlock();
+                        if let Ok(mut g) = peaks_db.lock() {
+                            g.clear();
+                        }
+                    }
+                    paused = p;
+                }
                 Ok(MeterCmd::Shutdown) => {
                     alive.store(false, Ordering::SeqCst);
                     break;
@@ -164,6 +185,15 @@ fn meter_loop(
         }
         if !alive.load(Ordering::SeqCst) {
             break;
+        }
+
+        if paused {
+            // Keep target list fresh while Idle, but do not open streams.
+            if let Some(targets) = pending_targets.take() {
+                last_targets = targets;
+            }
+            thread::sleep(Duration::from_millis(250));
+            continue;
         }
 
         if force {
@@ -185,6 +215,10 @@ fn meter_loop(
                 last_targets = targets.clone();
                 rebuild_meters(&mut ml, &mut ctx, &mut meters, &targets);
             }
+        } else if meters.is_empty() && !last_targets.is_empty() {
+            // Resume from Idle — recreate streams for the last known taps.
+            let targets = last_targets.clone();
+            rebuild_meters(&mut ml, &mut ctx, &mut meters, &targets);
         }
 
         // Enforce one stream per strip key (zombies from failed disconnects).

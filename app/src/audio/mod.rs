@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod engine_handle;
 pub mod filter_chain;
 pub mod insert_map;

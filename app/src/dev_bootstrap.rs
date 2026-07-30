@@ -66,7 +66,9 @@ fn prepend_path(var: &str, dirs: &[PathBuf]) {
 fn ensure_plugins(root: &Path) {
     let builtins = root.join("plugins/buschain-builtins/build/buschain_builtins.so");
     let denoiser = root.join("plugins/buschain-denoiser/build/buschain_denoiser.so");
-    if builtins.is_file() || denoiser.is_file() {
+    let reverb = root.join("plugins/buschain-reverb/build/buschain_reverb.so");
+    // Rebuild when any core .so is missing (reverb is new — don't skip on builtins alone).
+    if builtins.is_file() && denoiser.is_file() && reverb.is_file() {
         return;
     }
     eprintln!("buschain-control: building LADSPA plugins…");
@@ -136,6 +138,7 @@ pub fn run() {
         let plugin_dirs = [
             root.join("plugins/buschain-denoiser/build"),
             root.join("plugins/buschain-gate/build"),
+            root.join("plugins/buschain-reverb/build"),
             root.join("plugins/buschain-builtins/build"),
         ];
         prepend_path("LADSPA_PATH", &plugin_dirs);
@@ -153,6 +156,7 @@ pub fn run() {
     let plugin_dirs = [
         root.join("plugins/buschain-denoiser/build"),
         root.join("plugins/buschain-gate/build"),
+        root.join("plugins/buschain-reverb/build"),
         root.join("plugins/buschain-builtins/build"),
     ];
     prepend_path("LADSPA_PATH", &plugin_dirs);
@@ -167,9 +171,18 @@ pub fn run() {
     }
 
     let mixer_css = root.join("packaging/mixer/legacy/style.css");
-    // Prefer nix-wrapped `buschain-mixer-gtk` already on PATH (devShell). Do not
-    // force the bare packaging/ launcher — system python usually lacks `gi`.
-    if env::var_os("BUSCHAIN_CONTROL_MIXER").is_none() {
+    let mixer_local = root.join("packaging/mixer/buschain-mixer-gtk");
+    // Checkout launcher + nix-develop Python (BUSCHAIN_CONTROL_PYTHON). Override a
+    // stale nix-store mixer left in the environment from an older shellHook.
+    let store_stale = env::var("BUSCHAIN_CONTROL_MIXER")
+        .map(|p| p.contains("/nix/store/"))
+        .unwrap_or(false);
+    if mixer_local.is_file()
+        && (env::var_os("BUSCHAIN_CONTROL_MIXER").is_none() || store_stale)
+    {
+        env::set_var("BUSCHAIN_CONTROL_MIXER", &mixer_local);
+    } else if env::var_os("BUSCHAIN_CONTROL_MIXER").is_none() {
+        // Packaged install: first buschain-mixer-gtk on PATH.
         if let Ok(path) = env::var("PATH") {
             for dir in env::split_paths(&path) {
                 let p = dir.join("buschain-mixer-gtk");
@@ -180,11 +193,27 @@ pub fn run() {
             }
         }
     }
-    if env::var_os("BUSCHAIN_CONTROL_MIXER_CSS").is_none() && mixer_css.is_file() {
+    // Always prefer checkout CSS next to the local launcher.
+    if mixer_css.is_file()
+        && (env::var_os("BUSCHAIN_CONTROL_MIXER_CSS").is_none()
+            || env::var("BUSCHAIN_CONTROL_MIXER_CSS")
+                .map(|p| p.contains("/nix/store/"))
+                .unwrap_or(false))
+    {
         env::set_var("BUSCHAIN_CONTROL_MIXER_CSS", &mixer_css);
     }
     if env::var_os("BUSCHAIN_CONTROL_USE_GTK_MIXER").is_none() {
         env::set_var("BUSCHAIN_CONTROL_USE_GTK_MIXER", "1");
+    }
+
+    let strip_local = root.join("packaging/scroll-strip/buschain-scroll-strip");
+    let strip_stale = env::var("BUSCHAIN_CONTROL_SCROLL_STRIP_BIN")
+        .map(|p| p.contains("/nix/store/"))
+        .unwrap_or(false);
+    if strip_local.is_file()
+        && (env::var_os("BUSCHAIN_CONTROL_SCROLL_STRIP_BIN").is_none() || strip_stale)
+    {
+        env::set_var("BUSCHAIN_CONTROL_SCROLL_STRIP_BIN", &strip_local);
     }
 
     if let Ok(ctl) = env::var("BUSCHAIN_CONTROL_CTL") {
@@ -192,5 +221,11 @@ pub fn run() {
     }
     if let Ok(mix) = env::var("BUSCHAIN_CONTROL_MIXER") {
         eprintln!("buschain-control: mixer popup → {mix}");
+    }
+    if let Ok(strip) = env::var("BUSCHAIN_CONTROL_SCROLL_STRIP_BIN") {
+        eprintln!("buschain-control: scroll strip → {strip}");
+    }
+    if let Ok(py) = env::var("BUSCHAIN_CONTROL_PYTHON") {
+        eprintln!("buschain-control: mixer python → {py}");
     }
 }

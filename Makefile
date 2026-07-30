@@ -6,6 +6,7 @@ all: plugins
 plugins:
 	$(MAKE) -C plugins/buschain-denoiser
 	$(MAKE) -C plugins/buschain-gate
+	$(MAKE) -C plugins/buschain-reverb
 	$(MAKE) -C plugins/buschain-builtins
 
 run: ui
@@ -16,6 +17,7 @@ app:
 clean:
 	$(MAKE) -C plugins/buschain-denoiser clean
 	$(MAKE) -C plugins/buschain-gate clean
+	$(MAKE) -C plugins/buschain-reverb clean
 	$(MAKE) -C plugins/buschain-builtins clean
 	cargo clean 2>/dev/null || true
 	rm -rf target app/target
@@ -23,6 +25,7 @@ clean:
 install-plugins:
 	$(MAKE) -C plugins/buschain-denoiser install
 	$(MAKE) -C plugins/buschain-gate install
+	$(MAKE) -C plugins/buschain-reverb install
 	$(MAKE) -C plugins/buschain-builtins install
 
 # ── Local vendor workflow (no nixos-rebuild) ──────────────────────────

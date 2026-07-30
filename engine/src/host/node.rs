@@ -1,5 +1,6 @@
 //! PipeWire filter node — process() runs inside the PW RT data callback.
 
+use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -10,11 +11,13 @@ use anyhow::{anyhow, bail, Result};
 use once_cell::sync::OnceCell;
 use pipewire as pw;
 use pw::sys as pw_sys;
+use uuid::Uuid;
 
 use super::control::{ControlMsg, ControlQueue};
 use super::denormal::DenormalGuard;
 use super::processor::MidiEvent;
 use super::rack::Rack;
+use super::spectrum::{SpectrumBus, SpectrumRt};
 use crate::midi::MidiEventQueue;
 
 static PW_INIT: OnceCell<()> = OnceCell::new();
@@ -45,8 +48,14 @@ pub struct HostRtState {
     /// Peak |sample| as f32 bits (pre-insert / post-insert).
     pub meter_pre_peak: AtomicU32,
     pub meter_post_peak: AtomicU32,
+    /// FFT spectrum (pre/post) — UI watches via [`SpectrumBus::watch`].
+    pub spectrum: Arc<SpectrumBus>,
+    pub sample_rate: AtomicU32,
     /// Master-bus PDC delay line (try_lock in RT; lock on worker resize).
     pub pdc: Mutex<super::pdc::DelayLine>,
+    /// Wait-free Props: (slot_id, lowercase control name) → control index.
+    /// Rebuilt at rack publish — Props never take the rack Mutex.
+    pub control_index: Mutex<HashMap<(Uuid, String), u32>>,
 }
 
 impl HostRtState {
@@ -67,13 +76,30 @@ impl HostRtState {
             node_id: AtomicU32::new(0),
             meter_pre_peak: AtomicU32::new(0),
             meter_post_peak: AtomicU32::new(0),
+            spectrum: SpectrumBus::new(),
+            sample_rate: AtomicU32::new(48_000),
             pdc: Mutex::new(super::pdc::DelayLine::new()),
+            control_index: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn publish_rack(&self, rack: Rack) {
         let gen = rack.generation;
         let lat = rack.total_latency_samples();
+        // Publish control name→index before swapping so Props never need the rack lock.
+        {
+            let mut idx = HashMap::new();
+            for slot in &rack.slots {
+                for i in 0..slot.processor.control_count() {
+                    if let Some(name) = slot.processor.control_name(i) {
+                        idx.insert((slot.id.0, name.to_ascii_lowercase()), i as u32);
+                    }
+                }
+            }
+            if let Ok(mut g) = self.control_index.lock() {
+                *g = idx;
+            }
+        }
         let new = Arc::new(Mutex::new(rack));
         let new_ptr = Arc::into_raw(new) as *mut Mutex<Rack>;
         let old = self.rack_ptr.swap(new_ptr, Ordering::AcqRel);
@@ -140,6 +166,7 @@ struct FilterUserData {
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
     max_block: u32,
+    spectrum_rt: SpectrumRt,
 }
 
 #[derive(Clone, Copy)]
@@ -162,6 +189,7 @@ impl PwFxNode {
         ensure_pw_init();
         let fx_name = crate::domain::fx_name_for_bus(bus);
         let state = HostRtState::new();
+        state.sample_rate.store(sample_rate.max(1), Ordering::Relaxed);
         let loop_ptr: Arc<Mutex<Option<MainLoopPtr>>> = Arc::new(Mutex::new(None));
         let state_t = state.clone();
         let loop_t = loop_ptr.clone();
@@ -298,6 +326,7 @@ fn run_filter_loop(
             scratch_l: vec![0.0f32; quantum.max(2048) as usize],
             scratch_r: vec![0.0f32; quantum.max(2048) as usize],
             max_block: quantum.max(2048),
+            spectrum_rt: SpectrumRt::new(sample_rate.max(1)),
         });
 
         let events = pw_sys::pw_filter_events {
@@ -462,9 +491,6 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
         }
     }
 
-    let drain_n = ud.state.queue.drain_to(&mut ud.drain);
-    let midi_n = ud.state.midi_queue.drain_to(&mut ud.midi_drain);
-
     // Pre-insert meter peak (atomic f32 bits).
     let mut pre_peak = 0.0f32;
     for i in 0..ns {
@@ -474,6 +500,14 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
         .meter_pre_peak
         .store(pre_peak.to_bits(), Ordering::Relaxed);
 
+    ud.state.spectrum.tick_rt();
+    let watching = ud.state.spectrum.interested();
+    let want_post = ud.state.spectrum.want_post();
+    if watching && !want_post {
+        ud.spectrum_rt
+            .push_pre(&ud.scratch_l[..ns], &ud.scratch_r[..ns]);
+    }
+
     // Wait-free load of current rack Arc (no mutex on the publish slot).
     let ptr = ud.state.rack_ptr.load(Ordering::Acquire);
     if !ptr.is_null() {
@@ -482,8 +516,12 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
         std::mem::forget(arc);
 
         let _denorm = DenormalGuard::enter();
+        // Drain only after the lock — otherwise try_lock miss drops bypass/params
+        // forever while WorkerPushFx still reports ok (time-to-queue ≠ applied).
         let locked = rack_arc.try_lock();
         if let Ok(mut rack) = locked {
+            let drain_n = ud.state.queue.drain_to(&mut ud.drain);
+            let midi_n = ud.state.midi_queue.drain_to(&mut ud.midi_drain);
             if drain_n > 0 {
                 rack.apply_controls(&ud.drain[..drain_n]);
             }
@@ -495,7 +533,8 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
                 .observed_gen
                 .store(rack.generation, Ordering::Release);
         } else if ud.state.streaming.load(Ordering::Relaxed) {
-            // Contended only while non-RT rebuild holds the mutex briefly.
+            // Contended only while non-RT harvest/rebuild holds the mutex briefly.
+            // Leave mailbox full — next uncontended block applies queued power/params.
             ud.state.xruns.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -514,6 +553,16 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
     ud.state
         .meter_post_peak
         .store(post_peak.to_bits(), Ordering::Relaxed);
+
+    if watching {
+        if want_post {
+            ud.spectrum_rt
+                .push_post(&ud.scratch_l[..ns], &ud.scratch_r[..ns]);
+        }
+        let sr = ud.state.sample_rate.load(Ordering::Relaxed);
+        ud.spectrum_rt.set_sample_rate(sr);
+        ud.spectrum_rt.process_pending(&ud.state.spectrum);
+    }
 
     ptr::copy_nonoverlapping(ud.scratch_l.as_ptr(), out_l, ns);
     ptr::copy_nonoverlapping(ud.scratch_r.as_ptr(), out_r, ns);

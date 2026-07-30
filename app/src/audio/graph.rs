@@ -543,7 +543,33 @@ pub fn set_sink_volume(name_or_index: &str, pct: u32) -> Result<()> {
     if crate::audio::engine_handle::set_levels(name_or_index, gain_db, false).is_ok() {
         return Ok(());
     }
-    run_ok("pactl", &["set-sink-volume", name_or_index, &format!("{pct}%")])
+    set_sink_volume_pct(name_or_index, pct)
+}
+
+/// Master HW / waybar path — set the same `%` unit `probe_sink_volume_mute` reads.
+/// Avoids engine linear vs pactl-percent desync that makes scroll feel stuck.
+pub fn set_sink_volume_pct(name_or_index: &str, pct: u32) -> Result<()> {
+    let pct = pct.min(100);
+    run_ok(
+        "pactl",
+        &["set-sink-volume", name_or_index, &format!("{pct}%")],
+    )
+}
+
+/// Cheap live Master HW read — one sink, not a full `pactl list`.
+/// Used so `status.hw_volume_pct` cannot drift from PipeWire / waybar.
+pub fn probe_sink_volume_mute(name: &str) -> Option<(u32, bool)> {
+    if name.is_empty() {
+        return None;
+    }
+    let vol_out = run("pactl", &["get-sink-volume", name]).ok()?;
+    // Match waybar: first `NN%` token (channel volumes are equal for Master HW).
+    let pct = vol_out
+        .split_whitespace()
+        .find_map(|t| t.strip_suffix('%')?.parse::<u32>().ok())?;
+    let mute_out = run("pactl", &["get-sink-mute", name]).unwrap_or_default();
+    let mute = mute_out.to_ascii_lowercase().contains("yes");
+    Some((pct.min(150), mute))
 }
 
 pub fn set_sink_mute(name_or_index: &str, mute: bool) -> Result<()> {
@@ -1837,7 +1863,11 @@ pub fn apply_session(
         ApplyKind::Full => {
             crate::audio::engine_handle::arm_session(session, &hw_sink, false)
         }
-        ApplyKind::Hotplug | ApplyKind::ClockBind => {
+        ApplyKind::Hotplug => {
+            // Links / egress only — never full reconcile (that ForceRespawns FX).
+            crate::audio::engine_handle::relink_routes(session, &hw_sink)
+        }
+        ApplyKind::ClockBind => {
             crate::audio::engine_handle::reconcile(session, &hw_sink)
         }
     };

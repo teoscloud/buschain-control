@@ -78,6 +78,19 @@ pub fn remove_bus(bus: &str) {
     }
 }
 
+/// Snapshot of (bus, compensation_samples) for pushing into live hosts.
+pub fn all_compensation_targets() -> Vec<(String, u32)> {
+    targets()
+        .lock()
+        .ok()
+        .map(|g| {
+            g.iter()
+                .map(|(b, a)| (b.clone(), a.load(Ordering::Acquire)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Lock-free circular delay for RT use (owned by HostRtState).
 pub struct DelayLine {
     buf_l: Vec<f32>,

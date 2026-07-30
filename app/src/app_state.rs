@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::audio::graph::PwSnapshot;
 use crate::audio::live::LiveChange;
 use crate::audio::meters::{MeterHub, MeterTap};
 use crate::audio::plugin::PluginHost;
-use crate::audio::worker::{AudioWorker, Command, Event};
+use crate::audio::worker::{AudioWorker, Command, Event, SessionAppliedKind};
 use crate::design::SpectrumTheme;
 use crate::session::Session;
 use egui::TextureHandle;
@@ -77,9 +77,9 @@ pub struct AppState {
     levels_pending_full: bool,
     levels_last_sent: Option<Instant>,
     hotplug_deadline: Option<Instant>,
-    /// `None` = all tracks; `Some(id)` = surgical single-track FX reload.
-    hotplug_track: Option<Option<Uuid>>,
-    /// Live param push (knobs) — separate from structural hotplug.
+    /// Tracks pending surgical FX rewire (never escalates to session routes).
+    fx_dirty_tracks: HashSet<Uuid>,
+    /// Live param push (knobs) — drag coalesce; discrete ops push immediately.
     params_deadline: Option<Instant>,
     params_track: Option<Uuid>,
     /// After a failed Props push, allow deferred retries (bounded).
@@ -101,6 +101,8 @@ pub struct AppState {
     pub request_show: bool,
     /// Tray asked to withdraw the main window.
     pub request_hide: bool,
+    /// UI visualization live (meters / spectrum). False while withdrawn or headless.
+    pub viz_live: bool,
     /// Cold ApplySession / ArmSession in flight — show loading chrome until done.
     pub graph_loading: bool,
     /// Live MIDI device list + activity meters.
@@ -118,20 +120,44 @@ pub struct MidiLearnState {
 
 impl AppState {
     pub fn new() -> Self {
+        let boot = std::time::Instant::now();
+        let lat = matches!(
+            std::env::var("BUSCHAIN_CONTROL_LAT_TRACE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        );
         let mut session = Session::load();
         // Never auto-wire the graph on launch — that was stacking loopbacks / crackling.
         session.autostart_graph = false;
+        if lat {
+            eprintln!(
+                "[buschain-lat] session_load {}ms",
+                boot.elapsed().as_millis()
+            );
+        }
+        let scan_t = std::time::Instant::now();
         let plugins = PluginHost::new(
             &session.ladspa_paths,
             &session.lv2_paths,
             &session.clap_paths,
             session.vst3_enabled,
         );
+        if lat {
+            eprintln!(
+                "[buschain-lat] plugin_rescan {}ms",
+                scan_t.elapsed().as_millis()
+            );
+        }
         let worker = AudioWorker::spawn();
         // Embed ctl/waybar IPC into this process (same worker — no thin-client hop).
         if !worker.via_daemon {
             if let Err(e) = crate::daemon::start_embedded(worker.clone_sender()) {
                 eprintln!("buschain-control: embedded IPC: {e:#}");
+            }
+            if lat {
+                eprintln!(
+                    "[buschain-lat] sock_ready {}ms",
+                    boot.elapsed().as_millis()
+                );
             }
         }
         let meters = MeterHub::spawn();
@@ -155,7 +181,7 @@ impl AppState {
             dirty: false,
             rack_width: 360.0,
             mixer_analyzer_open: true,
-            mixer_analyzer_height: 132.0,
+            mixer_analyzer_height: 172.0,
             plugin_windows: Vec::new(),
             plugin_win_gen: 0,
             app_icon_cache: HashMap::new(),
@@ -170,7 +196,7 @@ impl AppState {
             levels_pending_full: false,
             levels_last_sent: None,
             hotplug_deadline: None,
-            hotplug_track: None,
+            fx_dirty_tracks: HashSet::new(),
             params_deadline: None,
             params_track: None,
             params_retry_armed: false,
@@ -184,6 +210,7 @@ impl AppState {
             request_quit: false,
             request_show: false,
             request_hide: false,
+            viz_live: true,
             graph_loading: !via_daemon,
             midi_snapshot: buschain_engine::MidiSnapshot::default(),
             midi_selected_device: None,
@@ -228,7 +255,7 @@ impl AppState {
     /// ERROR RECOVERY ONLY — not a normal edit path.
     pub fn teardown_graph(&mut self) {
         self.hotplug_deadline = None;
-        self.hotplug_track = None;
+        self.fx_dirty_tracks.clear();
         self.params_deadline = None;
         self.params_track = None;
         self.pending_level_track = None;
@@ -250,7 +277,7 @@ impl AppState {
         // Cold graph: bring buses/FX up instead of asking the user to Apply.
         if change.needs_graph() && !self.graph_is_live() {
             self.hotplug_deadline = None;
-            self.hotplug_track = None;
+            self.fx_dirty_tracks.clear();
             self.params_deadline = None;
             self.params_track = None;
             self.pending_level_track = None;
@@ -275,24 +302,21 @@ impl AppState {
                 self.flush_levels(false);
             }
             LiveChange::FxParams { track_id } => {
-                // Always keep latest params — never drop across rewire (minutes/never).
                 self.params_track = Some(track_id);
                 self.params_retry_armed = false;
                 self.params_retry_count = 0;
-                // Flush even while rewire is coalescing — Props are lock-free of ensure.
-                self.params_deadline = Some(Instant::now());
+                // Drag coalesce — discrete power uses flush_fx_params_now (immediate).
+                let gap = crate::audio::adaptive::AdaptivePolicy::global()
+                    .drag_coalesce_ms();
+                self.params_deadline =
+                    Some(Instant::now() + Duration::from_millis(gap));
             }
             LiveChange::FxRewire { track_id } => {
-                // Keep params_track so power/knobs during rebuild still flush after.
-                match self.hotplug_track {
-                    Some(None) => {}
-                    Some(Some(id)) if id != track_id => {
-                        self.hotplug_track = Some(None);
-                    }
-                    _ => self.hotplug_track = Some(Some(track_id)),
-                }
-                // Short coalesce — long debounce made add/reorder feel dead.
-                self.hotplug_deadline = Some(Instant::now() + Duration::from_millis(16));
+                self.fx_dirty_tracks.insert(track_id);
+                let gap = crate::audio::adaptive::AdaptivePolicy::global()
+                    .fx_coalesce_ms();
+                self.hotplug_deadline =
+                    Some(Instant::now() + Duration::from_millis(gap));
                 self.status = "Live FX rewire — slots (streams untouched)…".into();
             }
             LiveChange::EnsureTrack { track_id } => {
@@ -311,7 +335,7 @@ impl AppState {
             }
             LiveChange::Reconcile => {
                 self.hotplug_deadline = None;
-                self.hotplug_track = None;
+                self.fx_dirty_tracks.clear();
                 self.params_deadline = None;
                 self.params_track = None;
                 self.pending_level_track = None;
@@ -909,10 +933,27 @@ impl AppState {
         self.commit(LiveChange::EnsureTrack { track_id });
     }
 
+    /// Idle / withdraw — pause Pulse meters and clear host FFT watches.
+    pub fn sleep_visualization(&mut self) {
+        self.viz_live = false;
+        self.meters.set_paused(true);
+        crate::audio::engine_handle::host_spectrum_clear_watches();
+    }
+
+    /// Show window — resume meters and retarget taps immediately.
+    pub fn wake_visualization(&mut self) {
+        self.viz_live = true;
+        self.meters.set_paused(false);
+        self.meter_targets_sig = 0;
+        self.sync_meter_targets();
+        self.meters.force_rebuild();
+    }
+
     fn sync_meter_targets(&mut self) {
-        // Strip meters: always tap the bus (pre-FX). When inserts/post exist, also
-        // tap buschain_post_* and take the max — via_daemon UI has no wet-cache, so
-        // post-only taps used to go dark while Master still lit up.
+        if !self.viz_live {
+            return;
+        }
+        // Pulse only for buses without a live in-process host (dry / fallback).
         let rate = self.session.performance.sample_rate.max(8_000);
         let mut taps: Vec<MeterTap> = Vec::new();
         let mut sig: u64 = 0;
@@ -921,6 +962,14 @@ impl AppState {
                 .sink_name
                 .clone()
                 .unwrap_or_else(|| t.expected_sink_name());
+            if crate::audio::engine_handle::host_is_live(&bus) {
+                // Host peaks own this strip — no Pulse monitor stream.
+                sig = sig.wrapping_mul(16777619) ^ 0x484F_5354u64; // "HOST"
+                for b in bus.as_bytes() {
+                    sig = sig.wrapping_mul(16777619) ^ (*b as u64);
+                }
+                continue;
+            }
             let post = post_meter_sink(&bus);
             let post_live = self.snapshot.sinks.iter().any(|s| s.name == post)
                 || crate::audio::engine_handle::chain_is_wet_cached(&bus);
@@ -954,6 +1003,12 @@ impl AppState {
     /// After clock bind / bus migrate: names stay the same but PW indices change.
     fn force_meter_rebind(&mut self, schedule_followup: bool) {
         self.meter_targets_sig = 0;
+        if !self.viz_live {
+            if schedule_followup {
+                self.meter_rebind_deadline = Some(Instant::now() + Duration::from_millis(450));
+            }
+            return;
+        }
         self.sync_meter_targets();
         self.meters.force_rebuild();
         if schedule_followup {
@@ -978,7 +1033,9 @@ impl AppState {
         }
         let now = Instant::now();
         // ~120 Hz cap; keep pending across frames so drags stay continuous.
-        let min_gap = Duration::from_millis(8);
+        let min_gap = Duration::from_millis(
+            crate::audio::adaptive::AdaptivePolicy::global().drag_coalesce_ms(),
+        );
         let ready = force
             || self
                 .levels_last_sent
@@ -1045,10 +1102,31 @@ impl AppState {
     }
 
     /// Discrete power toggle — flush Props immediately (no coalesce wait).
+    ///
+    /// Pushes the host control queue from the UI thread first so power does not
+    /// wait behind worker idle reconcile / placements (those can take seconds
+    /// while `WorkerPushFx` still later reports 0ms). Worker mirrors session.
     pub fn flush_fx_params_now(&mut self, track_id: Uuid) {
-        self.harvest_track_plugin_state(track_id);
-        self.commit(LiveChange::FxParams { track_id });
-        self.params_deadline = Some(Instant::now());
+        self.params_track = Some(track_id);
+        self.params_retry_armed = false;
+        self.params_retry_count = 0;
+        self.params_deadline = None;
+        self.dirty = true;
+        if let Some((bus, inserts)) =
+            crate::audio::insert_map::ladspa_slots_for(&self.session, track_id)
+        {
+            let span = buschain_engine::fx_trace::span("UiPushFx");
+            match buschain_engine::host::registry::push_host_controls(&bus, &inserts) {
+                Ok(()) => span.end_ok(),
+                Err(e) => span.end(format!("defer {e:#}")),
+            }
+            self.worker.send(Command::PushFxControls { bus, inserts });
+        } else {
+            self.worker.send(Command::PushFxParams {
+                session: self.session.clone(),
+                track_id,
+            });
+        }
     }
 
     pub fn mark_routing_dirty(&mut self) {
@@ -1080,13 +1158,14 @@ impl AppState {
     }
 
     pub fn clear_master_fx(&mut self) {
+        let mid = self.session.master_id();
         if let Some(m) = self.session.tracks.iter_mut().find(|t| t.kind.is_master()) {
             m.inserts.clear();
         }
-        self.worker
-            .send(Command::ApplySession(self.session.clone()));
+        if let Some(track_id) = mid {
+            self.commit(LiveChange::FxRewire { track_id });
+        }
         self.status = "Cleared Master FX — Save to persist".into();
-        self.dirty = true;
     }
 
     pub fn new_session(&mut self) {
@@ -1130,6 +1209,7 @@ impl AppState {
                     };
                     self.dirty = false;
                 }
+                Ok(Response::Mixer { .. }) => {}
                 Ok(Response::Err { error }) => self.status = format!("Save failed: {error}"),
                 Err(e) => self.status = format!("Save failed: {e:#}"),
             }
@@ -1174,6 +1254,7 @@ impl AppState {
                     self.status = message;
                     self.dirty = false;
                 }
+                Ok(Response::Mixer { .. }) => {}
                 Ok(Response::Err { error }) => self.status = format!("Save as failed: {error}"),
                 Err(e) => self.status = format!("Save as failed: {e:#}"),
             }
@@ -1325,7 +1406,12 @@ impl AppState {
 
     pub fn tick(&mut self) {
         self.apply_pending_track_remove();
-        self.caps_probe_budget = 1;
+        // Idle viz: skip expensive caps probes — audio cmds + events only.
+        if self.viz_live {
+            self.caps_probe_budget = 1;
+        } else {
+            self.caps_probe_budget = 0;
+        }
         self.drain_editor_params_into_session();
 
         for ev in self.worker.poll() {
@@ -1359,25 +1445,12 @@ impl AppState {
                     if !self.status.starts_with("Reattached") {
                         self.status = s;
                     }
-                    if skipped {
-                        // Missing FX node after A/B: don't storm Props — wait for ensure.
-                        let max = if missing { 2 } else { 6 };
-                        if self.params_track.is_some() && self.params_retry_count < max {
-                            self.params_retry_armed = true;
-                            self.params_retry_count =
-                                self.params_retry_count.saturating_add(1);
-                            self.params_deadline = Some(
-                                Instant::now()
-                                    + Duration::from_millis(if missing { 400 } else { 250 }),
-                            );
-                        } else if self.params_retry_count >= max && !missing {
-                            self.status =
-                                "FX control stuck — params not wet after retries".into();
-                        }
-                    } else if live_ok {
+                    // Worker owns Props retries (FxReady cancels). UI does not double-retry.
+                    if live_ok || skipped {
                         self.params_retry_armed = false;
                         self.params_retry_count = 0;
                     }
+                    let _ = missing;
                 }
                 Event::Error(e) => self.status = e,
                 Event::MidiSnapshot(s) => {
@@ -1395,18 +1468,26 @@ impl AppState {
                     self.status = "MIDI learn — binding saved".into();
                     self.worker.send(Command::ApplyMidiConfig(self.session.clone()));
                 }
-                Event::SessionApplied { session, message } => {
-                    // Ensure/Prune/FX-rewire return a session clone from when the
-                    // cmd was queued — full adopt wipes newer assigns/faders/knobs.
-                    // Only patch sink_name.
-                    let patch_sinks_only = message.contains("Ensure track")
+                Event::FxReady { .. } => {
+                    // Worker owns Props retries; clear UI-side deferral arming.
+                    self.params_retry_armed = false;
+                    self.params_retry_count = 0;
+                }
+                Event::SessionApplied {
+                    session,
+                    message,
+                    kind,
+                } => {
+                    // Typed policy — no message.contains for adopt vs patch.
+                    let patch_sinks_only = matches!(
+                        kind,
+                        SessionAppliedKind::Ensure
+                            | SessionAppliedKind::FxRewire
+                            | SessionAppliedKind::Route
+                            | SessionAppliedKind::Levels
+                    ) || message.starts_with("Graph OK")
                         || message.contains("Removed bus")
-                        || message.starts_with("Prune")
-                        || message.contains("FX wet")
-                        || message.contains("FX dry")
-                        || message.contains("FX failed")
-                        || message.contains("FX building")
-                        || message.starts_with("Graph OK");
+                        || message.starts_with("Prune");
                     if patch_sinks_only {
                         for t in &session.tracks {
                             if let Some(local) =
@@ -1419,51 +1500,37 @@ impl AppState {
                         }
                         let graph_ok = message.starts_with("Graph OK");
                         self.status = message;
-                        self.sync_meter_targets();
+                        if self.viz_live {
+                            self.sync_meter_targets();
+                        }
                         if graph_ok || self.graph_is_live() {
                             self.graph_loading = false;
                         }
                         continue;
                     }
 
-                    // Full adopt only for structural/load events. Light FX/level
-                    // responses no longer carry a session (daemon fire-and-forget).
-                    let structural = message.contains("adopted")
-                        || message.contains("loaded")
-                        || message.contains("Apply")
-                        || message.contains("apply")
-                        || message.contains("Clock")
-                        || message.contains("migrat")
-                        || message.contains("GraphClock")
-                        || message.contains("binding")
-                        || message.contains("Device clock")
-                        || message.contains("saved")
-                        || session.slug != self.session.slug
+                    let structural = matches!(
+                        kind,
+                        SessionAppliedKind::Full | SessionAppliedKind::Clock
+                    ) || session.slug != self.session.slug
                         || session.tracks.len() != self.session.tracks.len();
                     if structural {
                         let prev_rate = self.session.performance.sample_rate;
                         let prev_q = self.session.performance.quantum;
                         self.adopt_session(session);
-                        let clockish = prev_rate != self.session.performance.sample_rate
-                            || prev_q != self.session.performance.quantum
-                            || message.contains("migrat")
-                            || message.contains("force-rate")
-                            || message.contains("Clock")
-                            || message.contains("GraphClock")
-                            || message.contains("binding")
-                            || message.contains("Device clock")
-                            || message.contains("adopted");
+                        let clockish = matches!(kind, SessionAppliedKind::Clock)
+                            || prev_rate != self.session.performance.sample_rate
+                            || prev_q != self.session.performance.quantum;
                         self.status = message;
                         self.dirty = false;
                         self.graph_loading = false;
                         if clockish {
                             self.force_meter_rebind(true);
-                        } else {
+                        } else if self.viz_live {
                             self.sync_meter_targets();
                         }
                         self.refresh_performance_from_device();
                     } else {
-                        // Keep local knob/fader edits; only refresh status text.
                         self.status = message;
                         if self.graph_is_live() {
                             self.graph_loading = false;
@@ -1475,34 +1542,38 @@ impl AppState {
 
         if let Some(deadline) = self.meter_rebind_deadline {
             if Instant::now() >= deadline {
-                self.meter_rebind_deadline = None;
-                self.force_meter_rebind(false);
+                if self.viz_live {
+                    self.meter_rebind_deadline = None;
+                    self.force_meter_rebind(false);
+                }
+                // else: keep deadline — wake_visualization rebuilds taps on show
             }
         }
 
-        self.sync_meter_targets();
+        if self.viz_live {
+            self.sync_meter_targets();
+        }
         self.flush_levels(false);
 
         if let Some(deadline) = self.hotplug_deadline {
             if Instant::now() >= deadline {
                 self.hotplug_deadline = None;
-                let target = self.hotplug_track.take();
-                match target {
-                    Some(Some(track_id)) => {
-                        self.worker.send(Command::RewireTrackFx {
-                            session: self.session.clone(),
-                            track_id,
-                        });
-                        self.status = "Rewiring FX slots (streams untouched)…".into();
-                        // Always Props after structural rewire (current session knobs).
-                        self.params_track = Some(track_id);
-                        self.params_deadline = Some(Instant::now());
+                let dirty: Vec<Uuid> = self.fx_dirty_tracks.drain().collect();
+                for track_id in dirty {
+                    self.worker.send(Command::RewireTrackFx {
+                        session: self.session.clone(),
+                        track_id,
+                    });
+                    self.params_track = Some(track_id);
+                    // Props after structural rewire — immediate push.
+                    if let Some((bus, inserts)) =
+                        crate::audio::insert_map::ladspa_slots_for(&self.session, track_id)
+                    {
+                        self.worker.send(Command::PushFxControls { bus, inserts });
                     }
-                    _ => {
-                        self.worker
-                            .send(Command::RewireSessionRoutes(self.session.clone()));
-                        self.status = "Rewiring routes (streams untouched)…".into();
-                    }
+                }
+                if self.params_track.is_some() {
+                    self.status = "Rewiring FX slots (streams untouched)…".into();
                 }
             }
         }

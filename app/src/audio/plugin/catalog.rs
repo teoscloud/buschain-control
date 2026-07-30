@@ -67,6 +67,11 @@ pub fn normalize_label(id: &str) -> &str {
         }
         head
     }).unwrap_or(head);
+    // Forgotten Parametric / eq8 identity → Equalizer.
+    if head == "buschain_eq8" || head.contains("buschain_eq8") || id.contains("buschain_eq8")
+    {
+        return "buschain_equalizer";
+    }
     for known in KNOWN_LABELS {
         if head == *known || head.contains(known) || id.contains(known) {
             return known;
@@ -78,11 +83,13 @@ pub fn normalize_label(id: &str) -> &str {
 const KNOWN_LABELS: &[&str] = &[
     "buschain_denoiser",
     "buschain_gate",
+    "buschain_reverb",
     "buschain_softclip",
     "buschain_overdrive",
     "buschain_limiter",
     "buschain_compressor",
-    "buschain_eq8",
+    // Before buschain_eq — "buschain_equalizer".contains("buschain_eq") would false-match.
+    "buschain_equalizer",
     "buschain_eq",
     "buschain_pitch",
 ];
@@ -718,6 +725,183 @@ impl PluginRef {
 
 /* ---- catalogs (port order = C enum after audio I/O) ---- */
 
+const fn p_slider(key: &'static str, label: &'static str, min: f32, max: f32, default: f32) -> ParamDef {
+    ParamDef {
+        key,
+        label,
+        kind: ParamKind::Slider,
+        min,
+        max,
+        default,
+        modes: None,
+        logarithmic: false,
+    }
+}
+const fn p_toggle(key: &'static str, label: &'static str, default: f32) -> ParamDef {
+    ParamDef {
+        key,
+        label,
+        kind: ParamKind::Toggle,
+        min: 0.0,
+        max: 1.0,
+        default,
+        modes: None,
+        logarithmic: false,
+    }
+}
+
+/// BusChain Room — input controls only (meters are LADSPA output ports).
+static REVERB: &[ParamDef] = &[
+    p_toggle("Bypass", "Bypass", 0.0),
+    p_slider("Mix", "Mix", 0.0, 1.0, 0.25),
+    p_slider("Predelay (ms)", "Predelay", 0.0, 200.0, 20.0),
+    p_slider("Size", "Size", 0.1, 4.0, 1.0),
+    p_slider("Shape", "Shape", 0.5, 2.0, 1.0),
+    p_slider("RT60 (s)", "RT60", 0.1, 12.0, 1.8),
+    p_slider("Character", "Character", 0.0, 1.0, 0.55),
+    p_slider("ER Level", "ER", 0.0, 1.0, 0.55),
+    p_slider("ER Spread", "ER Spread", 0.0, 1.0, 0.5),
+    p_slider("Diffusion", "Diffusion", 0.0, 1.0, 0.65),
+    p_slider("Density", "Density", 0.0, 1.0, 0.7),
+    p_slider("Modulation", "Mod", 0.0, 1.0, 0.15),
+    p_slider("Decay Lo", "Decay Lo", 0.25, 2.0, 1.0),
+    p_slider("Decay Hi", "Decay Hi", 0.25, 2.0, 0.7),
+    p_slider("Wet HP (Hz)", "Wet HP", 20.0, 500.0, 80.0),
+    p_slider("Wet LP (Hz)", "Wet LP", 2000.0, 20000.0, 12000.0),
+    p_slider("Width", "Width", 0.0, 1.0, 0.85),
+    p_slider("Duck Amount", "Duck", 0.0, 1.0, 0.0),
+    p_slider("Duck Release (ms)", "Duck Rel", 10.0, 1000.0, 200.0),
+    p_toggle("Freeze", "Freeze", 0.0),
+    p_slider("Gate Time (ms)", "Gate", 0.0, 500.0, 0.0),
+];
+
+pub fn reverb_preset_names() -> &'static [&'static str] {
+    &[
+        "Booth",
+        "Room",
+        "Chamber",
+        "Hall",
+        "Plate",
+        "Cathedral",
+        "Tunnel",
+        "Infinite",
+    ]
+}
+
+pub fn apply_reverb_preset(plug: &mut PluginRef, name: &str) -> bool {
+    let Some(values) = reverb_preset_values(name) else {
+        return false;
+    };
+    plug.ensure_params();
+    for (k, v) in values {
+        plug.set_param(k, *v);
+    }
+    true
+}
+
+fn reverb_preset_values(name: &str) -> Option<&'static [(&'static str, f32)]> {
+    match name {
+        "Booth" => Some(&[
+            ("Size", 0.35),
+            ("Shape", 1.1),
+            ("RT60 (s)", 0.35),
+            ("Predelay (ms)", 5.0),
+            ("Character", 0.4),
+            ("ER Level", 0.7),
+            ("Diffusion", 0.45),
+            ("Density", 0.55),
+            ("Decay Hi", 0.55),
+            ("Mix", 0.2),
+        ]),
+        "Room" => Some(&[
+            ("Size", 1.0),
+            ("Shape", 1.0),
+            ("RT60 (s)", 1.2),
+            ("Predelay (ms)", 18.0),
+            ("Character", 0.55),
+            ("ER Level", 0.55),
+            ("Diffusion", 0.65),
+            ("Density", 0.7),
+            ("Mix", 0.25),
+        ]),
+        "Chamber" => Some(&[
+            ("Size", 1.4),
+            ("Shape", 0.85),
+            ("RT60 (s)", 2.2),
+            ("Predelay (ms)", 28.0),
+            ("Character", 0.6),
+            ("ER Level", 0.45),
+            ("Diffusion", 0.75),
+            ("Density", 0.8),
+            ("Mix", 0.3),
+        ]),
+        "Hall" => Some(&[
+            ("Size", 2.2),
+            ("Shape", 1.2),
+            ("RT60 (s)", 3.5),
+            ("Predelay (ms)", 35.0),
+            ("Character", 0.5),
+            ("ER Level", 0.4),
+            ("Diffusion", 0.8),
+            ("Density", 0.85),
+            ("Decay Lo", 1.15),
+            ("Mix", 0.32),
+        ]),
+        "Plate" => Some(&[
+            ("Size", 0.9),
+            ("Shape", 1.6),
+            ("RT60 (s)", 2.0),
+            ("Predelay (ms)", 8.0),
+            ("Character", 0.75),
+            ("ER Level", 0.25),
+            ("Diffusion", 0.9),
+            ("Density", 0.95),
+            ("Modulation", 0.25),
+            ("Decay Hi", 0.9),
+            ("Mix", 0.28),
+        ]),
+        "Cathedral" => Some(&[
+            ("Size", 3.2),
+            ("Shape", 0.75),
+            ("RT60 (s)", 6.5),
+            ("Predelay (ms)", 55.0),
+            ("Character", 0.45),
+            ("ER Level", 0.35),
+            ("Diffusion", 0.85),
+            ("Density", 0.9),
+            ("Decay Lo", 1.3),
+            ("Decay Hi", 0.55),
+            ("Mix", 0.35),
+        ]),
+        "Tunnel" => Some(&[
+            ("Size", 2.8),
+            ("Shape", 0.55),
+            ("RT60 (s)", 4.0),
+            ("Predelay (ms)", 40.0),
+            ("Character", 0.35),
+            ("ER Level", 0.5),
+            ("Diffusion", 0.55),
+            ("Density", 0.6),
+            ("Decay Hi", 0.45),
+            ("Width", 0.95),
+            ("Mix", 0.3),
+        ]),
+        "Infinite" => Some(&[
+            ("Size", 3.5),
+            ("Shape", 1.0),
+            ("RT60 (s)", 11.0),
+            ("Predelay (ms)", 30.0),
+            ("Character", 0.5),
+            ("ER Level", 0.2),
+            ("Diffusion", 0.9),
+            ("Density", 0.95),
+            ("Modulation", 0.2),
+            ("Mix", 0.4),
+        ]),
+        _ => None,
+    }
+}
+
 /// Fruity Soft Clipper–style: Threshold + Post (makeup) + Mix (dry/wet).
 static SOFTCLIP: &[ParamDef] = &[
     ParamDef {
@@ -774,12 +958,62 @@ static LIMITER: &[ParamDef] = &[
         logarithmic: false,
     },
     ParamDef {
+        key: "Attack (ms)",
+        label: "Attack",
+        kind: ParamKind::Slider,
+        min: 0.01,
+        max: 50.0,
+        default: 0.1,
+        modes: None,
+        logarithmic: true,
+    },
+    ParamDef {
         key: "Release (ms)",
         label: "Release",
         kind: ParamKind::Slider,
         min: 1.0,
         max: 500.0,
         default: 50.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Lookahead (ms)",
+        label: "Lookahead",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 10.0,
+        default: 1.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Soft Knee (dB)",
+        label: "Knee",
+        kind: ParamKind::Slider,
+        min: 0.0,
+        max: 12.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Input (dB)",
+        label: "Input",
+        kind: ParamKind::Slider,
+        min: -24.0,
+        max: 24.0,
+        default: 0.0,
+        modes: None,
+        logarithmic: false,
+    },
+    ParamDef {
+        key: "Makeup (dB)",
+        label: "Makeup",
+        kind: ParamKind::Slider,
+        min: -24.0,
+        max: 24.0,
+        default: 0.0,
         modes: None,
         logarithmic: false,
     },
@@ -794,6 +1028,55 @@ static LIMITER: &[ParamDef] = &[
         logarithmic: false,
     },
 ];
+
+/// Limiter console presets.
+pub fn limiter_preset_names() -> &'static [&'static str] {
+    &["Transparent", "Mastering", "Aggressive"]
+}
+
+pub fn apply_limiter_preset(plug: &mut PluginRef, name: &str) -> bool {
+    let Some(values) = limiter_preset_values(name) else {
+        return false;
+    };
+    plug.ensure_params();
+    for (k, v) in values {
+        plug.set_param(k, *v);
+    }
+    true
+}
+
+fn limiter_preset_values(name: &str) -> Option<&'static [(&'static str, f32)]> {
+    match name {
+        "Transparent" => Some(&[
+            ("Ceiling (dB)", -0.1),
+            ("Attack (ms)", 0.1),
+            ("Release (ms)", 80.0),
+            ("Lookahead (ms)", 1.0),
+            ("Soft Knee (dB)", 0.0),
+            ("Input (dB)", 0.0),
+            ("Makeup (dB)", 0.0),
+        ]),
+        "Mastering" => Some(&[
+            ("Ceiling (dB)", -0.3),
+            ("Attack (ms)", 0.05),
+            ("Release (ms)", 120.0),
+            ("Lookahead (ms)", 3.0),
+            ("Soft Knee (dB)", 2.0),
+            ("Input (dB)", 0.0),
+            ("Makeup (dB)", 0.0),
+        ]),
+        "Aggressive" => Some(&[
+            ("Ceiling (dB)", -1.0),
+            ("Attack (ms)", 0.01),
+            ("Release (ms)", 30.0),
+            ("Lookahead (ms)", 5.0),
+            ("Soft Knee (dB)", 0.0),
+            ("Input (dB)", 3.0),
+            ("Makeup (dB)", 0.0),
+        ]),
+        _ => None,
+    }
+}
 
 static COMPRESSOR: &[ParamDef] = &[
     ParamDef {
@@ -1750,6 +2033,93 @@ static EQ8: &[ParamDef] = eq8_bands!(
     (8, 12000.0),
 );
 
+pub fn equalizer_preset_names() -> &'static [&'static str] {
+    &["Flat", "Voice Presence", "Mud Cut", "Air", "Bass Shelf"]
+}
+
+pub fn apply_equalizer_preset(plug: &mut PluginRef, name: &str) -> bool {
+    let Some(values) = equalizer_preset_values(name) else {
+        return false;
+    };
+    plug.ensure_params();
+    for (k, v) in values {
+        plug.set_param(k, *v);
+    }
+    true
+}
+
+fn equalizer_preset_values(name: &str) -> Option<&'static [(&'static str, f32)]> {
+    match name {
+        "Flat" => Some(EQ_PRESET_FLAT),
+        "Voice Presence" => Some(EQ_PRESET_VOICE),
+        "Mud Cut" => Some(EQ_PRESET_MUD),
+        "Air" => Some(EQ_PRESET_AIR),
+        "Bass Shelf" => Some(EQ_PRESET_BASS),
+        _ => None,
+    }
+}
+
+/// All bands on, flat gains, default freqs.
+static EQ_PRESET_FLAT: &[(&str, f32)] = &[
+    ("B1 On", 1.0), ("B1 Freq", 60.0), ("B1 Gain", 0.0), ("B1 Q", 0.707), ("B1 Type", 0.0),
+    ("B2 On", 1.0), ("B2 Freq", 150.0), ("B2 Gain", 0.0), ("B2 Q", 0.707), ("B2 Type", 0.0),
+    ("B3 On", 1.0), ("B3 Freq", 400.0), ("B3 Gain", 0.0), ("B3 Q", 0.707), ("B3 Type", 0.0),
+    ("B4 On", 1.0), ("B4 Freq", 1000.0), ("B4 Gain", 0.0), ("B4 Q", 0.707), ("B4 Type", 0.0),
+    ("B5 On", 1.0), ("B5 Freq", 2500.0), ("B5 Gain", 0.0), ("B5 Q", 0.707), ("B5 Type", 0.0),
+    ("B6 On", 1.0), ("B6 Freq", 5000.0), ("B6 Gain", 0.0), ("B6 Q", 0.707), ("B6 Type", 0.0),
+    ("B7 On", 1.0), ("B7 Freq", 8000.0), ("B7 Gain", 0.0), ("B7 Q", 0.707), ("B7 Type", 0.0),
+    ("B8 On", 1.0), ("B8 Freq", 12000.0), ("B8 Gain", 0.0), ("B8 Q", 0.707), ("B8 Type", 0.0),
+    ("Output (dB)", 0.0),
+];
+
+static EQ_PRESET_VOICE: &[(&str, f32)] = &[
+    ("B1 On", 1.0), ("B1 Freq", 80.0), ("B1 Gain", -2.0), ("B1 Q", 0.7), ("B1 Type", 1.0),
+    ("B2 On", 1.0), ("B2 Freq", 220.0), ("B2 Gain", -1.5), ("B2 Q", 1.0), ("B2 Type", 0.0),
+    ("B3 On", 0.0), ("B3 Freq", 400.0), ("B3 Gain", 0.0), ("B3 Q", 0.707), ("B3 Type", 0.0),
+    ("B4 On", 1.0), ("B4 Freq", 1200.0), ("B4 Gain", 1.5), ("B4 Q", 1.2), ("B4 Type", 0.0),
+    ("B5 On", 1.0), ("B5 Freq", 3200.0), ("B5 Gain", 2.5), ("B5 Q", 1.0), ("B5 Type", 0.0),
+    ("B6 On", 1.0), ("B6 Freq", 5500.0), ("B6 Gain", 1.0), ("B6 Q", 0.9), ("B6 Type", 0.0),
+    ("B7 On", 0.0), ("B7 Freq", 8000.0), ("B7 Gain", 0.0), ("B7 Q", 0.707), ("B7 Type", 0.0),
+    ("B8 On", 1.0), ("B8 Freq", 12000.0), ("B8 Gain", 1.5), ("B8 Q", 0.7), ("B8 Type", 2.0),
+    ("Output (dB)", 0.0),
+];
+
+static EQ_PRESET_MUD: &[(&str, f32)] = &[
+    ("B1 On", 1.0), ("B1 Freq", 40.0), ("B1 Gain", 0.0), ("B1 Q", 0.707), ("B1 Type", 3.0),
+    ("B2 On", 1.0), ("B2 Freq", 180.0), ("B2 Gain", -3.5), ("B2 Q", 1.4), ("B2 Type", 0.0),
+    ("B3 On", 1.0), ("B3 Freq", 320.0), ("B3 Gain", -2.0), ("B3 Q", 1.1), ("B3 Type", 0.0),
+    ("B4 On", 0.0), ("B4 Freq", 1000.0), ("B4 Gain", 0.0), ("B4 Q", 0.707), ("B4 Type", 0.0),
+    ("B5 On", 0.0), ("B5 Freq", 2500.0), ("B5 Gain", 0.0), ("B5 Q", 0.707), ("B5 Type", 0.0),
+    ("B6 On", 0.0), ("B6 Freq", 5000.0), ("B6 Gain", 0.0), ("B6 Q", 0.707), ("B6 Type", 0.0),
+    ("B7 On", 0.0), ("B7 Freq", 8000.0), ("B7 Gain", 0.0), ("B7 Q", 0.707), ("B7 Type", 0.0),
+    ("B8 On", 0.0), ("B8 Freq", 12000.0), ("B8 Gain", 0.0), ("B8 Q", 0.707), ("B8 Type", 0.0),
+    ("Output (dB)", 0.5),
+];
+
+static EQ_PRESET_AIR: &[(&str, f32)] = &[
+    ("B1 On", 0.0), ("B1 Freq", 60.0), ("B1 Gain", 0.0), ("B1 Q", 0.707), ("B1 Type", 0.0),
+    ("B2 On", 0.0), ("B2 Freq", 150.0), ("B2 Gain", 0.0), ("B2 Q", 0.707), ("B2 Type", 0.0),
+    ("B3 On", 0.0), ("B3 Freq", 400.0), ("B3 Gain", 0.0), ("B3 Q", 0.707), ("B3 Type", 0.0),
+    ("B4 On", 0.0), ("B4 Freq", 1000.0), ("B4 Gain", 0.0), ("B4 Q", 0.707), ("B4 Type", 0.0),
+    ("B5 On", 1.0), ("B5 Freq", 4000.0), ("B5 Gain", 1.0), ("B5 Q", 0.8), ("B5 Type", 0.0),
+    ("B6 On", 1.0), ("B6 Freq", 8000.0), ("B6 Gain", 2.0), ("B6 Q", 0.7), ("B6 Type", 0.0),
+    ("B7 On", 1.0), ("B7 Freq", 12000.0), ("B7 Gain", 2.5), ("B7 Q", 0.7), ("B7 Type", 2.0),
+    ("B8 On", 1.0), ("B8 Freq", 16000.0), ("B8 Gain", 1.5), ("B8 Q", 0.7), ("B8 Type", 2.0),
+    ("Output (dB)", 0.0),
+];
+
+static EQ_PRESET_BASS: &[(&str, f32)] = &[
+    ("B1 On", 1.0), ("B1 Freq", 80.0), ("B1 Gain", 3.5), ("B1 Q", 0.7), ("B1 Type", 1.0),
+    ("B2 On", 1.0), ("B2 Freq", 200.0), ("B2 Gain", 1.0), ("B2 Q", 0.9), ("B2 Type", 0.0),
+    ("B3 On", 1.0), ("B3 Freq", 450.0), ("B3 Gain", -1.0), ("B3 Q", 1.0), ("B3 Type", 0.0),
+    ("B4 On", 0.0), ("B4 Freq", 1000.0), ("B4 Gain", 0.0), ("B4 Q", 0.707), ("B4 Type", 0.0),
+    ("B5 On", 0.0), ("B5 Freq", 2500.0), ("B5 Gain", 0.0), ("B5 Q", 0.707), ("B5 Type", 0.0),
+    ("B6 On", 0.0), ("B6 Freq", 5000.0), ("B6 Gain", 0.0), ("B6 Q", 0.707), ("B6 Type", 0.0),
+    ("B7 On", 0.0), ("B7 Freq", 8000.0), ("B7 Gain", 0.0), ("B7 Q", 0.707), ("B7 Type", 0.0),
+    ("B8 On", 0.0), ("B8 Freq", 12000.0), ("B8 Gain", 0.0), ("B8 Q", 0.707), ("B8 Type", 0.0),
+    ("Output (dB)", -1.0),
+];
+
 static GATE: &[ParamDef] = &[
     ParamDef {
         key: "Enable",
@@ -1845,6 +2215,12 @@ static GATE: &[ParamDef] = &[
 
 static SPECS: &[PluginUiSpec] = &[
     PluginUiSpec {
+        label: "buschain_reverb",
+        title: "Room",
+        plugin_file: "buschain_reverb",
+        params: REVERB,
+    },
+    PluginUiSpec {
         label: "buschain_softclip",
         title: "Soft Clipper",
         plugin_file: "buschain_builtins",
@@ -1869,8 +2245,8 @@ static SPECS: &[PluginUiSpec] = &[
         params: COMPRESSOR,
     },
     PluginUiSpec {
-        label: "buschain_eq8",
-        title: "Parametric EQ",
+        label: "buschain_equalizer",
+        title: "Equalizer",
         plugin_file: "buschain_builtins",
         params: EQ8,
     },
@@ -1907,7 +2283,7 @@ mod tests {
     #[test]
     fn every_catalog_plugin_has_power_port() {
         // Insert power only writes Bypass/Enable — missing ports = silent no-op
-        // (the buschain_eq8 regression). Keep both accepted (gate uses Enable).
+        // (the Equalizer On/Enable regression). Keep both accepted (gate uses Enable).
         for spec in SPECS {
             let has_power = spec
                 .params

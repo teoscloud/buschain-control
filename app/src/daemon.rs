@@ -5,9 +5,10 @@
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -78,8 +79,79 @@ struct DaemonState {
     last_idle: Instant,
     /// Last forced `pactl` snapshot refresh — avoid blocking IPC on every poll.
     last_snapshot_at: Instant,
-    /// Optimistic Master HW vol/mute so rapid waybar scrolls accumulate.
+    /// Optimistic Master HW vol/mute so rapid waybar/ctl scroll bursts
+    /// accumulate. TTL must match snapshot overlay — a shorter overlay used to
+    /// clear the cache on a stale Event::Snapshot while status still trusted
+    /// the cache (or the reverse), desyncing waybar vs panel.
     hw_vol_cache: Option<(u32, bool, Instant)>,
+    /// Last applied AdjustHwVolume — coalesce Waybar parallel forkExec floods.
+    hw_vol_last_adjust: Option<Instant>,
+}
+
+/// Cache TTL for Master HW % (scroll optimistic + idle status). Avoids 2× pactl
+/// on every Waybar `exec` while still refreshing within a couple seconds.
+const HW_VOL_STATUS_TTL: Duration = Duration::from_millis(2000);
+/// Reserved for diagnostics; AdjustHwVolume always applies (stuck scroll > flood).
+#[allow(dead_code)]
+const HW_VOL_ADJUST_MIN: Duration = Duration::from_millis(8);
+/// Skip RTMIN+9 while this marker is fresher than cool-down.
+const WAYBAR_SCROLL_COOLDOWN_MS: u128 = 1500;
+
+/// Ordered Master HW pactl writer — IPC ACKs before `pactl` so Waybar scroll
+/// forkExecs return instantly. Seq picks the newest intent (never an older %).
+fn hw_vol_apply_tx() -> &'static Sender<(u64, String, u32)> {
+    static TX: OnceLock<Sender<(u64, String, u32)>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(u64, String, u32)>();
+        thread::Builder::new()
+            .name("hw-vol-apply".into())
+            .spawn(move || {
+                let mut pending: Option<(u64, String, u32)> = None;
+                loop {
+                    let first = pending.take().or_else(|| rx.recv().ok());
+                    let Some(item) = first else {
+                        break;
+                    };
+                    let mut best = item;
+                    while let Ok(next) = rx.try_recv() {
+                        if next.0 >= best.0 {
+                            best = next;
+                        }
+                    }
+                    let (seq, name, pct) = best;
+                    let _ = seq;
+                    if let Err(e) = graph::set_sink_volume_pct(&name, pct) {
+                        eprintln!("buschain-control: hw-vol apply {pct}%: {e}");
+                    }
+                    // Prefer highest seq among anything that arrived during pactl.
+                    let mut again: Option<(u64, String, u32)> = None;
+                    while let Ok(next) = rx.try_recv() {
+                        match &again {
+                            Some(cur) if next.0 < cur.0 => {}
+                            _ => again = Some(next),
+                        }
+                    }
+                    pending = again;
+                }
+            })
+            .expect("hw-vol-apply thread");
+        tx
+    })
+}
+
+fn enqueue_hw_volume_set(name: String, pct: u32) {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = hw_vol_apply_tx().send((seq, name, pct.min(100)));
+}
+
+fn lat_trace(msg: &str) {
+    if matches!(
+        std::env::var("BUSCHAIN_CONTROL_LAT_TRACE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    ) {
+        eprintln!("[buschain-lat] {msg}");
+    }
 }
 
 impl DaemonState {
@@ -98,6 +170,7 @@ impl DaemonState {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
             hw_vol_cache: None,
+            hw_vol_last_adjust: None,
         }
     }
 
@@ -114,8 +187,37 @@ impl DaemonState {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now),
             hw_vol_cache: None,
+            hw_vol_last_adjust: None,
         }
     }
+
+    fn waybar_runtime_dir() -> std::path::PathBuf {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("buschain-control")
+    }
+
+    /// Mark an active Master HW scroll gesture for pill / RTMIN cool-down.
+    fn touch_waybar_scroll_marker() {
+        let dir = Self::waybar_runtime_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let marker = dir.join("waybar-scroll-ms");
+        let _ = std::fs::write(&marker, b"1");
+    }
+
+    fn waybar_scroll_marker_hot() -> bool {
+        let marker = Self::waybar_runtime_dir().join("waybar-scroll-ms");
+        std::fs::metadata(&marker)
+            .and_then(|m| m.modified())
+            .map(|t| {
+                t.elapsed()
+                    .map(|d| d.as_millis() < WAYBAR_SCROLL_COOLDOWN_MS)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
 
     /// Refresh PipeWire snapshot at most every `ttl` (or when empty).
     fn ensure_snapshot(&mut self, ttl: Duration) {
@@ -124,20 +226,7 @@ impl DaemonState {
         if empty || self.last_snapshot_at.elapsed() >= ttl {
             self.snapshot = graph::refresh_snapshot();
             self.last_snapshot_at = Instant::now();
-            // Re-apply optimistic HW vol after a fresh list.
-            if let Some((pct, mute, at)) = self.hw_vol_cache {
-                if at.elapsed() < Duration::from_millis(600) {
-                    let name = self.session.master_output.clone();
-                    if let Some(name) = name {
-                        if let Some(sink) =
-                            self.snapshot.sinks.iter_mut().find(|x| x.name == name)
-                        {
-                            sink.volume_pct = pct;
-                            sink.mute = mute;
-                        }
-                    }
-                }
-            }
+            self.apply_hw_cache_to_snapshot();
         }
     }
 
@@ -198,27 +287,17 @@ impl DaemonState {
             match ev {
                 Event::Snapshot(s) => {
                     self.snapshot = s;
-                    // Keep optimistic HW vol if a scroll just happened (snapshot may be stale).
-                    if let Some((pct, mute, at)) = self.hw_vol_cache {
-                        if at.elapsed() < Duration::from_millis(600) {
-                            let name = self.session.master_output.clone();
-                            if let Some(name) = name {
-                                if let Some(sink) =
-                                    self.snapshot.sinks.iter_mut().find(|x| x.name == name)
-                                {
-                                    sink.volume_pct = pct;
-                                    sink.mute = mute;
-                                }
-                            }
-                        } else {
-                            self.hw_vol_cache = None;
-                        }
-                    }
+                    self.apply_hw_cache_to_snapshot();
                     self.soft_bind();
                 }
                 Event::Status(s) | Event::Error(s) => self.status_msg = s,
                 Event::MidiSnapshot(_) | Event::MidiLearnBound { .. } => {}
-                Event::SessionApplied { session, message } => {
+                Event::FxReady { .. } => {}
+                Event::SessionApplied {
+                    session,
+                    message,
+                    kind: _,
+                } => {
                     // Worker applied session is authoritative (tracks + inserts + sink names).
                     self.session = session;
                     self.status_msg = message;
@@ -231,23 +310,72 @@ impl DaemonState {
         self.session.master_output.as_deref()
     }
 
-    fn hw_volume(&self) -> (u32, bool) {
-        // Keep optimistic cache long enough that waybar scroll bursts + snapshot
-        // refresh cannot snap the percent back mid-gesture.
-        if let Some((pct, mute, at)) = self.hw_vol_cache {
-            if at.elapsed() < Duration::from_millis(1800) {
-                return (pct, mute);
+    fn is_master_hw_sink(&self, name: &str) -> bool {
+        self.session.master_output.as_deref() == Some(name)
+    }
+
+    /// Overlay fresh optimistic / status-cached HW % onto the snapshot.
+    fn apply_hw_cache_to_snapshot(&mut self) {
+        let Some((pct, mute, at)) = self.hw_vol_cache else {
+            return;
+        };
+        if at.elapsed() >= HW_VOL_STATUS_TTL {
+            self.hw_vol_cache = None;
+            return;
+        }
+        if let Some(name) = self.session.master_output.clone() {
+            if let Some(sink) = self.snapshot.sinks.iter_mut().find(|x| x.name == name) {
+                sink.volume_pct = pct;
+                sink.mute = mute;
             }
         }
-        let Some(name) = self.hw_sink() else {
+    }
+
+    fn patch_hw_into_snapshot(&mut self, pct: u32, mute: bool) {
+        if let Some(name) = self.session.master_output.clone() {
+            if let Some(s) = self.snapshot.sinks.iter_mut().find(|s| s.name == name) {
+                s.volume_pct = pct;
+                s.mute = mute;
+            }
+        }
+    }
+
+    /// Master HW percent for status / AdjustHwVolume.
+    /// Gesture / status cache first, else live PipeWire (then cache for status TTL).
+    fn hw_volume(&mut self) -> (u32, bool) {
+        if let Some((pct, mute, at)) = self.hw_vol_cache {
+            // Trust optimistic cache through the scroll cool-down — mid-gesture
+            // pactl probes can lag / disagree with the notch we just applied and
+            // make AdjustHwVolume / waybar feel stuck or snap back.
+            let hold = at.elapsed() < HW_VOL_STATUS_TTL || Self::waybar_scroll_marker_hot();
+            if hold {
+                let pct = pct.min(100);
+                self.patch_hw_into_snapshot(pct, mute);
+                return (pct, mute);
+            }
+            self.hw_vol_cache = None;
+        }
+        let Some(name) = self.hw_sink().map(|s| s.to_string()) else {
             return (0, false);
         };
-        self.snapshot
-            .sinks
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| (s.volume_pct, s.mute))
-            .unwrap_or((0, false))
+        let t0 = Instant::now();
+        let (pct, mute) = graph::probe_sink_volume_mute(&name)
+            .or_else(|| {
+                self.snapshot
+                    .sinks
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| (s.volume_pct, s.mute))
+            })
+            .unwrap_or((0, false));
+        lat_trace(&format!(
+            "hw_volume probe {}ms",
+            t0.elapsed().as_millis()
+        ));
+        let pct = pct.min(100);
+        self.hw_vol_cache = Some((pct, mute, Instant::now()));
+        self.patch_hw_into_snapshot(pct, mute);
+        (pct, mute)
     }
 
     /// One scroll notch: ±5 on a 5-grid, snap through 100, hard-capped at 100%.
@@ -271,22 +399,102 @@ impl DaemonState {
     }
 
     fn patch_hw_volume(&mut self, pct: u32, mute: Option<bool>) {
-        let mute = mute.unwrap_or_else(|| self.hw_volume().1);
+        let mute = mute.unwrap_or_else(|| {
+            // Avoid nested hw_volume() while writing cache — read mute only.
+            if let Some((_, m, at)) = self.hw_vol_cache {
+                if at.elapsed() < HW_VOL_STATUS_TTL {
+                    return m;
+                }
+            }
+            self.hw_sink()
+                .and_then(|n| graph::probe_sink_volume_mute(n))
+                .map(|(_, m)| m)
+                .or_else(|| {
+                    let name = self.hw_sink()?;
+                    self.snapshot
+                        .sinks
+                        .iter()
+                        .find(|s| s.name == name)
+                        .map(|s| s.mute)
+                })
+                .unwrap_or(false)
+        });
         let pct = pct.min(100);
         self.hw_vol_cache = Some((pct, mute, Instant::now()));
-        let name = self.session.master_output.clone();
-        if let Some(name) = name {
-            if let Some(s) = self.snapshot.sinks.iter_mut().find(|s| s.name == name) {
-                s.volume_pct = pct;
-                s.mute = mute;
-            }
-        }
+        self.patch_hw_into_snapshot(pct, mute);
     }
 
-    fn build_status(&self) -> Status {
-        let (pct, mute) = self.hw_volume();
-        // Never advertise HW boost in status/waybar/QS labels.
+    fn signal_waybar_hw(&self) {
+        // Pill refresh via RTMIN+9 (module uses exec-on-event: false so scroll
+        // is not blocked by a second `ctl status`). Throttle burst signals and
+        // always schedule a trailing nudge so the final % lands on the pill.
+        static LAST_MS: AtomicU64 = AtomicU64::new(0);
+        static TRAIL_GEN: AtomicU64 = AtomicU64::new(0);
+
+        fn pkill_waybar_signal() {
+            let _ = std::process::Command::new("pkill")
+                .args(["-RTMIN+9", "waybar"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = LAST_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 45 {
+            LAST_MS.store(now, Ordering::Relaxed);
+            std::thread::spawn(pkill_waybar_signal);
+        }
+
+        let gen = TRAIL_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(70));
+            if TRAIL_GEN.load(Ordering::Relaxed) == gen {
+                LAST_MS.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                pkill_waybar_signal();
+            }
+        });
+    }
+
+    /// Apply Master HW volume on the IPC thread (same path as `hw-vol set`).
+    fn apply_master_hw_volume(&mut self, pct: u32) -> Result<(), String> {
         let pct = pct.min(100);
+        let name = self
+            .hw_sink()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "no Master HW out".to_string())?;
+        // Cache + enqueue + return — never block the IPC ACK on pactl (Waybar
+        // drops on-scroll forkExecs while ctl waits).
+        self.patch_hw_volume(pct, None);
+        Self::touch_waybar_scroll_marker();
+        enqueue_hw_volume_set(name, pct);
+        self.signal_waybar_hw();
+        Ok(())
+    }
+
+    fn apply_master_hw_mute(&mut self, mute: bool) -> Result<(), String> {
+        let name = self
+            .hw_sink()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "no Master HW out".to_string())?;
+        let pct = self.hw_volume().0;
+        self.patch_hw_volume(pct, Some(mute));
+        graph::set_sink_mute(&name, mute).map_err(|e| e.to_string())?;
+        self.signal_waybar_hw();
+        Ok(())
+    }
+
+    fn build_status(&mut self) -> Status {
+        let (pct, mute) = self.hw_volume();
         Status {
             ok: true,
             message: self.status_msg.clone(),
@@ -343,6 +551,22 @@ impl DaemonState {
                     session: Some(self.session.clone()),
                 }
             }
+            Request::GetMixer => {
+                if self.snapshot.sinks.is_empty() && self.snapshot.sources.is_empty() {
+                    self.snapshot = graph::refresh_snapshot();
+                    self.last_snapshot_at = Instant::now();
+                }
+                let status = self.build_status();
+                let mixer = crate::mixer_api::build_mixer_json(
+                    Some(&status),
+                    Some(&self.snapshot),
+                    Some(&self.session),
+                );
+                Response::Mixer {
+                    mixer,
+                    status: Some(status),
+                }
+            }
             Request::Exec { cmd } => {
                 // Only structural graph ops block IPC / return a session for UI adopt.
                 // PushFxParams / ApplyLevels / levels must be fire-and-forget (sub-frame).
@@ -397,29 +621,26 @@ impl DaemonState {
                     },
                 }
             }
-            Request::SetHwVolume { pct } => {
-                let pct = pct.min(100);
-                if let Some(name) = self.hw_sink().map(|s| s.to_string()) {
-                    self.patch_hw_volume(pct, None);
-                    // Apply on the IPC thread (pavucontrol-snappy). Skip worker queue.
-                    let _ = graph::set_sink_volume(&name, pct);
+            Request::SetHwVolume { pct } => match self.apply_master_hw_volume(pct) {
+                Ok(()) => {
+                    crate::mixer_api::touch_mixer_tick();
                     Response::Ok {
-                        message: format!("hw vol {pct}%"),
+                        message: format!("hw vol {}%", pct.min(100)),
                         status: Some(self.build_status()),
                         sessions: None,
                         snapshot: None,
                         session: None,
                     }
-                } else {
-                    Response::Err {
-                        error: "no Master HW out".into(),
-                    }
                 }
-            }
+                Err(error) => Response::Err { error },
+            },
             Request::AdjustHwVolume { delta } => {
+                // Always apply. Coalescing made hover-scroll feel stuck (dropped
+                // notches). Waybar smooth-scrolling-threshold already thins floods.
+                Self::touch_waybar_scroll_marker();
+                self.hw_vol_last_adjust = Some(Instant::now());
                 let (cur, _) = self.hw_volume();
                 // Treat |delta|/5 as snap-aware notches (waybar sends ±5 per wheel tick).
-                // Remainder still counts as one notch so fine deltas aren't dropped.
                 let notches = match delta {
                     0 => 0,
                     d if d > 0 => {
@@ -439,6 +660,8 @@ impl DaemonState {
                         }
                     }
                 };
+                // Cap one IPC to 2 notches — parallel forkExec can't jump 50%.
+                let notches = notches.clamp(-2, 2);
                 let mut pct = cur;
                 if notches > 0 {
                     for _ in 0..notches {
@@ -449,28 +672,23 @@ impl DaemonState {
                         pct = Self::snap_hw_notch(pct, false);
                     }
                 }
-                if let Some(name) = self.hw_sink().map(|s| s.to_string()) {
-                    self.patch_hw_volume(pct, None);
-                    let _ = graph::set_sink_volume(&name, pct);
-                    Response::Ok {
-                        message: format!("hw vol {pct}%"),
-                        status: Some(self.build_status()),
-                        sessions: None,
-                        snapshot: None,
-                        session: None,
+                match self.apply_master_hw_volume(pct) {
+                    Ok(()) => {
+                        crate::mixer_api::touch_mixer_tick();
+                        Response::Ok {
+                            message: format!("hw vol {pct}%"),
+                            status: Some(self.build_status()),
+                            sessions: None,
+                            snapshot: None,
+                            session: None,
+                        }
                     }
-                } else {
-                    Response::Err {
-                        error: "no Master HW out".into(),
-                    }
+                    Err(error) => Response::Err { error },
                 }
             }
-            Request::SetHwMute { mute } => {
-                let name = self.session.master_output.clone();
-                if let Some(name) = name {
-                    let pct = self.hw_volume().0;
-                    self.patch_hw_volume(pct, Some(mute));
-                    let _ = graph::set_sink_mute(&name, mute);
+            Request::SetHwMute { mute } => match self.apply_master_hw_mute(mute) {
+                Ok(()) => {
+                    crate::mixer_api::touch_mixer_tick();
                     Response::Ok {
                         message: "ok".into(),
                         status: Some(self.build_status()),
@@ -478,16 +696,14 @@ impl DaemonState {
                         snapshot: None,
                         session: None,
                     }
-                } else {
-                    Response::Err {
-                        error: "no Master HW out".into(),
-                    }
                 }
-            }
+                Err(error) => Response::Err { error },
+            },
             Request::SetSinkInputVolume { index, pct } => {
                 self.patch_sink_input(index, Some(pct), None);
                 self.cmds
                     .send(Command::SetSinkInputVolume { index, pct });
+                crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
                     message: "ok".into(),
                     status: None,
@@ -500,6 +716,7 @@ impl DaemonState {
                 self.patch_sink_input(index, None, Some(mute));
                 self.cmds
                     .send(Command::SetSinkInputMute { index, mute });
+                crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
                     message: "ok".into(),
                     status: None,
@@ -510,6 +727,7 @@ impl DaemonState {
             }
             Request::MoveSinkInput { index, sink } => {
                 self.cmds.send(Command::MoveSinkInput { index, sink });
+                crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
                     message: "ok".into(),
                     status: None,
@@ -566,30 +784,67 @@ impl DaemonState {
                 }
             }
             Request::SetSinkVolume { name, pct } => {
-                self.patch_device_vol(true, &name, Some(pct), None);
-                self.cmds.send(Command::SetSinkVolume { name, pct });
-                Response::Ok {
-                    message: "ok".into(),
-                    status: None,
-                    sessions: None,
-                    snapshot: None,
-                    session: None,
+                // Master HW device row must share the hw-vol path — never a
+                // second percent via async worker sink-vol (waybar/status desync).
+                if self.is_master_hw_sink(&name) {
+                    match self.apply_master_hw_volume(pct) {
+                        Ok(()) => {
+                            crate::mixer_api::touch_mixer_tick();
+                            Response::Ok {
+                                message: format!("hw vol {}%", pct.min(100)),
+                                status: Some(self.build_status()),
+                                sessions: None,
+                                snapshot: None,
+                                session: None,
+                            }
+                        }
+                        Err(error) => Response::Err { error },
+                    }
+                } else {
+                    self.patch_device_vol(true, &name, Some(pct.min(150)), None);
+                    self.cmds.send(Command::SetSinkVolume { name, pct });
+                    crate::mixer_api::touch_mixer_tick();
+                    Response::Ok {
+                        message: "ok".into(),
+                        status: None,
+                        sessions: None,
+                        snapshot: None,
+                        session: None,
+                    }
                 }
             }
             Request::SetSinkMute { name, mute } => {
-                self.patch_device_vol(true, &name, None, Some(mute));
-                self.cmds.send(Command::SetSinkMute { name, mute });
-                Response::Ok {
-                    message: "ok".into(),
-                    status: None,
-                    sessions: None,
-                    snapshot: None,
-                    session: None,
+                if self.is_master_hw_sink(&name) {
+                    match self.apply_master_hw_mute(mute) {
+                        Ok(()) => {
+                            crate::mixer_api::touch_mixer_tick();
+                            Response::Ok {
+                                message: "ok".into(),
+                                status: Some(self.build_status()),
+                                sessions: None,
+                                snapshot: None,
+                                session: None,
+                            }
+                        }
+                        Err(error) => Response::Err { error },
+                    }
+                } else {
+                    self.patch_device_vol(true, &name, None, Some(mute));
+                    self.cmds.send(Command::SetSinkMute { name, mute });
+                    crate::mixer_api::touch_mixer_tick();
+                    Response::Ok {
+                        message: "ok".into(),
+                        status: None,
+                        sessions: None,
+                        snapshot: None,
+                        session: None,
+                    }
                 }
             }
             Request::SetSourceVolume { name, pct } => {
                 self.patch_device_vol(false, &name, Some(pct), None);
                 self.cmds.send(Command::SetSourceVolume { name, pct });
+                crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
                     message: "ok".into(),
                     status: None,
@@ -601,6 +856,7 @@ impl DaemonState {
             Request::SetSourceMute { name, mute } => {
                 self.patch_device_vol(false, &name, None, Some(mute));
                 self.cmds.send(Command::SetSourceMute { name, mute });
+                crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
                     message: "ok".into(),
                     status: None,
@@ -634,6 +890,7 @@ impl DaemonState {
                     gain_db: gain,
                     muted,
                 });
+                crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
                     message: "ok".into(),
                     status: None,
@@ -763,7 +1020,8 @@ impl DaemonState {
                 }
             }
             Request::PopupPlayback => {
-                crate::popup_launch::spawn_mixer_popup();
+                // Never block the IPC mutex on GTK settle / egui fallthrough.
+                crate::popup_launch::spawn_mixer_popup_async();
                 Response::Ok {
                     message: "popup".into(),
                     status: None,
@@ -773,6 +1031,20 @@ impl DaemonState {
                 }
             }
         }
+    }
+}
+
+fn request_tag(req: &Request) -> &'static str {
+    match req {
+        Request::Ping => "ping",
+        Request::GetStatus => "status",
+        Request::AdjustHwVolume { .. } | Request::SetHwVolume { .. } | Request::SetHwMute { .. } => {
+            "hw-vol"
+        }
+        Request::PopupPlayback => "popup",
+        Request::GetSnapshot => "snapshot",
+        Request::GetMixer => "mixer",
+        _ => "other",
     }
 }
 
@@ -794,14 +1066,20 @@ fn handle_client(state: Arc<Mutex<DaemonState>>, mut stream: UnixStream) {
                     let resp = match serde_json::from_str::<Request>(line) {
                         Ok(req) => {
                             let shutdown = matches!(req, Request::Shutdown);
+                            let tag = request_tag(&req);
+                            let t0 = Instant::now();
                             let mut g = state.lock().unwrap();
+                            let lock_ms = t0.elapsed().as_millis();
                             let embedded = g.cmds.is_embedded();
-                            // Keep ctl session fresh with UI disk saves.
-                            if embedded {
-                                g.session = Session::load();
-                            }
+                            // Embedded: session truth comes from worker Events only
+                            // (never reload disk and overwrite UI-dirty state).
                             g.drain_events();
+                            let _ = embedded;
                             let r = g.handle(req);
+                            lat_trace(&format!(
+                                "ipc {tag} lock_wait={lock_ms}ms hold={}ms",
+                                t0.elapsed().as_millis()
+                            ));
                             if shutdown && !embedded {
                                 drop(g);
                                 let _ = ipc::write_line(&mut stream, &r);
@@ -825,8 +1103,9 @@ fn handle_client(state: Arc<Mutex<DaemonState>>, mut stream: UnixStream) {
 }
 
 fn serve_loop(state: Arc<Mutex<DaemonState>>, listener: std::os::unix::net::UnixListener) {
+    // Snapshot refresh must not block accept (multi-pactl).
+    let refresh_busy = Arc::new(AtomicBool::new(false));
     loop {
-        // Never hold the mutex across pactl — that stalled call_fast knobs.
         let refresh = {
             let mut g = state.lock().unwrap();
             g.drain_events();
@@ -837,13 +1116,22 @@ fn serve_loop(state: Arc<Mutex<DaemonState>>, listener: std::os::unix::net::Unix
                 false
             }
         };
-        if refresh {
-            let snap = graph::refresh_snapshot();
-            let mut g = state.lock().unwrap();
-            g.snapshot = snap;
-            // Embedded: UI owns the live session (commands update it). Reloading
-            // disk every tick fought unsaved edits and lagged behind toggles.
-            g.soft_bind();
+        if refresh && !refresh_busy.swap(true, Ordering::SeqCst) {
+            let st = state.clone();
+            let busy = refresh_busy.clone();
+            thread::spawn(move || {
+                let t0 = Instant::now();
+                let snap = graph::refresh_snapshot();
+                let ms = t0.elapsed().as_millis();
+                lat_trace(&format!("refresh_snapshot {ms}ms"));
+                let mut g = st.lock().unwrap();
+                g.snapshot = snap;
+                // Keep Master HW optimistic cache aligned with status/waybar/GTK.
+                g.apply_hw_cache_to_snapshot();
+                // Embedded: UI owns the live session (commands update it).
+                g.soft_bind();
+                busy.store(false, Ordering::SeqCst);
+            });
         }
 
         match listener.accept() {
@@ -876,6 +1164,7 @@ pub fn run() -> Result<()> {
         "buschain-daemon listening on {}",
         ipc::socket_path().display()
     );
+    crate::scroll_strip::spawn_scroll_strip_async();
     serve_loop(state, listener);
     #[allow(unreachable_code)]
     Ok(())
@@ -897,5 +1186,7 @@ pub fn start_embedded(cmd_tx: Sender<Command>) -> Result<()> {
         .name("buschain-ipc".into())
         .spawn(move || serve_loop(state, listener))
         .expect("spawn embedded ipc");
+    // Master HW hover notches — BusChain-owned layer-shell strip (not Waybar on-scroll).
+    crate::scroll_strip::spawn_scroll_strip_async();
     Ok(())
 }

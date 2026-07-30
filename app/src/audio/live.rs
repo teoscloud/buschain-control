@@ -10,8 +10,8 @@
 //! ## Severity ladder (least → most invasive)
 //!
 //! 1. **Levels** — volume/mute on existing buses (no module load)
-//! 2. **FxParams** — Props on the monolithic rack (knobs / mix / insert power)
-//! 3. **FxRewire** — add/remove/reorder (warm A/B dual-helper cutover when wet)
+//! 2. **FxParams** — Props on the in-process host ControlQueue (knobs / mix / power)
+//! 3. **FxRewire** — add/remove/reorder via surgical gen-swap ForceRespawn per track
 //! 4. **EnsureTrack / PruneTrack** — one bus only
 //! 5. **Route** — link-only rewire (listen / HW / targets) — never respawn FX
 //! 6. **Reconcile** — idle ensure; recovery / cold bring-up
@@ -19,12 +19,12 @@
 //!
 //! ## Hard rules
 //!
-//! - One sealed `buschain_fx_*` helper per bus (`n0→n1→…`); structural edits A/B cutover.
-//! - Power/knobs = Props only. Route = destination links only.
-//! - Exclusive `ensure_loopback` routes (never stack loads → double audio).
+//! - One sealed `buschain_fx_*` host per bus; structural edits gen-swap the rack.
+//! - Power/knobs = Props only. Route = destination links only (`relink_routes`).
+//! - Multi-track FX dirtiness stays N× `RewireTrackFx` — never escalates to session Hotplug.
 //! - Never move sink-inputs as a side effect of mixer edits (Chromium/Spotify pause).
 //! - If the graph is cold, **auto bring-up** via Reconcile — do not prompt for Apply.
-//! - Apps stay on stable `buschain_*` null-sink buses; FX is monolithic filter-chain.
+//! - Apps stay on stable `buschain_*` null-sink buses; FX is the in-process host filter.
 
 use uuid::Uuid;
 
@@ -37,7 +37,7 @@ pub enum LiveChange {
     Levels,
     /// Knobs / mix / insert power — Props on slots, no process restart.
     FxParams { track_id: Uuid },
-    /// Insert add / remove / reorder — A/B FX cutover + exclusive rewire.
+    /// Insert add / remove / reorder — surgical gen-swap on that track's host.
     FxRewire { track_id: Uuid },
     /// New track bus.
     EnsureTrack { track_id: Uuid },

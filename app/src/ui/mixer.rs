@@ -1,7 +1,9 @@
 use crate::app_state::AppState;
 use crate::audio::plugin::{
-    apply_denoiser_preset, denoiser_preset_names, dynamic_ui_for_ref, plugin_ref_with_defaults,
-    plugin_title_for_ref, ui_spec_for_ref, OwnedParamDef, ParamKind, PluginFormat, PluginId,
+    apply_denoiser_preset, apply_equalizer_preset, apply_limiter_preset, apply_reverb_preset,
+    denoiser_preset_names, dynamic_ui_for_ref, equalizer_preset_names, limiter_preset_names,
+    plugin_ref_with_defaults, plugin_title_for_ref, reverb_preset_names, ui_spec_for_ref,
+    OwnedParamDef, ParamKind, PluginFormat, PluginId,
 };
 use crate::audio::worker::Command;
 use crate::design::{self, Theme};
@@ -230,174 +232,158 @@ pub fn draw_channel_rack_panel(ctx: &egui::Context, state: &mut AppState) {
 /// Collapsible bottom analyzer — peak spectrum of the selected track.
 /// Height is owned by AppState (`exact_height`); a custom top grab strip resizes it.
 /// (egui's built-in panel resize stores content-rect height and fights the drag.)
+/// Bottom rice visual — post-FX spectrum for the selected track (no EQ nodes / chrome).
 pub fn draw_mixer_analyzer_panel(ctx: &egui::Context, state: &mut AppState) {
     let theme = state.theme;
-    let open = state.mixer_analyzer_open;
-    let min_h = 96.0_f32;
+    let min_h = 80.0_f32;
     let max_h = 420.0_f32;
-    let bar_h = 28.0_f32;
+    // Always show the visual (collapse chrome removed).
+    state.mixer_analyzer_open = true;
     state.mixer_analyzer_height = state.mixer_analyzer_height.clamp(min_h, max_h);
-    let panel_h = if open {
-        state.mixer_analyzer_height
-    } else {
-        bar_h
-    };
+    let panel_h = state.mixer_analyzer_height;
 
     let frame = egui::Frame::NONE
         .fill(theme.bg_panel())
         .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
         .inner_margin(egui::Margin::symmetric(10, 4));
 
-    egui::TopBottomPanel::bottom("mixer_analyzer_v5")
+    egui::TopBottomPanel::bottom("mixer_analyzer_v7")
         .exact_height(panel_h)
         .resizable(false)
         .frame(frame)
         .show(ctx, |ui| {
-            if open {
-                // Custom resize grab along the top edge (drag up = taller).
-                let full = ui.max_rect();
-                let grab = egui::Rect::from_x_y_ranges(
+            let full = ui.max_rect();
+            let grab = egui::Rect::from_x_y_ranges(
+                full.x_range(),
+                egui::Rangef::new(full.top() - 2.0, full.top() + 7.0),
+            );
+            let grab_resp = ui.interact(
+                grab,
+                egui::Id::new("mixer_analyzer_resize_grab"),
+                Sense::drag(),
+            );
+            if grab_resp.dragged() {
+                state.mixer_analyzer_height = (state.mixer_analyzer_height
+                    - grab_resp.drag_delta().y)
+                    .clamp(min_h, max_h);
+            }
+            if grab_resp.hovered() || grab_resp.dragged() {
+                ui.ctx()
+                    .set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                ui.painter().hline(
                     full.x_range(),
-                    egui::Rangef::new(full.top() - 2.0, full.top() + 7.0),
+                    full.top() + 1.0,
+                    egui::Stroke::new(2.0_f32, theme.accent().gamma_multiply(0.85)),
                 );
-                let grab_resp = ui.interact(
-                    grab,
-                    egui::Id::new("mixer_analyzer_resize_grab"),
-                    Sense::drag(),
-                );
-                if grab_resp.dragged() {
-                    state.mixer_analyzer_height = (state.mixer_analyzer_height
-                        - grab_resp.drag_delta().y)
-                        .clamp(min_h, max_h);
-                }
-                if grab_resp.hovered() || grab_resp.dragged() {
-                    ui.ctx()
-                        .set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                    ui.painter().hline(
-                        full.x_range(),
-                        full.top() + 1.0,
-                        egui::Stroke::new(2.0_f32, theme.accent().gamma_multiply(0.85)),
-                    );
-                } else {
-                    ui.painter().hline(
-                        full.x_range(),
-                        full.top() + 1.0,
-                        egui::Stroke::new(1.0_f32, theme.border_soft()),
-                    );
-                }
-            }
-
-            ui.horizontal(|ui| {
-                let open = state.mixer_analyzer_open;
-                let label = if open { "▾ Analyzer" } else { "▸ Analyzer" };
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(label)
-                                .size(11.0)
-                                .strong()
-                                .color(theme.accent()),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::NONE),
-                    )
-                    .on_hover_text(if open {
-                        "Collapse analyzer"
-                    } else {
-                        "Expand analyzer"
-                    })
-                    .clicked()
-                {
-                    state.mixer_analyzer_open = !state.mixer_analyzer_open;
-                }
-                let (track_name, peak, _, _) = selected_track_analyzer_data(state);
-                ui.label(
-                    RichText::new(track_name)
-                        .size(11.0)
-                        .color(theme.text_dim()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let txt = if peak <= -89.0 {
-                        "— dB".into()
-                    } else {
-                        format!("{peak:+.0} dB")
-                    };
-                    ui.label(
-                        RichText::new(txt)
-                            .size(10.0)
-                            .monospace()
-                            .color(theme.text_muted()),
-                    );
-                });
-            });
-
-            if state.mixer_analyzer_open {
-                ui.add_space(2.0);
-                let (_track_name, peak, bands, out_g) = selected_track_analyzer_data(state);
-                let w = ui.available_width();
-                let h = (ui.available_height() - 2.0).max(48.0);
-                design::track_analyzer(
-                    ui,
-                    &theme,
-                    peak,
-                    bands.as_deref(),
-                    out_g,
-                    Vec2::new(w, h),
+            } else {
+                ui.painter().hline(
+                    full.x_range(),
+                    full.top() + 1.0,
+                    egui::Stroke::new(1.0_f32, theme.border_soft()),
                 );
             }
+
+            let bus_key = selected_track_bus_key(state);
+            // Always post-FX for the selected track.
+            if !bus_key.is_empty() {
+                crate::audio::engine_handle::host_spectrum_watch(&bus_key, true);
+            }
+            let frame = if bus_key.is_empty() {
+                None
+            } else {
+                crate::audio::engine_handle::host_spectrum(&bus_key, true)
+            };
+            let (mags, sr, gen) = match &frame {
+                Some(f) => (Some(f.mags.as_slice()), f.sample_rate as f32, f.gen),
+                None => (None, 48_000.0, 0),
+            };
+
+            let chrome = design::EqChartChrome {
+                post: true,
+                peak_hold: true,
+                freeze: false,
+            };
+            let mut sel = 0usize;
+            let w = ui.available_width();
+            let h = (ui.available_height() - 2.0).max(48.0);
+            // Spectrum only — no EQ band nodes from inserts.
+            design::eq_chart(
+                ui,
+                &theme,
+                None,
+                0.0,
+                &mut sel,
+                Vec2::new(w, h),
+                mags,
+                sr,
+                gen,
+                &chrome,
+                "mixer_analyzer",
+            );
         });
 }
 
-fn selected_track_analyzer_data(
-    state: &AppState,
-) -> (String, f32, Option<Vec<design::PeqBand>>, f32) {
+fn is_equalizer_label(label: &str) -> bool {
+    let n = crate::audio::plugin::normalize_label(label);
+    n == "buschain_equalizer"
+}
+
+/// Prefer host post peak when FX host is live; Pulse fallback for dry buses.
+fn strip_peak_db(state: &AppState, bus: &str) -> f32 {
+    if let Some((_pre, post)) = crate::audio::engine_handle::host_meter_peaks(bus) {
+        if post > 1e-8 {
+            return (20.0 * post.log10()).clamp(-90.0, 12.0);
+        }
+        if _pre > 1e-8 {
+            return (20.0 * _pre.log10()).clamp(-90.0, 12.0);
+        }
+    }
+    state.meters.peak_db(bus)
+}
+
+fn selected_track_bus_key(state: &AppState) -> String {
     let Some(tid) = state.selected_track else {
-        return ("(no track)".into(), -90.0, None, 0.0);
+        return String::new();
     };
     let Some(track) = state.session.tracks.iter().find(|t| t.id == tid) else {
-        return ("(no track)".into(), -90.0, None, 0.0);
+        return String::new();
     };
-    let key = track
+    track
         .sink_name
         .clone()
-        .unwrap_or_else(|| track.expected_sink_name());
-    let peak = if let Some((_pre, post)) = crate::audio::engine_handle::host_meter_peaks(&key) {
-        if post > 1e-8 {
-            (20.0 * post.log10()).clamp(-90.0, 12.0)
-        } else if _pre > 1e-8 {
-            (20.0 * _pre.log10()).clamp(-90.0, 12.0)
-        } else {
-            state.meters.peak_db(&key)
-        }
-    } else {
-        state.meters.peak_db(&key)
-    };
+        .unwrap_or_else(|| track.expected_sink_name())
+}
 
-    // EQ curve only when the selected insert is Parametric EQ — never from other plugs.
-    let mut out_g = 0.0;
-    let bands = state
-        .selected_plugin_slot
-        .and_then(|sid| track.inserts.iter().find(|p| p.slot_id == sid))
-        .filter(|p| {
-            !p.bypass
-                && ui_spec_for_ref(p)
-                    .map(|s| s.label == "buschain_eq8")
-                    .unwrap_or(false)
+fn load_eq_bands(state: &AppState, track_idx: usize, insert_idx: usize) -> Vec<design::PeqBand> {
+    let plug = &state.session.tracks[track_idx].inserts[insert_idx];
+    (1..=8)
+        .map(|n| design::PeqBand {
+            on: plug.param(&format!("B{n} On")).unwrap_or(1.0) >= 0.5,
+            freq: plug.param(&format!("B{n} Freq")).unwrap_or(1000.0),
+            gain_db: plug.param(&format!("B{n} Gain")).unwrap_or(0.0),
+            q: plug.param(&format!("B{n} Q")).unwrap_or(0.707),
+            mode: plug.param(&format!("B{n} Type")).unwrap_or(0.0).round() as i32,
         })
-        .map(|plug| {
-            out_g = plug.param("Output (dB)").unwrap_or(0.0);
-            (1..=8)
-                .map(|n| design::PeqBand {
-                    on: plug.param(&format!("B{n} On")).unwrap_or(1.0) >= 0.5,
-                    freq: plug.param(&format!("B{n} Freq")).unwrap_or(1000.0),
-                    gain_db: plug.param(&format!("B{n} Gain")).unwrap_or(0.0),
-                    q: plug.param(&format!("B{n} Q")).unwrap_or(0.707),
-                    mode: plug.param(&format!("B{n} Type")).unwrap_or(0.0).round() as i32,
-                })
-                .collect::<Vec<_>>()
-        });
+        .collect()
+}
 
-    (track.name.clone(), peak, bands, out_g)
+fn store_eq_bands(
+    state: &mut AppState,
+    track_idx: usize,
+    insert_idx: usize,
+    bands: &[design::PeqBand],
+    out_gain: f32,
+) {
+    let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
+    for (i, b) in bands.iter().enumerate() {
+        let n = i + 1;
+        plug.set_param(&format!("B{n} On"), if b.on { 1.0 } else { 0.0 });
+        plug.set_param(&format!("B{n} Freq"), b.freq);
+        plug.set_param(&format!("B{n} Gain"), b.gain_db);
+        plug.set_param(&format!("B{n} Q"), b.q);
+        plug.set_param(&format!("B{n} Type"), b.mode as f32);
+    }
+    plug.set_param("Output (dB)", out_gain.clamp(-24.0, 24.0));
 }
 
 fn draw_strip(
@@ -552,7 +538,7 @@ fn draw_strip(
                             .sink_name
                             .clone()
                             .unwrap_or_else(|| t.expected_sink_name());
-                        state.meters.peak_db(&key)
+                        strip_peak_db(state, &key)
                     })
                     .unwrap_or(-90.0);
                 // Same dB window as the fader — 0 dB rails stay locked together.
@@ -561,17 +547,7 @@ fn draw_strip(
         });
     });
 
-    // ---- Control deck (bottom-locked, identical geometry on every strip) ----
-    ui.painter().rect_filled(
-        deck_rect,
-        egui::CornerRadius {
-            nw: 0,
-            ne: 0,
-            sw: 3,
-            se: 3,
-        },
-        theme.bg_well(),
-    );
+    // ---- Control deck (bottom-locked) — same theme fill as the strip body ----
     ui.painter().hline(
         deck_rect.x_range(),
         deck_rect.top(),
@@ -608,7 +584,8 @@ fn draw_strip(
                 if has_sink {
                     state.schedule_levels();
                 } else {
-                    state.commit(crate::audio::LiveChange::Reconcile);
+                    state.commit(crate::audio::LiveChange::EnsureTrack { track_id });
+                    state.schedule_levels();
                 }
             }
         });
@@ -638,19 +615,11 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(8.0);
 
     let Some(sel_id) = state.selected_track else {
-        ui.label(
-            RichText::new("Select a track on the left")
-                .size(13.0)
-                .color(theme.text_muted()),
-        );
+        ui.label(RichText::new("—").size(13.0).color(theme.text_muted()));
         return;
     };
     let Some(track_idx) = state.session.track_index(sel_id) else {
-        ui.label(
-            RichText::new("Track gone")
-                .size(13.0)
-                .color(theme.danger()),
-        );
+        ui.label(RichText::new("—").size(13.0).color(theme.danger()));
         return;
     };
 
@@ -665,9 +634,23 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
     );
     ui.add_space(6.0);
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Name").size(11.0).color(theme.text_dim()));
-        let resp = ui.text_edit_singleline(&mut state.session.tracks[track_idx].name);
+    {
+        let name_fill = Color32::from_rgb(0x30, 0x33, 0x38);
+        let resp = egui::Frame::NONE
+            .fill(name_fill)
+            .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
+            .corner_radius(theme.rounding())
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.session.tracks[track_idx].name)
+                        .desired_width(ui.available_width())
+                        .frame(false)
+                        .font(egui::FontId::proportional(14.0))
+                        .text_color(theme.text()),
+                )
+            })
+            .inner;
         if resp.changed() {
             state.dirty = true;
             // Optimistic Output label + push PW device.description (stale Track_N otherwise).
@@ -688,147 +671,161 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 description: desc,
             });
         }
-    });
-
-    ui.add_space(10.0);
-    design::section_label(ui, &theme, "INPUT SOURCE");
-    draw_input_dropdown(ui, state, track_idx);
+    }
 
     if !is_master {
-        ui.add_space(4.0);
-        let mut listen = state.session.tracks[track_idx].listen;
-        if ui.checkbox(&mut listen, "Listen").changed() {
-            state.session.tracks[track_idx].listen = listen;
-            state.mark_routing_dirty();
-        }
-        let mut virt = state.session.tracks[track_idx].virtual_output;
-        if ui
-            .checkbox(&mut virt, "Virtual output device")
-            .on_hover_text(
-                "When on, this track appears as a system sink (apps / default / Move to). \
-                 When off, BusChain hides it from Output / Move to (bus still exists for routing).",
-            )
-            .changed()
-        {
-            state.session.tracks[track_idx].virtual_output = virt;
-            let bus = state.session.tracks[track_idx].expected_sink_name();
-            let desc = format!(
-                "BusChainControl_{}",
-                state.session.tracks[track_idx].name.replace(' ', "_")
-            );
-            state.dirty = true;
-            let _ = state.session.save();
-            // Keep worker last_session aligned so idle reconcile doesn't clobber the flag.
-            state
-                .worker
-                .send(Command::ApplyLevels(state.session.clone()));
-            state.worker.send(Command::Refresh);
-            // Optimistic Output row — don't wait for the snapshot round-trip.
-            if virt {
-                if !state.snapshot.sinks.iter().any(|s| s.name == bus) {
-                    state.snapshot.sinks.push(crate::audio::graph::DeviceNode {
-                        index: 0,
-                        name: bus,
-                        description: desc,
-                        volume_pct: 100,
-                        mute: false,
-                        sample_rate: None,
-                    });
-                }
-            }
-            state.status = if virt {
-                "Virtual output enabled for track".into()
-            } else {
-                "Virtual output hidden — internal bus only".into()
-            };
-        }
+        ui.add_space(10.0);
+        draw_virtual_output_section(ui, state, track_idx);
     }
 
     ui.add_space(10.0);
-    design::section_label(ui, &theme, "OUTPUT ROUTING");
-    if is_master {
-        let hw = state
-            .session
-            .master_output
-            .clone()
-            .unwrap_or_else(|| "(auto)".into());
-        ui.label(
-            RichText::new(format!("HW out: {hw}"))
-                .size(11.0)
-                .color(theme.text_muted()),
-        );
-    } else {
-        draw_output_routing(ui, state, track_idx, sel_id);
-    }
+    draw_io_strip(ui, state, track_idx, is_master);
 
-    ui.add_space(10.0);
-    design::section_label(ui, &theme, "APPS ON THIS TRACK");
-    draw_app_assign(ui, state, track_idx);
+    ui.add_space(12.0);
+    design::section_label(ui, &theme, "APPS");
+    draw_apps_rack(ui, state, track_idx);
 
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     design::section_label(ui, &theme, "INSERTS");
     draw_insert_rack(ui, state, track_idx);
 
-    ui.add_space(12.0);
+    ui.add_space(6.0);
     draw_plugin_browser(ui, state, track_idx);
+
+    ui.add_space(12.0);
+    design::section_label(ui, &theme, "OUTPUT");
+    draw_output_rack(ui, state, track_idx, sel_id, is_master);
 }
 
-fn draw_input_dropdown(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
+/// Virtual system output — separate from hardware input routing.
+fn draw_virtual_output_section(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
     let theme = state.theme;
-    let current = state.session.tracks[track_idx]
-        .input_source
-        .clone()
-        .unwrap_or_else(|| "(none)".into());
-    let sources: Vec<(String, String)> = std::iter::once(("(none)".into(), "(none)".into()))
-        .chain(
-            state
-                .snapshot
-                .sources
-                .iter()
-                .map(|s| (s.name.clone(), s.description.clone())),
-        )
-        .collect();
-
-    let input_salt = state.session.tracks[track_idx].id;
-    egui::ComboBox::from_id_salt(format!("input_{input_salt}"))
-        .selected_text(RichText::new(&current).size(11.0))
-        .width(ui.available_width())
-        .show_ui(ui, |ui| {
-            for (name, desc) in &sources {
-                let label = if name == "(none)" {
-                    "(none)".to_string()
-                } else if desc.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{desc}")
-                };
-                if ui
-                    .selectable_label(current == *name, RichText::new(&label).size(11.0))
-                    .clicked()
-                {
-                    if name == "(none)" {
-                        state.session.tracks[track_idx].input_source = None;
-                        state.session.tracks[track_idx].input_source_desc = None;
-                    } else {
-                        state.session.tracks[track_idx].input_source = Some(name.clone());
-                        state.session.tracks[track_idx].input_source_desc =
-                            Some(desc.clone());
-                    }
-                    state.mark_routing_dirty();
+    egui::Frame::NONE
+        .fill(theme.bg_chart())
+        .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            let mut virt = state.session.tracks[track_idx].virtual_output;
+            if design::toggle_chip(
+                ui,
+                &theme,
+                "Create",
+                &mut virt,
+                theme.accent(),
+            )
+            .changed()
+            {
+                state.session.tracks[track_idx].virtual_output = virt;
+                let tid = state.session.tracks[track_idx].id;
+                state.dirty = true;
+                let _ = state.session.save();
+                // Session flag + EnsureTrack — never invent PwSnapshot nodes.
+                if virt {
+                    state.commit(crate::audio::LiveChange::EnsureTrack { track_id: tid });
                 }
+                state
+                    .worker
+                    .send(Command::ApplyLevels(state.session.clone()));
             }
         });
-    let _ = theme;
 }
 
-fn draw_output_routing(
+/// Hardware input + Listen (same row), separate from virtual system output.
+fn draw_io_strip(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, is_master: bool) {
+    let theme = state.theme;
+    egui::Frame::NONE
+        .fill(theme.bg_chart())
+        .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("In")
+                        .size(11.0)
+                        .strong()
+                        .color(theme.text_dim()),
+                );
+                ui.add_space(6.0);
+
+                let listen_reserve = if is_master { 0.0 } else { 64.0 };
+                let dd_w = (ui.available_width() - listen_reserve).max(100.0);
+                draw_input_dropdown(ui, state, track_idx, dd_w);
+
+                if !is_master {
+                    ui.add_space(6.0);
+                    let mut listen = state.session.tracks[track_idx].listen;
+                    if design::toggle_chip(ui, &theme, "Listen", &mut listen, theme.accent())
+                        .changed()
+                    {
+                        state.session.tracks[track_idx].listen = listen;
+                        state.mark_routing_dirty();
+                    }
+                }
+            });
+        });
+}
+
+fn master_output_title(state: &AppState) -> String {
+    if let Some(desc) = state
+        .session
+        .master_output_desc
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return desc.to_string();
+    }
+    if let Some(name) = state.session.master_output.as_ref() {
+        if let Some(sink) = state.snapshot.sinks.iter().find(|s| s.name == *name) {
+            if !sink.description.trim().is_empty() {
+                return sink.description.clone();
+            }
+        }
+        return short_device_title(name);
+    }
+    "(auto)".into()
+}
+
+fn short_device_title(name: &str) -> String {
+    let s = name
+        .strip_prefix("alsa_output.")
+        .or_else(|| name.strip_prefix("alsa_input."))
+        .unwrap_or(name);
+    let head = s.split("__").next().unwrap_or(s);
+    let head = head.split('.').next().unwrap_or(head);
+    head.replace('_', " ")
+}
+
+/// OUTPUT mini-rack — master shows HW title; other tracks show checked destinations.
+fn draw_output_rack(
     ui: &mut egui::Ui,
     state: &mut AppState,
     track_idx: usize,
     self_id: Uuid,
+    is_master: bool,
 ) {
+    let theme = state.theme;
+    let content_w = ui.available_width();
+    ui.set_max_width(content_w);
+
+    if is_master {
+        mini_rack_row(ui, &theme, content_w, |ui| {
+            ui.label(
+                RichText::new(master_output_title(state))
+                    .size(12.0)
+                    .strong()
+                    .color(theme.text()),
+            );
+        });
+        return;
+    }
+
     let master_id = state.session.master_id();
-    let candidates: Vec<(Uuid, String, bool)> = state
+    let candidates: Vec<(Uuid, String)> = state
         .session
         .tracks
         .iter()
@@ -841,40 +838,215 @@ fn draw_output_routing(
                 } else {
                     t.name.clone()
                 },
-                t.kind.is_master(),
             )
         })
         .collect();
 
-    for (id, name, _is_m) in candidates {
-        let mut on = state.session.tracks[track_idx]
-            .output_targets
-            .contains(&id);
-        if ui.checkbox(&mut on, &name).changed() {
-            let targets = &mut state.session.tracks[track_idx].output_targets;
-            if on {
-                if !targets.contains(&id) {
-                    targets.push(id);
-                }
-            } else {
-                targets.retain(|x| *x != id);
-            }
-            // Always keep at least master if everything unchecked
-            if targets.is_empty() {
-                if let Some(mid) = master_id {
-                    targets.push(mid);
-                }
-            }
-            state.mark_routing_dirty();
+    let targets = state.session.tracks[track_idx].output_targets.clone();
+    let mut remove_id: Option<Uuid> = None;
+
+    for (id, name) in &candidates {
+        if !targets.contains(id) {
+            continue;
         }
+        mini_rack_row(ui, &theme, content_w, |ui| {
+            ui.label(
+                RichText::new(name)
+                    .size(12.0)
+                    .strong()
+                    .color(theme.text()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if design::text_tool_button(ui, &theme, "×")
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
+                    remove_id = Some(*id);
+                }
+            });
+        });
+        ui.add_space(3.0);
+    }
+
+    if let Some(id) = remove_id {
+        let targets = &mut state.session.tracks[track_idx].output_targets;
+        targets.retain(|x| *x != id);
+        if targets.is_empty() {
+            if let Some(mid) = master_id {
+                targets.push(mid);
+            }
+        }
+        state.mark_routing_dirty();
+    }
+
+    let assigned_now = state.session.tracks[track_idx].output_targets.clone();
+    let choices: Vec<(Uuid, String)> = candidates
+        .into_iter()
+        .filter(|(id, _)| !assigned_now.contains(id))
+        .collect();
+
+    let popup_id = ui.make_persistent_id(("output_to_popup", self_id));
+    let trigger = ui.add(
+        egui::Button::new(
+            RichText::new(format!("{}  Output to…", egui_phosphor::regular::PLUS))
+                .size(12.0)
+                .strong()
+                .color(theme.text()),
+        )
+        .fill(theme.bg_elevated())
+        .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+        .corner_radius(theme.rounding())
+        .min_size(Vec2::new(110.0, 26.0)),
+    );
+    if trigger.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &trigger,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(180.0);
+            if choices.is_empty() {
+                ui.label(
+                    RichText::new("All destinations added")
+                        .size(11.0)
+                        .color(theme.text_muted()),
+                );
+                return;
+            }
+            for (id, name) in &choices {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(name).size(12.0).color(theme.text()))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .min_size(Vec2::new(ui.available_width(), 22.0)),
+                    )
+                    .clicked()
+                {
+                    let targets = &mut state.session.tracks[track_idx].output_targets;
+                    if !targets.contains(id) {
+                        targets.push(*id);
+                    }
+                    state.mark_routing_dirty();
+                    ui.close_menu();
+                }
+            }
+        },
+    );
+}
+
+fn mini_rack_row(
+    ui: &mut egui::Ui,
+    theme: &dyn Theme,
+    content_w: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    const ROW_H: f32 = 34.0;
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(content_w, ROW_H), Sense::hover());
+    ui.painter()
+        .rect_filled(row_rect, theme.rounding(), theme.bg_chart());
+    ui.painter().rect_stroke(
+        row_rect,
+        theme.rounding(),
+        egui::Stroke::new(1.0_f32, theme.border()),
+        egui::StrokeKind::Inside,
+    );
+    let inner = row_rect.shrink2(Vec2::new(8.0, 4.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(inner.width());
+            add_contents(ui);
+        });
+    });
+}
+
+fn input_device_title(name: &str, desc: &str) -> String {
+    let d = desc.trim();
+    if !d.is_empty() {
+        d.to_string()
+    } else {
+        short_device_title(name)
     }
 }
 
-fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
+fn draw_input_dropdown(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, width: f32) {
+    let current = state.session.tracks[track_idx]
+        .input_source
+        .clone()
+        .unwrap_or_else(|| "(none)".into());
+    let current_title = if current == "(none)" {
+        "(none)".to_string()
+    } else if let Some(desc) = state
+        .session
+        .tracks[track_idx]
+        .input_source_desc
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        desc.to_string()
+    } else if let Some(src) = state.snapshot.sources.iter().find(|s| s.name == current) {
+        input_device_title(&src.name, &src.description)
+    } else {
+        short_device_title(&current)
+    };
+
+    let sources: Vec<(String, String)> = std::iter::once(("(none)".into(), "(none)".into()))
+        .chain(
+            state
+                .snapshot
+                .sources
+                .iter()
+                .map(|s| (s.name.clone(), input_device_title(&s.name, &s.description))),
+        )
+        .collect();
+
+    let input_salt = state.session.tracks[track_idx].id;
+    egui::ComboBox::from_id_salt(format!("input_{input_salt}"))
+        .selected_text(RichText::new(&current_title).size(11.0))
+        .width(width)
+        .show_ui(ui, |ui| {
+            for (name, title) in &sources {
+                if ui
+                    .selectable_label(current == *name, RichText::new(title).size(11.0))
+                    .clicked()
+                {
+                    if name == "(none)" {
+                        state.session.tracks[track_idx].input_source = None;
+                        state.session.tracks[track_idx].input_source_desc = None;
+                    } else {
+                        let desc = state
+                            .snapshot
+                            .sources
+                            .iter()
+                            .find(|s| s.name == *name)
+                            .map(|s| s.description.clone())
+                            .unwrap_or_default();
+                        state.session.tracks[track_idx].input_source = Some(name.clone());
+                        state.session.tracks[track_idx].input_source_desc =
+                            Some(if desc.trim().is_empty() {
+                                title.clone()
+                            } else {
+                                desc
+                            });
+                    }
+                    state.mark_routing_dirty();
+                }
+            }
+        });
+}
+
+/// APPS mini-rack — insert-style rows for assigned playback apps.
+fn draw_apps_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
     let theme = state.theme;
+    let content_w = ui.available_width();
+    ui.set_max_width(content_w);
 
     // Unique live *user* apps (skip BusChain / foreign filter-chain helpers)
-    // (key, display label, icon_name)
     let mut live: Vec<(String, String, Option<String>)> = Vec::new();
     for s in &state.snapshot.sink_inputs {
         if !s.is_user_app() {
@@ -882,7 +1054,7 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
         }
         let key = s.app_key();
         if key.starts_with("stream:") {
-            continue; // still anonymous — don't offer
+            continue;
         }
         if !live.iter().any(|(k, _, _)| k == &key) {
             live.push((key, s.display_name(), s.icon_name.clone()));
@@ -890,51 +1062,46 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
     }
     live.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
 
-    // Assigned chips (resolve label from live streams when possible)
     let assigned = state.session.tracks[track_idx].assigned_playback.clone();
     let mut remove_key: Option<String> = None;
-    if !assigned.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-            for key in &assigned {
-                let (label, icon) = live
-                    .iter()
-                    .find(|(k, _, _)| k == key)
-                    .map(|(_, d, ic)| (d.clone(), ic.clone()))
-                    .unwrap_or_else(|| (pretty_app_key(key), None));
-                egui::Frame::NONE
-                    .fill(theme.bg_elevated())
-                    .stroke(egui::Stroke::new(1.0_f32, theme.border()))
-                    .corner_radius(theme.rounding())
-                    .inner_margin(egui::Margin::symmetric(6, 3))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            crate::ui::app_icons::draw_app_icon(ui, state, icon.as_deref());
-                            ui.label(RichText::new(&label).size(11.0).color(theme.text()));
-                            if design::icon_button(ui, &theme, egui_phosphor::regular::X, true)
-                                .on_hover_text("Remove app from this track")
-                                .clicked()
-                            {
-                                remove_key = Some(key.clone());
-                            }
-                        });
-                    });
-            }
+
+    for key in &assigned {
+        let (label, icon) = live
+            .iter()
+            .find(|(k, _, _)| k == key)
+            .map(|(_, d, ic)| (d.clone(), ic.clone()))
+            .unwrap_or_else(|| (pretty_app_key(key), None));
+        mini_rack_row(ui, &theme, content_w, |ui| {
+            crate::ui::app_icons::draw_app_icon(ui, state, icon.as_deref());
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(&label)
+                    .size(12.0)
+                    .strong()
+                    .color(theme.text()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if design::text_tool_button(ui, &theme, "×")
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
+                    remove_key = Some(key.clone());
+                }
+            });
         });
-        ui.add_space(4.0);
+        ui.add_space(3.0);
     }
+
     if let Some(key) = remove_key {
         state.session.tracks[track_idx]
             .assigned_playback
             .retain(|a| a != &key && !keys_same_app(a, &key));
         state.dirty = true;
-        // Sync worker last_session so idle enforce doesn't re-pin this app.
         state
             .worker
             .send(crate::audio::worker::Command::ApplyLevels(
                 state.session.clone(),
             ));
-        // Unpin → move off this bus onto preferred default / master (fresh list).
         let fallback = state
             .session
             .preferred_default_sink
@@ -960,42 +1127,63 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
         })
         .collect();
 
-    let mut pick: Option<String> = None;
-    egui::ComboBox::from_id_salt(format!("app_assign_{track_id_salt}"))
-        .selected_text(
-            RichText::new(if choices.is_empty() {
-                if state.snapshot.sink_inputs.is_empty() {
-                    "No apps playing right now"
-                } else {
-                    "All live apps already assigned"
-                }
-            } else {
-                "Add application…"
-            })
-            .size(11.0),
+    let popup_id = ui.make_persistent_id(("app_assign_popup", track_id_salt));
+    let trigger = ui.add(
+        egui::Button::new(
+            RichText::new(format!("{}  Add", egui_phosphor::regular::PLUS))
+                .size(12.0)
+                .strong()
+                .color(theme.text()),
         )
-        .width(ui.available_width())
-        .show_ui(ui, |ui| {
+        .fill(theme.bg_elevated())
+        .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+        .corner_radius(theme.rounding())
+        .min_size(Vec2::new(88.0, 26.0)),
+    );
+    if trigger.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    let mut pick: Option<String> = None;
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &trigger,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(220.0);
+            ui.set_max_height(280.0);
             if choices.is_empty() {
                 ui.label(
-                    RichText::new("No live apps")
+                    RichText::new("No apps available")
                         .size(11.0)
                         .color(theme.text_muted()),
                 );
+                return;
             }
-            for (key, label, icon) in &choices {
-                ui.horizontal(|ui| {
-                    crate::ui::app_icons::draw_app_icon(ui, state, icon.as_deref());
-                    if ui
-                        .selectable_label(false, RichText::new(label).size(11.0))
-                        .on_hover_text(key)
-                        .clicked()
-                    {
-                        pick = Some(key.clone());
-                    }
-                });
-            }
-        });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (key, label, icon) in &choices {
+                    ui.horizontal(|ui| {
+                        crate::ui::app_icons::draw_app_icon(ui, state, icon.as_deref());
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(label).size(12.0).color(theme.text()),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .min_size(Vec2::new(ui.available_width(), 22.0)),
+                            )
+                            .clicked()
+                        {
+                            pick = Some(key.clone());
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+        },
+    );
 
     if let Some(key) = pick {
         let tid = state.session.tracks[track_idx].id;
@@ -1014,13 +1202,11 @@ fn draw_app_assign(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
             track.sink_name = Some(sink.clone());
         }
         state.dirty = true;
-        // Sync pins into worker before place — idle enforce uses last_session.
         state
             .worker
             .send(crate::audio::worker::Command::ApplyLevels(
                 state.session.clone(),
             ));
-        // Ensure bus exists (coalesce runs Ensure before PlaceApp in-batch).
         if !state.snapshot.sinks.iter().any(|s| s.name == sink) {
             state.ensure_new_track(tid);
         }
@@ -1092,11 +1278,7 @@ fn draw_insert_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
     }
 
     if state.session.tracks[track_idx].inserts.is_empty() {
-        ui.label(
-            RichText::new("No inserts")
-                .size(11.0)
-                .color(theme.text_muted()),
-        );
+        // Empty rack — Add control sits below via draw_plugin_browser.
         return;
     }
 
@@ -1129,11 +1311,11 @@ fn draw_insert_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
         let is_source = dragging.is_some_and(|d| d.from == i);
 
         let fill = if is_source {
-            theme.bg_elevated().gamma_multiply(0.85)
+            theme.bg_chart().gamma_multiply(0.9)
         } else if window_open || selected {
             theme.bg_elevated()
         } else {
-            theme.bg_well()
+            theme.bg_chart()
         };
         let stroke = if is_source || window_open || selected {
             theme.accent()
@@ -1261,17 +1443,21 @@ fn draw_insert_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
                             RichText::new(name).size(13.0).strong().color(name_color),
                         )
                         .truncate()
+                        .selectable(false)
                         .sense(Sense::click()),
                     );
                     if name_resp.clicked() {
                         toggle_slot = Some(slot_id);
                     }
                     if !enabled {
-                        ui.label(
-                            RichText::new("OFF")
-                                .size(10.0)
-                                .strong()
-                                .color(theme.text_muted()),
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("OFF")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(theme.text_muted()),
+                            )
+                            .selectable(false),
                         );
                     }
                 },
@@ -1474,10 +1660,13 @@ fn draw_static_plugin_params(
     changed |= match label {
         "buschain_softclip" => draw_softclip_panel(ui, state, track_idx, insert_idx),
         "buschain_overdrive" => draw_overdrive_panel(ui, state, track_idx, insert_idx),
-        "buschain_eq8" => draw_peq_panel(ui, state, track_idx, insert_idx),
+        "buschain_equalizer" | "buschain_eq8" => {
+            draw_equalizer_panel(ui, state, track_idx, insert_idx)
+        }
         "buschain_compressor" => draw_compressor_panel(ui, state, track_idx, insert_idx),
         "buschain_limiter" => draw_limiter_panel(ui, state, track_idx, insert_idx),
         "buschain_gate" => draw_gate_panel(ui, state, track_idx, insert_idx),
+        "buschain_reverb" => draw_reverb_panel(ui, state, track_idx, insert_idx),
         "buschain_pitch" => draw_pitch_panel(ui, state, track_idx, insert_idx),
         "buschain_eq" => draw_eq1_panel(ui, state, track_idx, insert_idx),
         "buschain_denoiser" => draw_denoiser_panel(ui, state, track_idx, insert_idx),
@@ -1610,7 +1799,651 @@ fn inhouse_knob_col(
     changed
 }
 
-/// Soft Clipper — knobs · meters · transfer curve (BusChain console).
+/// Per-insert SpatialViz orbit (yaw/pitch) + distance multiplier.
+#[derive(Clone, Copy, Debug)]
+struct ReverbVizCam {
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+}
+
+impl Default for ReverbVizCam {
+    fn default() -> Self {
+        // Prior fixed framing: eye ∝ (0.72, 0.48, 0.78).
+        Self {
+            yaw: 0.745,
+            pitch: 0.425,
+            zoom: 1.0,
+        }
+    }
+}
+
+/// Room — hybrid FDN console: knobs · SpatialViz · meters.
+fn draw_reverb_panel(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    track_idx: usize,
+    insert_idx: usize,
+) -> bool {
+    use crate::design::spatial_viz::{
+        BackendRect, EguiPainterBackend, ReverbRoomParams, ReverbRoomScene, SpatialBackend,
+        SpatialCamera, SpatialFrame, SpatialMetricBus, SpatialScene, SpatialViewport, VizQuality,
+        METRIC_BAND_T60_HI, METRIC_BAND_T60_LO, METRIC_BAND_T60_MID, METRIC_DUCK_GR,
+        METRIC_ECHO_DENSITY, METRIC_ER_TAIL, METRIC_RT60, METRIC_WET_PEAK,
+    };
+    use egui::{CornerRadius, Frame, Margin, Stroke};
+
+    let theme = state.theme;
+    let peak_db = insert_peak_db(state, track_idx, insert_idx);
+    let track_id = state.session.tracks[track_idx].id;
+    let slot_id = state.session.tracks[track_idx].inserts[insert_idx].slot_id;
+
+    let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
+    plug.ensure_params();
+
+    let mut mix = plug.param("Mix").unwrap_or(0.25);
+    let mut predelay = plug.param("Predelay (ms)").unwrap_or(20.0);
+    let mut size = plug.param("Size").unwrap_or(1.0);
+    let mut shape = plug.param("Shape").unwrap_or(1.0);
+    let mut rt60 = plug.param("RT60 (s)").unwrap_or(1.8);
+    let mut character = plug.param("Character").unwrap_or(0.55);
+    let mut er_level = plug.param("ER Level").unwrap_or(0.55);
+    let mut er_spread = plug.param("ER Spread").unwrap_or(0.5);
+    let mut diffusion = plug.param("Diffusion").unwrap_or(0.65);
+    let mut density = plug.param("Density").unwrap_or(0.7);
+    let mut modulation = plug.param("Modulation").unwrap_or(0.15);
+    let mut decay_lo = plug.param("Decay Lo").unwrap_or(1.0);
+    let mut decay_hi = plug.param("Decay Hi").unwrap_or(0.7);
+    let mut wet_hp = plug.param("Wet HP (Hz)").unwrap_or(80.0);
+    let mut wet_lp = plug.param("Wet LP (Hz)").unwrap_or(12000.0);
+    let mut width = plug.param("Width").unwrap_or(0.85);
+    let mut duck_amt = plug.param("Duck Amount").unwrap_or(0.0);
+    let mut duck_rel = plug.param("Duck Release (ms)").unwrap_or(200.0);
+    let mut freeze = plug.param("Freeze").unwrap_or(0.0) >= 0.5;
+    let mut gate_time = plug.param("Gate Time (ms)").unwrap_or(0.0);
+    let mut changed = false;
+
+    let viz_id = egui::Id::new(("reverb_viz", track_id, slot_id));
+    let viz_cam_id = egui::Id::new(("reverb_viz_cam", track_id, slot_id));
+    let viz_grab_id = egui::Id::new(("reverb_viz_grab", track_id, slot_id));
+    let arch_id = egui::Id::new(("reverb_arch", track_id, slot_id));
+    let mut quality = ui.ctx().data(|d| {
+        d.get_temp::<VizQuality>(viz_id)
+            .unwrap_or(VizQuality::Cinematic)
+    });
+    let mut viz_cam = ui.ctx().data(|d| {
+        d.get_temp::<ReverbVizCam>(viz_cam_id)
+            .unwrap_or_default()
+    });
+    let mut active_arch = ui.ctx().data(|d| {
+        d.get_temp::<String>(arch_id)
+            .unwrap_or_else(|| "Room".to_string())
+    });
+
+    let knob = 42.0_f32;
+    let fmt01 = |v: f32| format!("{v:.2}");
+    let fmt_ms = |v: f32| format!("{v:.0} ms");
+    let fmt_s = |v: f32| format!("{v:.2} s");
+    let fmt_hz = |v: f32| {
+        if v >= 1000.0 {
+            format!("{:.1} k", v / 1000.0)
+        } else {
+            format!("{v:.0} Hz")
+        }
+    };
+
+    design::inhouse_shell_ex(ui, &theme, "Room", "hybrid FDN", peak_db, true, |ui| {
+        ui.set_max_width(760.0);
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+
+        // ── Archetype dropdown + viz toggle ───────────────────────────
+        Frame::NONE
+            .fill(theme.bg_well())
+            .stroke(Stroke::new(1.0_f32, theme.border_soft()))
+            .corner_radius(theme.rounding())
+            .inner_margin(Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("ARCHETYPE")
+                            .size(9.0)
+                            .strong()
+                            .color(theme.text_muted()),
+                    );
+                    egui::ComboBox::from_id_salt(("reverb_arch_combo", track_id, slot_id))
+                        .selected_text(
+                            RichText::new(active_arch.as_str())
+                                .size(11.0)
+                                .strong()
+                                .color(theme.text()),
+                        )
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for name in reverb_preset_names() {
+                                let selected = active_arch == *name;
+                                if ui.selectable_label(selected, *name).clicked() {
+                                    let plug =
+                                        &mut state.session.tracks[track_idx].inserts[insert_idx];
+                                    if apply_reverb_preset(plug, name) {
+                                        changed = true;
+                                        active_arch = (*name).to_string();
+                                        mix = plug.param("Mix").unwrap_or(mix);
+                                        predelay = plug.param("Predelay (ms)").unwrap_or(predelay);
+                                        size = plug.param("Size").unwrap_or(size);
+                                        shape = plug.param("Shape").unwrap_or(shape);
+                                        rt60 = plug.param("RT60 (s)").unwrap_or(rt60);
+                                        character = plug.param("Character").unwrap_or(character);
+                                        er_level = plug.param("ER Level").unwrap_or(er_level);
+                                        er_spread = plug.param("ER Spread").unwrap_or(er_spread);
+                                        diffusion = plug.param("Diffusion").unwrap_or(diffusion);
+                                        density = plug.param("Density").unwrap_or(density);
+                                        modulation = plug.param("Modulation").unwrap_or(modulation);
+                                        decay_lo = plug.param("Decay Lo").unwrap_or(decay_lo);
+                                        decay_hi = plug.param("Decay Hi").unwrap_or(decay_hi);
+                                        wet_hp = plug.param("Wet HP (Hz)").unwrap_or(wet_hp);
+                                        wet_lp = plug.param("Wet LP (Hz)").unwrap_or(wet_lp);
+                                        width = plug.param("Width").unwrap_or(width);
+                                        duck_amt = plug.param("Duck Amount").unwrap_or(duck_amt);
+                                        duck_rel =
+                                            plug.param("Duck Release (ms)").unwrap_or(duck_rel);
+                                        freeze = plug.param("Freeze").unwrap_or(0.0) >= 0.5;
+                                        gate_time =
+                                            plug.param("Gate Time (ms)").unwrap_or(gate_time);
+                                    }
+                                }
+                            }
+                        });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut cinematic = matches!(quality, VizQuality::Cinematic);
+                        if design::toggle_chip(ui, &theme, "CINEMATIC", &mut cinematic, theme.accent())
+                            .changed()
+                        {
+                            quality = if cinematic {
+                                VizQuality::Cinematic
+                            } else {
+                                VizQuality::Essential
+                            };
+                        }
+                        ui.label(
+                            RichText::new("VIZ")
+                                .size(9.0)
+                                .strong()
+                                .color(theme.text_muted()),
+                        );
+                    });
+                });
+            });
+
+        // Metric bus (params → viz; DSP meter ports exist but host CSV is input-only)
+        let mut metrics = SpatialMetricBus::new();
+        metrics.set(METRIC_RT60, rt60);
+        metrics.set(METRIC_ECHO_DENSITY, density * 0.5 + diffusion * 0.5);
+        metrics.set(METRIC_ER_TAIL, er_level);
+        metrics.set(METRIC_BAND_T60_LO, rt60 * decay_lo);
+        metrics.set(METRIC_BAND_T60_MID, rt60);
+        metrics.set(METRIC_BAND_T60_HI, rt60 * decay_hi);
+        let wet_peak = if peak_db > -90.0 {
+            10f32.powf(peak_db / 20.0)
+        } else {
+            0.0
+        };
+        metrics.set(METRIC_WET_PEAK, wet_peak);
+        metrics.set(METRIC_DUCK_GR, duck_amt * wet_peak.clamp(0.0, 1.0));
+        metrics.sample_history();
+
+        let viz_h = 268.0_f32;
+        let left_w = 392.0_f32;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+
+            // ── Left: aligned full-width knob banks ───────────────────
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_w, viz_h + 200.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(left_w);
+
+                    reverb_section(ui, &theme, "SPACE", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            changed |=
+                                reverb_knob(ui, &theme, "MIX", &mut mix, 0.0..=1.0, knob, &fmt01);
+                            changed |= reverb_knob(
+                                ui, &theme, "PRE", &mut predelay, 0.0..=200.0, knob, &fmt_ms,
+                            );
+                            changed |=
+                                reverb_knob(ui, &theme, "SIZE", &mut size, 0.1..=4.0, knob, &fmt01);
+                            changed |= reverb_knob(
+                                ui, &theme, "SHAPE", &mut shape, 0.5..=2.0, knob, &fmt01,
+                            );
+                            changed |=
+                                reverb_knob(ui, &theme, "RT60", &mut rt60, 0.1..=12.0, knob, &fmt_s);
+                            changed |= reverb_knob(
+                                ui, &theme, "CHAR", &mut character, 0.0..=1.0, knob, &fmt01,
+                            );
+                        });
+                    });
+
+                    reverb_section(ui, &theme, "STRUCTURE", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            changed |= reverb_knob(
+                                ui, &theme, "ER", &mut er_level, 0.0..=1.0, knob, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "SPREAD", &mut er_spread, 0.0..=1.0, knob, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "DIFF", &mut diffusion, 0.0..=1.0, knob, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "DENS", &mut density, 0.0..=1.0, knob, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "MOD", &mut modulation, 0.0..=1.0, knob, &fmt01,
+                            );
+                        });
+                    });
+
+                    // TONE + MIX TOOLS share one row, equal-width panels
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let half = (left_w - 8.0) * 0.5;
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(half, 120.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(half);
+                                reverb_section(ui, &theme, "TONE", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        changed |= reverb_knob(
+                                            ui, &theme, "LO", &mut decay_lo, 0.25..=2.0, 36.0, &fmt01,
+                                        );
+                                        changed |= reverb_knob(
+                                            ui, &theme, "HI", &mut decay_hi, 0.25..=2.0, 36.0, &fmt01,
+                                        );
+                                        changed |= reverb_knob(
+                                            ui, &theme, "HP", &mut wet_hp, 20.0..=500.0, 36.0, &fmt_hz,
+                                        );
+                                        changed |= reverb_knob(
+                                            ui, &theme, "LP", &mut wet_lp, 2000.0..=20000.0, 36.0,
+                                            &fmt_hz,
+                                        );
+                                        changed |= reverb_knob(
+                                            ui, &theme, "WIDTH", &mut width, 0.0..=1.0, 36.0, &fmt01,
+                                        );
+                                    });
+                                });
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(half, 120.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(half);
+                                reverb_section(ui, &theme, "MIX TOOLS", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        changed |= reverb_knob(
+                                            ui, &theme, "DUCK", &mut duck_amt, 0.0..=1.0, 36.0, &fmt01,
+                                        );
+                                        changed |= reverb_knob(
+                                            ui, &theme, "REL", &mut duck_rel, 10.0..=1000.0, 36.0,
+                                            &fmt_ms,
+                                        );
+                                        changed |= reverb_knob(
+                                            ui, &theme, "GATE", &mut gate_time, 0.0..=500.0, 36.0,
+                                            &fmt_ms,
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    if design::toggle_chip(
+                                        ui,
+                                        &theme,
+                                        "FREEZE",
+                                        &mut freeze,
+                                        theme.meter_orange(),
+                                    )
+                                    .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                });
+                            },
+                        );
+                    });
+                },
+            );
+
+            // ── Right: SpatialViz + meters ────────────────────────────
+            ui.vertical(|ui| {
+                let avail_w = (ui.available_width() - 2.0).clamp(300.0, 360.0);
+
+                Frame::NONE
+                    .fill(theme.bg_well())
+                    .stroke(Stroke::new(1.0_f32, theme.border_soft()))
+                    .corner_radius(theme.rounding())
+                    .inner_margin(Margin::same(4))
+                    .show(ui, |ui| {
+                        let (rect, resp) =
+                            ui.allocate_exact_size(Vec2::new(avail_w - 8.0, viz_h), egui::Sense::drag());
+
+                        let primary_held = resp.is_pointer_button_down_on()
+                            && ui.input(|i| i.pointer.primary_down());
+                        let middle_held = resp.is_pointer_button_down_on()
+                            && ui.input(|i| i.pointer.middle_down());
+                        let adjusting = primary_held
+                            || middle_held
+                            || resp.dragged_by(egui::PointerButton::Primary)
+                            || resp.dragged_by(egui::PointerButton::Middle);
+                        design::capture_cursor_while(ui, adjusting, viz_grab_id);
+
+                        if resp.dragged_by(egui::PointerButton::Primary) {
+                            let d = resp.drag_delta();
+                            size = (size + d.x * 0.008).clamp(0.1, 4.0);
+                            shape = (shape - d.y * 0.006).clamp(0.5, 2.0);
+                            changed = true;
+                        }
+                        if resp.dragged_by(egui::PointerButton::Middle) {
+                            let d = resp.drag_delta();
+                            viz_cam.yaw -= d.x * 0.01;
+                            viz_cam.pitch = (viz_cam.pitch + d.y * 0.008).clamp(-0.12, 1.35);
+                        }
+                        if resp.hovered() && !adjusting {
+                            let (raw_y, smooth_y) =
+                                ui.input(|i| (i.raw_scroll_delta.y, i.smooth_scroll_delta.y));
+                            let dy = if raw_y.abs() > 0.0 { raw_y } else { smooth_y };
+                            if dy.abs() > 0.01 {
+                                ui.ctx().input_mut(|i| {
+                                    i.smooth_scroll_delta = Vec2::ZERO;
+                                });
+                                // Scroll up → zoom in (closer).
+                                let step = if raw_y.abs() > 0.0 {
+                                    (raw_y / 14.0).clamp(-4.0, 4.0)
+                                } else {
+                                    (smooth_y / 48.0).clamp(-2.5, 2.5)
+                                };
+                                viz_cam.zoom =
+                                    (viz_cam.zoom * (1.0 - step * 0.08)).clamp(0.35, 2.8);
+                            }
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        }
+
+                        // Orbitable view of the whole room (default isometric-ish framing).
+                        let room_w = 1.0 * size * shape.sqrt();
+                        let room_h = 0.65 * size;
+                        let room_d = 1.25 * size / shape.sqrt();
+                        let span = room_w.max(room_h).max(room_d);
+                        let cam_dist = (4.8 + span * 1.65) * viz_cam.zoom;
+                        let target = crate::design::spatial_viz::math::Vec3::new(
+                            0.0,
+                            room_h * 0.55,
+                            0.0,
+                        );
+                        let (sy, cy) = viz_cam.yaw.sin_cos();
+                        let (sp, cp) = viz_cam.pitch.sin_cos();
+                        let eye = crate::design::spatial_viz::math::Vec3::new(
+                            target.x + cam_dist * cp * sy,
+                            target.y + cam_dist * sp,
+                            target.z + cam_dist * cp * cy,
+                        );
+                        let frame = SpatialFrame {
+                            camera: SpatialCamera {
+                                eye,
+                                target,
+                                fovy_deg: 36.0,
+                                ..Default::default()
+                            },
+                            theme: Default::default(),
+                            quality,
+                            time_s: 0.0,
+                            viewport: SpatialViewport {
+                                width_px: rect.width(),
+                                height_px: rect.height(),
+                                dpi: ui.ctx().pixels_per_point(),
+                            },
+                        };
+
+                        let scene = ReverbRoomScene {
+                            params: ReverbRoomParams {
+                                size,
+                                shape,
+                                predelay_ms: predelay,
+                                rt60,
+                                character,
+                                er_level,
+                                diffusion,
+                                mix,
+                                decay_lo,
+                                decay_hi,
+                                freeze: if freeze { 1.0 } else { 0.0 },
+                                gate_time_ms: gate_time,
+                            },
+                        };
+                        let list = scene.build(&frame, &metrics);
+                        let mut backend = EguiPainterBackend::new();
+                        backend.begin_frame(
+                            &frame,
+                            BackendRect {
+                                min_x: rect.min.x,
+                                min_y: rect.min.y,
+                                max_x: rect.max.x,
+                                max_y: rect.max.y,
+                            },
+                        );
+                        backend.submit(&list);
+                        backend.end_frame();
+                        {
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(rect, CornerRadius::same(2), theme.bg_app());
+                        }
+                        backend.paint_in_ui(ui, rect);
+
+                        ui.painter().text(
+                            rect.left_bottom() + egui::vec2(8.0, -6.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            "LMB size/shape · MMB orbit · scroll zoom",
+                            egui::FontId::proportional(9.0),
+                            theme.text_muted().gamma_multiply(0.65),
+                        );
+                    });
+
+                ui.add_space(4.0);
+                Frame::NONE
+                    .fill(theme.bg_well())
+                    .stroke(Stroke::new(1.0_f32, theme.border_soft()))
+                    .corner_radius(theme.rounding())
+                    .inner_margin(Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("METERS")
+                                .size(9.0)
+                                .strong()
+                                .color(theme.text_muted()),
+                        );
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            metric_spark(ui, &theme, "RT60", metrics.history(METRIC_RT60), rt60, 12.0);
+                            metric_spark(
+                                ui,
+                                &theme,
+                                "Echo",
+                                metrics.history(METRIC_ECHO_DENSITY),
+                                metrics.get(METRIC_ECHO_DENSITY),
+                                1.0,
+                            );
+                            metric_spark(
+                                ui,
+                                &theme,
+                                "ER/T",
+                                metrics.history(METRIC_ER_TAIL),
+                                metrics.get(METRIC_ER_TAIL),
+                                1.0,
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("T60(f)")
+                                    .size(9.0)
+                                    .color(theme.text_muted()),
+                            );
+                            band_bar(ui, &theme, "Lo", rt60 * decay_lo, 12.0);
+                            band_bar(ui, &theme, "Mid", rt60, 12.0);
+                            band_bar(ui, &theme, "Hi", rt60 * decay_hi, 12.0);
+                            if duck_amt > 0.01 {
+                                ui.label(
+                                    RichText::new(format!("Duck {:.0}%", duck_amt * 100.0))
+                                        .size(9.0)
+                                        .color(theme.meter_orange()),
+                                );
+                            }
+                        });
+                    });
+            });
+        });
+    });
+
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(viz_id, quality);
+        d.insert_temp(viz_cam_id, viz_cam);
+        d.insert_temp(arch_id, active_arch);
+    });
+
+    if changed {
+        let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
+        plug.set_param("Mix", mix);
+        plug.set_param("Predelay (ms)", predelay);
+        plug.set_param("Size", size);
+        plug.set_param("Shape", shape);
+        plug.set_param("RT60 (s)", rt60);
+        plug.set_param("Character", character);
+        plug.set_param("ER Level", er_level);
+        plug.set_param("ER Spread", er_spread);
+        plug.set_param("Diffusion", diffusion);
+        plug.set_param("Density", density);
+        plug.set_param("Modulation", modulation);
+        plug.set_param("Decay Lo", decay_lo);
+        plug.set_param("Decay Hi", decay_hi);
+        plug.set_param("Wet HP (Hz)", wet_hp);
+        plug.set_param("Wet LP (Hz)", wet_lp);
+        plug.set_param("Width", width);
+        plug.set_param("Duck Amount", duck_amt);
+        plug.set_param("Duck Release (ms)", duck_rel);
+        plug.set_param("Freeze", if freeze { 1.0 } else { 0.0 });
+        plug.set_param("Gate Time (ms)", gate_time);
+    }
+    changed
+}
+
+fn reverb_section(ui: &mut egui::Ui, theme: &dyn Theme, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    use egui::{Frame, Margin, Stroke};
+    let w = ui.available_width();
+    Frame::NONE
+        .fill(theme.bg_well())
+        .stroke(Stroke::new(1.0_f32, theme.border_soft()))
+        .corner_radius(theme.rounding())
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(w);
+            ui.label(
+                RichText::new(title)
+                    .size(9.0)
+                    .strong()
+                    .color(theme.accent().gamma_multiply(0.85)),
+            );
+            ui.add_space(4.0);
+            add(ui);
+        });
+}
+
+fn reverb_knob(
+    ui: &mut egui::Ui,
+    theme: &dyn Theme,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    size: f32,
+    fmt: &dyn Fn(f32) -> String,
+) -> bool {
+    let mut changed = false;
+    ui.allocate_ui_with_layout(
+        Vec2::new(size + 14.0, size + 36.0),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            if design::knob_sized(ui, theme, value, range, "", size).changed() {
+                changed = true;
+            }
+            ui.label(
+                RichText::new(label)
+                    .size(9.0)
+                    .strong()
+                    .color(theme.text_dim()),
+            );
+            ui.label(
+                RichText::new(fmt(*value))
+                    .size(9.0)
+                    .monospace()
+                    .color(theme.text_muted()),
+            );
+        },
+    );
+    changed
+}
+
+fn metric_spark(ui: &mut egui::Ui, theme: &dyn Theme, label: &str, hist: &[f32], value: f32, max: f32) {
+    use egui::CornerRadius;
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new(format!("{label}  {value:.2}"))
+                .size(9.0)
+                .monospace()
+                .color(theme.text_dim()),
+        );
+        let size = Vec2::new(88.0, 24.0);
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = resp.rect;
+        painter.rect_filled(rect, CornerRadius::same(3), theme.bg_app());
+        if hist.len() >= 2 {
+            let mut pts = Vec::with_capacity(hist.len());
+            for (i, v) in hist.iter().enumerate() {
+                let t = i as f32 / (hist.len() - 1) as f32;
+                let y = 1.0 - (v / max.max(1e-6)).clamp(0.0, 1.0);
+                pts.push(egui::pos2(
+                    rect.left() + t * rect.width(),
+                    rect.top() + y * rect.height(),
+                ));
+            }
+            painter.add(egui::Shape::line(
+                pts,
+                egui::Stroke::new(1.2_f32, theme.accent()),
+            ));
+        }
+    });
+}
+
+fn band_bar(ui: &mut egui::Ui, theme: &dyn Theme, label: &str, value: f32, max: f32) {
+    use egui::CornerRadius;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .size(9.0)
+                .strong()
+                .color(theme.text_muted()),
+        );
+        let size = Vec2::new(56.0, 10.0);
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = resp.rect;
+        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_app());
+        let f = (value / max).clamp(0.0, 1.0);
+        let fill = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * f, rect.height()));
+        painter.rect_filled(fill, CornerRadius::same(2), theme.accent());
+    });
+}
+
 fn draw_softclip_panel(
     ui: &mut egui::Ui,
     state: &mut AppState,
@@ -1897,8 +2730,8 @@ fn draw_overdrive_panel(
     changed
 }
 
-/// Parametric EQ — spectrum backdrop + interactive graph (BusChain console).
-fn draw_peq_panel(
+/// Equalizer — FFT analyzer + interactive multi-band editor.
+fn draw_equalizer_panel(
     ui: &mut egui::Ui,
     state: &mut AppState,
     track_idx: usize,
@@ -1906,48 +2739,140 @@ fn draw_peq_panel(
 ) -> bool {
     let theme = state.theme;
     let peak_db = insert_peak_db(state, track_idx, insert_idx);
-    let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
-    plug.ensure_params();
+    let track_id = state.session.tracks[track_idx].id;
+    let bus_key = state.session.tracks[track_idx]
+        .sink_name
+        .clone()
+        .unwrap_or_else(|| state.session.tracks[track_idx].expected_sink_name());
+    state.session.tracks[track_idx].inserts[insert_idx].ensure_params();
 
-    let mut bands: Vec<design::PeqBand> = (1..=8)
-        .map(|n| design::PeqBand {
-            on: plug.param(&format!("B{n} On")).unwrap_or(1.0) >= 0.5,
-            freq: plug.param(&format!("B{n} Freq")).unwrap_or(1000.0),
-            gain_db: plug.param(&format!("B{n} Gain")).unwrap_or(0.0),
-            q: plug.param(&format!("B{n} Q")).unwrap_or(0.707),
-            mode: plug.param(&format!("B{n} Type")).unwrap_or(0.0).round() as i32,
-        })
-        .collect();
-    let mut out_gain = plug.param("Output (dB)").unwrap_or(0.0);
+    let mut bands = load_eq_bands(state, track_idx, insert_idx);
+    let mut out_gain = state.session.tracks[track_idx].inserts[insert_idx]
+        .param("Output (dB)")
+        .unwrap_or(0.0);
     let mut changed = false;
 
-    let sel_key = egui::Id::new(("peq_sel", track_idx, insert_idx));
+    let sel_key = egui::Id::new(("eq_sel", track_idx, insert_idx));
+    let chrome_key = egui::Id::new(("eq_chrome", track_idx, insert_idx));
+    let solo_key = egui::Id::new(("eq_solo", track_idx, insert_idx));
+    let ab_key = egui::Id::new(("eq_ab", track_idx, insert_idx));
     let mut selected: usize = ui.ctx().data(|d| d.get_temp(sel_key)).unwrap_or(0);
     selected = selected.min(bands.len().saturating_sub(1));
+    let mut chrome: design::EqChartChrome =
+        ui.ctx().data(|d| d.get_temp(chrome_key)).unwrap_or_default();
+    let mut solo: Option<usize> = ui.ctx().data(|d| d.get_temp(solo_key));
 
-    design::inhouse_shell(
+    // Apply solo mask visually/param-wise: snapshot On map when entering solo.
+    let snap_key = egui::Id::new(("eq_solo_snap", track_idx, insert_idx));
+
+    design::inhouse_shell_ex(
         ui,
         &theme,
-        "Parametric EQ",
-        "drag nodes · snap @ 0 dB",
+        "Equalizer",
+        "FFT analyzer · console",
         peak_db,
+        false,
         |ui| {
-            let graph_w = ui.available_width().clamp(240.0, 560.0);
-            if design::peq_graph(
+            ui.set_max_width(660.0);
+            design::eq_chart_chrome(
                 ui,
                 &theme,
-                &mut bands,
+                &state.session.tracks[track_idx].name,
+                peak_db,
+                &mut chrome,
+            );
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Preset").size(10.0).color(theme.text_dim()));
+                egui::ComboBox::from_id_salt(("eq_preset", track_idx, insert_idx))
+                    .selected_text("—")
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for name in equalizer_preset_names() {
+                            if ui.selectable_label(false, *name).clicked() {
+                                if apply_equalizer_preset(
+                                    &mut state.session.tracks[track_idx].inserts[insert_idx],
+                                    name,
+                                ) {
+                                    changed = true;
+                                    bands = load_eq_bands(state, track_idx, insert_idx);
+                                    out_gain = state.session.tracks[track_idx].inserts[insert_idx]
+                                        .param("Output (dB)")
+                                        .unwrap_or(0.0);
+                                    solo = None;
+                                    ui.ctx().data_mut(|d| d.remove_temp::<Vec<bool>>(snap_key));
+                                }
+                            }
+                        }
+                    });
+                if ui
+                    .add(egui::Button::new(RichText::new("A→B").size(10.0)).small())
+                    .on_hover_text("Store A snapshot into B")
+                    .clicked()
+                {
+                    let snap: Vec<(bool, f32, f32, f32, i32, f32)> = bands
+                        .iter()
+                        .map(|b| (b.on, b.freq, b.gain_db, b.q, b.mode, out_gain))
+                        .collect();
+                    ui.ctx().data_mut(|d| d.insert_temp(ab_key, snap));
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("B→A").size(10.0)).small())
+                    .on_hover_text("Recall B snapshot")
+                    .clicked()
+                {
+                    if let Some(snap) = ui
+                        .ctx()
+                        .data(|d| d.get_temp::<Vec<(bool, f32, f32, f32, i32, f32)>>(ab_key))
+                    {
+                        for (i, (on, f, g, q, m, _)) in snap.iter().enumerate() {
+                            if let Some(b) = bands.get_mut(i) {
+                                b.on = *on;
+                                b.freq = *f;
+                                b.gain_db = *g;
+                                b.q = *q;
+                                b.mode = *m;
+                            }
+                        }
+                        if let Some((_, _, _, _, _, og)) = snap.first() {
+                            out_gain = *og;
+                        }
+                        changed = true;
+                    }
+                }
+                design::plugin_stereo_meters(
+                    ui,
+                    &theme,
+                    peak_db,
+                    Vec2::new(22.0, 36.0),
+                    ("eq_meters", track_idx, insert_idx),
+                );
+            });
+
+            ui.add_space(4.0);
+            let frame = crate::audio::engine_handle::host_spectrum(&bus_key, chrome.post);
+            let (mags, sr, gen) = match &frame {
+                Some(f) => (Some(f.mags.as_slice()), f.sample_rate as f32, f.gen),
+                None => (None, 48_000.0, 0),
+            };
+            let graph_w = ui.available_width().clamp(280.0, 640.0);
+            if design::eq_chart(
+                ui,
+                &theme,
+                Some(&mut bands),
                 out_gain,
                 &mut selected,
-                Vec2::new(graph_w, 168.0),
-                peak_db,
+                Vec2::new(graph_w, 220.0),
+                mags,
+                sr,
+                gen,
+                &chrome,
+                ("eq_win", track_idx, insert_idx),
             ) {
                 changed = true;
             }
 
             ui.add_space(6.0);
-
-            // Output fader LEFT of band gain faders (taller throws).
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.vertical(|ui| {
@@ -1984,38 +2909,87 @@ fn draw_peq_panel(
                         changed = true;
                     }
                 });
-                for (i, b) in bands.iter_mut().enumerate() {
+                let mut solo_click: Option<usize> = None;
+                for i in 0..bands.len() {
                     let col = design::PEQ_BAND_COLORS[i % design::PEQ_BAND_COLORS.len()];
                     ui.vertical(|ui| {
-                        ui.set_width(36.0);
+                        ui.set_width(40.0);
                         let on_lbl = format!("{}", i + 1);
-                        let mut on = b.on;
+                        let mut on = bands[i].on;
                         if design::toggle_chip(ui, &theme, &on_lbl, &mut on, col).changed() {
-                            b.on = on;
+                            bands[i].on = on;
                             changed = true;
                             selected = i;
                         }
-                        let mut g = b.gain_db;
+                        let solo_on = solo == Some(i);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("S")
+                                        .size(9.0)
+                                        .color(if solo_on {
+                                            theme.bg_app()
+                                        } else {
+                                            theme.text_muted()
+                                        }),
+                                )
+                                .fill(if solo_on {
+                                    col
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .small(),
+                            )
+                            .on_hover_text("Solo band")
+                            .clicked()
+                        {
+                            solo_click = Some(i);
+                        }
+                        let mut g = bands[i].gain_db;
                         if design::fader_db(
                             ui,
                             &theme,
                             &mut g,
                             -24.0..=24.0,
-                            Vec2::new(28.0, 140.0),
+                            Vec2::new(28.0, 120.0),
                         )
                         .changed()
                         {
-                            b.gain_db = g;
+                            bands[i].gain_db = g;
                             changed = true;
                             selected = i;
                         }
                         ui.label(
-                            RichText::new(format!("{:+.1}", b.gain_db))
+                            RichText::new(format!("{:+.1}", bands[i].gain_db))
                                 .size(9.0)
                                 .monospace()
                                 .color(col),
                         );
                     });
+                }
+                if let Some(i) = solo_click {
+                    if solo == Some(i) {
+                        if let Some(snap) =
+                            ui.ctx().data(|d| d.get_temp::<Vec<bool>>(snap_key))
+                        {
+                            for (j, b2) in bands.iter_mut().enumerate() {
+                                if let Some(v) = snap.get(j) {
+                                    b2.on = *v;
+                                }
+                            }
+                        }
+                        solo = None;
+                        ui.ctx().data_mut(|d| d.remove_temp::<Vec<bool>>(snap_key));
+                    } else {
+                        let snap: Vec<bool> = bands.iter().map(|b| b.on).collect();
+                        ui.ctx().data_mut(|d| d.insert_temp(snap_key, snap));
+                        for (j, b2) in bands.iter_mut().enumerate() {
+                            b2.on = j == i;
+                        }
+                        solo = Some(i);
+                    }
+                    changed = true;
+                    selected = i;
                 }
             });
 
@@ -2043,22 +3017,21 @@ fn draw_peq_panel(
                         changed = true;
                     }
                     ui.label(RichText::new("Q").size(10.0).color(theme.text_dim()));
-                    if design::slider_drag(ui, &mut q, 0.1..=10.0, |s| s.show_value(true))
-                        .changed()
-                    {
+                    if design::knob_sized(ui, &theme, &mut q, 0.1..=10.0, "", 36.0).changed() {
                         b.q = q;
                         changed = true;
                     }
-                    let modes = ["Peak", "LowShelf", "HighShelf", "HP", "LP"];
-                    egui::ComboBox::from_id_salt(format!("peq_mode_{track_idx}_{insert_idx}"))
-                        .selected_text(modes.get(mode as usize).copied().unwrap_or("Peak"))
-                        .show_ui(ui, |ui| {
-                            for (i, name) in modes.iter().enumerate() {
-                                if ui.selectable_value(&mut mode, i as i32, *name).changed() {
-                                    changed = true;
-                                }
-                            }
-                        });
+                    let modes = ["Peak", "LS", "HS", "HP", "LP"];
+                    for (i, name) in modes.iter().enumerate() {
+                        let on = mode == i as i32;
+                        if ui
+                            .selectable_label(on, RichText::new(*name).size(10.0))
+                            .clicked()
+                        {
+                            mode = i as i32;
+                            changed = true;
+                        }
+                    }
                     if mode != b.mode {
                         b.mode = mode;
                         changed = true;
@@ -2068,20 +3041,21 @@ fn draw_peq_panel(
         },
     );
 
-    ui.ctx().data_mut(|d| d.insert_temp(sel_key, selected));
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(sel_key, selected);
+        d.insert_temp(chrome_key, chrome);
+        if let Some(s) = solo {
+            d.insert_temp(solo_key, s);
+        } else {
+            d.remove_temp::<usize>(solo_key);
+        }
+    });
 
     if changed {
-        let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
-        for (i, b) in bands.iter().enumerate() {
-            let n = i + 1;
-            plug.set_param(&format!("B{n} On"), if b.on { 1.0 } else { 0.0 });
-            plug.set_param(&format!("B{n} Freq"), b.freq);
-            plug.set_param(&format!("B{n} Gain"), b.gain_db);
-            plug.set_param(&format!("B{n} Q"), b.q);
-            plug.set_param(&format!("B{n} Type"), b.mode as f32);
-        }
-        plug.set_param("Output (dB)", out_gain.clamp(-24.0, 24.0));
+        store_eq_bands(state, track_idx, insert_idx, &bands, out_gain);
+        state.schedule_fx_params(track_id);
     }
+    let _ = track_id;
     changed
 }
 
@@ -2167,47 +3141,178 @@ fn draw_limiter_panel(
     let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
     plug.ensure_params();
     let mut ceiling = plug.param("Ceiling (dB)").unwrap_or(-0.1);
+    let mut attack = plug.param("Attack (ms)").unwrap_or(0.1);
     let mut release = plug.param("Release (ms)").unwrap_or(50.0);
+    let mut lookahead = plug.param("Lookahead (ms)").unwrap_or(1.0);
+    let mut knee = plug.param("Soft Knee (dB)").unwrap_or(0.0);
+    let mut input_db = plug.param("Input (dB)").unwrap_or(0.0);
+    let mut makeup = plug.param("Makeup (dB)").unwrap_or(0.0);
     let mut changed = false;
 
-    design::inhouse_shell(
+    // Chart height includes the GR strip; knob columns fill the same vertical span.
+    let panel_h = 288.0_f32;
+    let col_w = 72.0_f32;
+    let left_n = 4.0_f32;
+    let slot_h = panel_h / left_n;
+    let knob = (slot_h - 16.0).clamp(48.0, 58.0);
+    design::inhouse_shell_ex(
         ui,
         &theme,
         "Limiter",
-        "",
+        "brickwall · stereo link",
         peak_db,
+        false,
         |ui| {
-            ui.set_max_width(268.0);
+            ui.set_max_width(540.0);
+
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                if inhouse_knob_col(ui, &theme, "CEILING", &mut ceiling, -24.0..=0.0, 56.0) {
-                    changed = true;
-                }
-                if inhouse_knob_col(ui, &theme, "RELEASE", &mut release, 1.0..=500.0, 56.0) {
-                    changed = true;
-                }
+                ui.label(RichText::new("Preset").size(10.0).color(theme.text_dim()));
+                egui::ComboBox::from_id_salt(("lim_preset", track_idx, insert_idx))
+                    .selected_text("—")
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for name in limiter_preset_names() {
+                            if ui.selectable_label(false, *name).clicked() {
+                                if apply_limiter_preset(
+                                    &mut state.session.tracks[track_idx].inserts[insert_idx],
+                                    name,
+                                ) {
+                                    changed = true;
+                                    let p = &state.session.tracks[track_idx].inserts[insert_idx];
+                                    ceiling = p.param("Ceiling (dB)").unwrap_or(-0.1);
+                                    attack = p.param("Attack (ms)").unwrap_or(0.1);
+                                    release = p.param("Release (ms)").unwrap_or(50.0);
+                                    lookahead = p.param("Lookahead (ms)").unwrap_or(1.0);
+                                    knee = p.param("Soft Knee (dB)").unwrap_or(0.0);
+                                    input_db = p.param("Input (dB)").unwrap_or(0.0);
+                                    makeup = p.param("Makeup (dB)").unwrap_or(0.0);
+                                }
+                            }
+                        }
+                    });
+                ui.label(
+                    RichText::new(format!("{ceiling:+.2} dB ceil"))
+                        .size(11.0)
+                        .monospace()
+                        .strong()
+                        .color(theme.accent()),
+                );
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.set_height(panel_h);
+                ui.spacing_mut().item_spacing.x = 6.0;
+
+                let mut knob_slot = |ui: &mut egui::Ui,
+                                     label: &str,
+                                     value: &mut f32,
+                                     range: std::ops::RangeInclusive<f32>|
+                 -> bool {
+                    let mut hit = false;
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(col_w, slot_h),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(((slot_h - knob - 14.0) * 0.35).max(0.0));
+                            if design::knob_sized(ui, &theme, value, range, "", knob).changed() {
+                                hit = true;
+                            }
+                            ui.label(
+                                RichText::new(label)
+                                    .size(9.0)
+                                    .color(theme.text_dim()),
+                            );
+                        },
+                    );
+                    hit
+                };
+
+                // Left: 4 knobs filling chart height (incl. GR strip).
+                ui.allocate_ui_with_layout(
+                    Vec2::new(col_w, panel_h),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        if knob_slot(ui, "CEIL", &mut ceiling, -24.0..=0.0) {
+                            changed = true;
+                        }
+                        if knob_slot(ui, "ATK", &mut attack, 0.01..=50.0) {
+                            changed = true;
+                        }
+                        if knob_slot(ui, "REL", &mut release, 1.0..=500.0) {
+                            changed = true;
+                        }
+                        if knob_slot(ui, "LOOK", &mut lookahead, 0.0..=10.0) {
+                            changed = true;
+                        }
+                    },
+                );
+                // Right: 3 knobs, same size, evenly spaced over the same height.
+                ui.allocate_ui_with_layout(
+                    Vec2::new(col_w, panel_h),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let right_slot = panel_h / 3.0;
+                        let mut right_knob = |ui: &mut egui::Ui,
+                                              label: &str,
+                                              value: &mut f32,
+                                              range: std::ops::RangeInclusive<f32>|
+                         -> bool {
+                            let mut hit = false;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(col_w, right_slot),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(((right_slot - knob - 14.0) * 0.35).max(0.0));
+                                    if design::knob_sized(ui, &theme, value, range, "", knob)
+                                        .changed()
+                                    {
+                                        hit = true;
+                                    }
+                                    ui.label(
+                                        RichText::new(label)
+                                            .size(9.0)
+                                            .color(theme.text_dim()),
+                                    );
+                                },
+                            );
+                            hit
+                        };
+                        if right_knob(ui, "KNEE", &mut knee, 0.0..=12.0) {
+                            changed = true;
+                        }
+                        if right_knob(ui, "IN", &mut input_db, -24.0..=24.0) {
+                            changed = true;
+                        }
+                        if right_knob(ui, "MAKEUP", &mut makeup, -24.0..=24.0) {
+                            changed = true;
+                        }
+                    },
+                );
+
                 design::plugin_stereo_meters(
                     ui,
                     &theme,
                     peak_db,
-                    Vec2::new(24.0, 88.0),
+                    Vec2::new(22.0, panel_h - 4.0),
                     ("lim_meters", track_idx, insert_idx),
                 );
-                ui.vertical(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("{ceiling:+.2} dB"))
-                            .size(13.0)
-                            .monospace()
-                            .strong()
-                            .color(theme.accent()),
-                    );
-                    ui.label(
-                        RichText::new(format!("{release:.0} ms"))
-                            .size(10.0)
-                            .color(theme.text_muted()),
-                    );
-                });
+
+                let plot_w = (ui.available_width() - 4.0).clamp(200.0, 320.0);
+                if design::limiter_transfer_plot(
+                    ui,
+                    &theme,
+                    &mut ceiling,
+                    knee,
+                    input_db,
+                    makeup,
+                    peak_db,
+                    Vec2::new(plot_w, panel_h - 4.0),
+                ) {
+                    changed = true;
+                }
             });
         },
     );
@@ -2215,7 +3320,12 @@ fn draw_limiter_panel(
     if changed {
         let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
         plug.set_param("Ceiling (dB)", ceiling);
+        plug.set_param("Attack (ms)", attack);
         plug.set_param("Release (ms)", release);
+        plug.set_param("Lookahead (ms)", lookahead);
+        plug.set_param("Soft Knee (dB)", knee);
+        plug.set_param("Input (dB)", input_db);
+        plug.set_param("Makeup (dB)", makeup);
     }
     changed
 }
@@ -3100,7 +4210,7 @@ fn draw_plugin_browser(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize
 
     if plugins.is_empty() {
         ui.label(
-            RichText::new("No plugins scanned — Settings → Plugins / make plugins")
+            RichText::new("No plugins scanned")
                 .size(11.0)
                 .color(theme.text_muted()),
         );
@@ -3121,71 +4231,69 @@ fn draw_plugin_browser(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize
         bucket.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
     }
 
-    let add_label = format!("{}  Add plugin", egui_phosphor::regular::PLUS);
+    let add_label = format!("{}  Add", egui_phosphor::regular::PLUS);
     let mut picked: Option<(PluginId, String)> = None;
+    let popup_id = ui.make_persistent_id(("add_plugin_popup", track_idx));
 
-    let add_w = ui.available_width();
-    egui::Frame::NONE
-        .fill(theme.accent())
-        .stroke(egui::Stroke::new(1.0_f32, theme.accent_dim()))
+    let trigger = ui.add(
+        egui::Button::new(
+            RichText::new(&add_label)
+                .size(12.0)
+                .strong()
+                .color(theme.text()),
+        )
+        .fill(theme.bg_elevated())
+        .stroke(egui::Stroke::new(1.0_f32, theme.border()))
         .corner_radius(theme.rounding())
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.set_max_width(add_w);
-            ui.set_min_width(add_w - 4.0);
-            ui.spacing_mut().button_padding = egui::vec2(6.0, 4.0);
-            ui.menu_button(
-                RichText::new(&add_label)
-                    .size(13.0)
-                    .strong()
-                    .color(Color32::WHITE),
-                |ui| {
-                    ui.set_min_width(260.0);
-                    ui.label(
-                        RichText::new("Choose an insert")
-                            .size(11.0)
-                            .color(theme.text_muted()),
-                    );
-                    ui.label(
-                        RichText::new("LADSPA · CLAP · LV2 · VST3 from scan")
-                            .size(10.0)
-                            .color(theme.text_muted()),
-                    );
-                    ui.separator();
-                    for (group, items) in &groups {
-                        if items.is_empty() {
-                            continue;
-                        }
-                        ui.label(
-                            RichText::new(*group)
-                                .size(10.0)
-                                .strong()
-                                .color(theme.accent()),
-                        );
-                        for (id, name, fmt) in items {
-                            let label = match fmt {
-                                PluginFormat::Ladspa => name.clone(),
-                                _ => format!("[{}] {name}", format_short_name(*fmt)),
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(label).size(12.0).color(theme.text()),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .min_size(Vec2::new(240.0, 22.0)),
-                                )
-                                .clicked()
-                            {
-                                picked = Some((id.clone(), name.clone()));
-                                ui.close_menu();
-                            }
-                        }
-                        ui.add_space(4.0);
+        .min_size(Vec2::new(88.0, 26.0)),
+    );
+    if trigger.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &trigger,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(240.0);
+            ui.set_max_height(360.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (group, items) in &groups {
+                    if items.is_empty() {
+                        continue;
                     }
-                },
-            );
-        });
+                    ui.label(
+                        RichText::new(*group)
+                            .size(10.0)
+                            .strong()
+                            .color(theme.text_dim()),
+                    );
+                    for (id, name, fmt) in items {
+                        let label = match fmt {
+                            PluginFormat::Ladspa => name.clone(),
+                            _ => format!("[{}] {name}", format_short_name(*fmt)),
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(label).size(12.0).color(theme.text()),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .min_size(Vec2::new(220.0, 22.0)),
+                            )
+                            .clicked()
+                        {
+                            picked = Some((id.clone(), name.clone()));
+                            ui.memory_mut(|m| m.close_popup());
+                        }
+                    }
+                    ui.add_space(3.0);
+                }
+            });
+        },
+    );
 
     if let Some((id, name)) = picked {
         state.session.tracks[track_idx]
@@ -3196,7 +4304,7 @@ fn draw_plugin_browser(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize
         if !state.status.starts_with("Loading audio graph")
             && !state.status.starts_with("Live graph bring-up")
         {
-            state.status = format!("Added {name} — live slot rewire…");
+            state.status = format!("Added {name}");
         }
     }
 }

@@ -10,6 +10,8 @@ license = "MIT"
 default = ["vst3"]
 vst3 = []
 vst3-carla = ["vst3"]
+# Future SpatialViz GPU backend (scenes unchanged). Off by default.
+spatial-wgpu = []
 
 [lib]
 name = "buschain_control"

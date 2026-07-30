@@ -50,7 +50,13 @@ impl Slot {
 
     pub fn set_bypassed(&mut self, bypassed: bool) {
         self.bypassed = bypassed;
-        self.fade.set_bypassed(bypassed);
+        if bypassed {
+            // Power-off: snap dry immediately. Crossfading from pitched delay
+            // tails feels like a sluggish disable; dry is click-safe.
+            self.fade.snap(true);
+        } else {
+            self.fade.set_bypassed(false);
+        }
     }
 
     pub fn latency_samples(&self) -> u32 {

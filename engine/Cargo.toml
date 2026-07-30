@@ -39,3 +39,5 @@ lilv = { version = "0.2.4", optional = true }
 vst3-host = { version = "0.9", default-features = false }
 memmap2 = "0.9"
 libc = "0.2"
+realfft = "3"
+rustfft = "6"

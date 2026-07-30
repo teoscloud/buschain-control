@@ -17,6 +17,7 @@ impl Lv2Backend {
         for rel in [
             "plugins/buschain-denoiser/build",
             "plugins/buschain-gate/build",
+            "plugins/buschain-reverb/build",
             "plugins/buschain-builtins/build",
             "/usr/lib/lv2",
             "/usr/local/lib/lv2",

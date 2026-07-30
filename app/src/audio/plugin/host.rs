@@ -61,7 +61,10 @@ impl PluginHost {
                 PluginFormat::Ladspa => {
                     let id = p.id.id.to_lowercase();
                     let name = p.name.to_lowercase();
-                    !(id.contains("buschain_builtins") || name == "shadow builtins")
+                    // Hide .so stem + forgotten eq8 label (Equalizer is buschain_equalizer).
+                    !(id.contains("buschain_builtins")
+                        || id.contains("buschain_eq8")
+                        || name == "shadow builtins")
                 }
                 PluginFormat::Clap | PluginFormat::Lv2 => true,
                 PluginFormat::Vst3 => vst3_enabled,

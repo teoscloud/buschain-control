@@ -7,9 +7,11 @@ mod clap_stub;
 mod vst3_carla;
 
 pub use catalog::{
-    apply_denoiser_preset, denoiser_preset_names, dynamic_ui_for_ref, normalize_label,
-    plugin_file_for, plugin_ref_with_defaults, plugin_title_for_ref, ui_spec_for_ref, OwnedParamDef,
-    DynamicPluginUiSpec, ParamDef, ParamKind, PluginUiSpec,
+    apply_denoiser_preset, apply_equalizer_preset, apply_limiter_preset, apply_reverb_preset,
+    denoiser_preset_names, dynamic_ui_for_ref, equalizer_preset_names, limiter_preset_names,
+    normalize_label, plugin_file_for, plugin_ref_with_defaults, plugin_title_for_ref,
+    reverb_preset_names, ui_spec_for_ref, OwnedParamDef, DynamicPluginUiSpec, ParamDef, ParamKind,
+    PluginUiSpec,
 };
 pub use host::*;
 #[allow(unused_imports)]

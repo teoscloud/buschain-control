@@ -81,11 +81,21 @@ fn main() -> eframe::Result<()> {
 
             tray::ensure_started();
 
-            let state = boot_state.unwrap_or_else(AppState::new);
+            let mut state = boot_state.unwrap_or_else(AppState::new);
+            // Headless Show leaves visualization Idle — wake for the new window.
+            let mut runtime = if state.viz_live {
+                ui::UiRuntime::new_live()
+            } else {
+                ui::UiRuntime::new_idle()
+            };
+            if !runtime.is_live() {
+                runtime.enter_live(&mut state);
+            }
             let app = BusChainApp {
                 state,
                 hide_on_close: true,
                 withdrawn: false,
+                runtime,
             };
             app.state.theme.apply_egui(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -159,6 +169,8 @@ struct BusChainApp {
     hide_on_close: bool,
     /// Window close was intercepted — stay alive withdrawn (Hyprland-safe).
     withdrawn: bool,
+    /// Live vs Idle visualization pipeline (meters / spectrum / paint).
+    runtime: ui::UiRuntime,
 }
 
 impl eframe::App for BusChainApp {
@@ -169,11 +181,13 @@ impl eframe::App for BusChainApp {
             self.state.request_show = false;
             self.state.request_hide = false;
             self.withdrawn = false;
+            self.runtime.enter_live(&mut self.state);
             withdraw::restore(ctx);
         }
         if self.state.request_hide {
             self.state.request_hide = false;
             self.withdrawn = true;
+            self.runtime.enter_idle(&mut self.state);
             withdraw::withdraw(ctx);
         }
 
@@ -189,6 +203,7 @@ impl eframe::App for BusChainApp {
         if close_req && self.hide_on_close && !quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.withdrawn = true;
+            self.runtime.enter_idle(&mut self.state);
             withdraw::withdraw(ctx);
         }
 
@@ -196,13 +211,22 @@ impl eframe::App for BusChainApp {
         self.state.tick();
 
         if self.withdrawn {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            if self.runtime.is_live() {
+                self.runtime.enter_idle(&mut self.state);
+            }
+            ctx.request_repaint_after(Duration::from_millis(ui::IDLE_REPAINT_MS));
             return;
+        }
+
+        if !self.runtime.is_live() {
+            self.runtime.enter_live(&mut self.state);
         }
 
         self.state.theme.apply_egui(ctx);
         ui::draw(ctx, &mut self.state);
-        ctx.request_repaint_after(Duration::from_millis(16));
+        let ms = buschain_control::audio::adaptive::AdaptivePolicy::global()
+            .repaint_ms_for_activity(true);
+        ctx.request_repaint_after(Duration::from_millis(ms));
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

@@ -45,6 +45,7 @@ fn resolve_plugin_so_uncached(label: &str) -> String {
     for sub in [
         "../plugins/buschain-denoiser/build",
         "../plugins/buschain-gate/build",
+        "../plugins/buschain-reverb/build",
         "../plugins/buschain-builtins/build",
     ] {
         dirs.push(manifest.join(sub));
