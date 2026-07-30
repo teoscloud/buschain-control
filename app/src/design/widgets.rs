@@ -35,27 +35,15 @@ pub fn hide_cursor_on_drag(ui: &Ui, resp: &egui::Response) {
     }
 }
 
-/// Hide + lock the OS cursor while `active` so the pointer stays put for orbit / fine drag.
-/// Releases grab on the falling edge (`state_id` tracks the previous frame).
-pub fn capture_cursor_while(ui: &Ui, active: bool, state_id: egui::Id) {
-    let was_active = ui.ctx().data(|d| d.get_temp::<bool>(state_id).unwrap_or(false));
+/// Hide the OS cursor while `active` (orbit / fine drag).
+///
+/// Intentionally avoids `CursorGrab::Locked` — on Wayland that clears the
+/// pointer position and egui aborts the drag on the next frame.
+pub fn capture_cursor_while(ui: &Ui, active: bool, _state_id: egui::Id) {
     if active {
         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-        if !was_active {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                egui::viewport::CursorGrab::Locked,
-            ));
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-        }
-    } else if was_active {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-            egui::viewport::CursorGrab::None,
-        ));
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        ui.ctx().request_repaint();
     }
-    ui.ctx().data_mut(|d| d.insert_temp(state_id, active));
 }
 
 /// DAW-style fine control: Shift = 0.1×, Alt = 0.05×. Ctrl reserved for shortcuts.

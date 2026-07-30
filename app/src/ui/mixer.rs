@@ -1866,6 +1866,8 @@ fn draw_reverb_panel(
     let viz_id = egui::Id::new(("reverb_viz", track_id, slot_id));
     let viz_cam_id = egui::Id::new(("reverb_viz_cam", track_id, slot_id));
     let viz_grab_id = egui::Id::new(("reverb_viz_grab", track_id, slot_id));
+    let viz_orbit_id = egui::Id::new(("reverb_viz_orbit", track_id, slot_id));
+    let viz_size_drag_id = egui::Id::new(("reverb_viz_size", track_id, slot_id));
     let arch_id = egui::Id::new(("reverb_arch", track_id, slot_id));
     let mut quality = ui.ctx().data(|d| {
         d.get_temp::<VizQuality>(viz_id)
@@ -2130,28 +2132,60 @@ fn draw_reverb_panel(
                         let (rect, resp) =
                             ui.allocate_exact_size(Vec2::new(avail_w - 8.0, viz_h), egui::Sense::drag());
 
-                        let primary_held = resp.is_pointer_button_down_on()
-                            && ui.input(|i| i.pointer.primary_down());
-                        let middle_held = resp.is_pointer_button_down_on()
-                            && ui.input(|i| i.pointer.middle_down());
-                        let adjusting = primary_held
-                            || middle_held
-                            || resp.dragged_by(egui::PointerButton::Primary)
-                            || resp.dragged_by(egui::PointerButton::Middle);
+                        // Sticky gestures: don't rely on egui's dragged_* after the
+                        // pointer leaves the rect (or Wayland briefly drops position).
+                        let (primary_down, middle_down, primary_pressed, middle_pressed, ptr_delta) =
+                            ui.input(|i| {
+                                (
+                                    i.pointer.primary_down(),
+                                    i.pointer.middle_down(),
+                                    i.pointer.button_pressed(egui::PointerButton::Primary),
+                                    i.pointer.button_pressed(egui::PointerButton::Middle),
+                                    i.pointer.delta(),
+                                )
+                            });
+                        let over = resp.contains_pointer() || resp.hovered();
+                        let mut size_dragging = ui.ctx().data(|d| {
+                            d.get_temp::<bool>(viz_size_drag_id).unwrap_or(false)
+                        });
+                        let mut orbiting = ui
+                            .ctx()
+                            .data(|d| d.get_temp::<bool>(viz_orbit_id).unwrap_or(false));
+                        if over && primary_pressed {
+                            size_dragging = true;
+                        }
+                        if over && middle_pressed {
+                            orbiting = true;
+                        }
+                        if !primary_down {
+                            size_dragging = false;
+                        }
+                        if !middle_down {
+                            orbiting = false;
+                        }
+                        // Prefer orbit when both somehow overlap.
+                        if orbiting {
+                            size_dragging = false;
+                        }
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(viz_size_drag_id, size_dragging);
+                            d.insert_temp(viz_orbit_id, orbiting);
+                        });
+
+                        let adjusting = size_dragging || orbiting;
                         design::capture_cursor_while(ui, adjusting, viz_grab_id);
 
-                        if resp.dragged_by(egui::PointerButton::Primary) {
-                            let d = resp.drag_delta();
-                            size = (size + d.x * 0.008).clamp(0.1, 4.0);
-                            shape = (shape - d.y * 0.006).clamp(0.5, 2.0);
+                        if size_dragging {
+                            size = (size + ptr_delta.x * 0.008).clamp(0.1, 4.0);
+                            shape = (shape - ptr_delta.y * 0.006).clamp(0.5, 2.0);
                             changed = true;
                         }
-                        if resp.dragged_by(egui::PointerButton::Middle) {
-                            let d = resp.drag_delta();
-                            viz_cam.yaw -= d.x * 0.01;
-                            viz_cam.pitch = (viz_cam.pitch + d.y * 0.008).clamp(-0.12, 1.35);
+                        if orbiting {
+                            viz_cam.yaw -= ptr_delta.x * 0.01;
+                            viz_cam.pitch =
+                                (viz_cam.pitch + ptr_delta.y * 0.008).clamp(-0.12, 1.35);
                         }
-                        if resp.hovered() && !adjusting {
+                        if over && !adjusting {
                             let (raw_y, smooth_y) =
                                 ui.input(|i| (i.raw_scroll_delta.y, i.smooth_scroll_delta.y));
                             let dy = if raw_y.abs() > 0.0 { raw_y } else { smooth_y };
