@@ -1,4 +1,6 @@
-use super::draw_list::{MeshCmd, MeshKind, SpatialCmd, SpatialDrawList, SpatialMaterial, SpatialMeshId};
+use super::draw_list::{
+    MeshCmd, MeshKind, ShellCmd, SpatialCmd, SpatialDrawList, SpatialMaterial, SpatialMeshId,
+};
 use super::math::{SpatialTransform, Vec3};
 
 pub fn push_box(
@@ -39,6 +41,25 @@ pub fn push_plane(
         },
         kind: MeshKind::Plane,
         material,
+        sort_key,
+    }));
+}
+
+pub fn push_shell(
+    list: &mut SpatialDrawList,
+    room_type: u8,
+    half_extents: Vec3,
+    face_heat: [f32; 6],
+    material: SpatialMaterial,
+    segments: u8,
+    sort_key: f32,
+) {
+    list.push(SpatialCmd::Shell(ShellCmd {
+        room_type,
+        half_extents,
+        face_heat,
+        material,
+        segments,
         sort_key,
     }));
 }

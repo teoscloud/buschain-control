@@ -33,6 +33,19 @@ enum {
   L_DUCK_RELEASE,
   L_FREEZE,
   L_GATE_TIME,
+  L_ROOM_TYPE,
+  L_SOURCE_X,
+  L_SOURCE_Y,
+  L_SOURCE_Z,
+  L_LISTENER_X,
+  L_LISTENER_Y,
+  L_LISTENER_Z,
+  L_SOURCE_SPACING,
+  L_SOURCE_YAW,
+  L_FACE_LOCK,
+  L_LISTENER_SPACING,
+  L_EAR_ANGLE,
+  L_EAR_PRESET,
   /* meters (output control) */
   L_M_RT60,
   L_M_ECHO,
@@ -108,6 +121,19 @@ static void run(LADSPA_Handle instance, unsigned long n_samples) {
   params.duck_release_ms = pget(self, L_DUCK_RELEASE, params.duck_release_ms);
   params.freeze = pget(self, L_FREEZE, 0.0f) >= 0.5f ? 1.0f : 0.0f;
   params.gate_time_ms = pget(self, L_GATE_TIME, params.gate_time_ms);
+  params.room_type = pget(self, L_ROOM_TYPE, params.room_type);
+  params.source_x = pget(self, L_SOURCE_X, params.source_x);
+  params.source_y = pget(self, L_SOURCE_Y, params.source_y);
+  params.source_z = pget(self, L_SOURCE_Z, params.source_z);
+  params.listener_x = pget(self, L_LISTENER_X, params.listener_x);
+  params.listener_y = pget(self, L_LISTENER_Y, params.listener_y);
+  params.listener_z = pget(self, L_LISTENER_Z, params.listener_z);
+  params.source_spacing = pget(self, L_SOURCE_SPACING, params.source_spacing);
+  params.source_yaw = pget(self, L_SOURCE_YAW, params.source_yaw);
+  params.face_lock = pget(self, L_FACE_LOCK, params.face_lock) >= 0.5f ? 1.0f : 0.0f;
+  params.listener_spacing = pget(self, L_LISTENER_SPACING, params.listener_spacing);
+  params.ear_angle = pget(self, L_EAR_ANGLE, params.ear_angle);
+  params.ear_preset = pget(self, L_EAR_PRESET, params.ear_preset);
 
   buschain_reverb_set_params(self->dsp, &params);
 
@@ -163,7 +189,7 @@ static void init_descriptor(void) {
   port_descriptors[L_INPUT_R] = LADSPA_PORT_INPUT | LADSPA_PORT_AUDIO;
   port_descriptors[L_OUTPUT_L] = LADSPA_PORT_OUTPUT | LADSPA_PORT_AUDIO;
   port_descriptors[L_OUTPUT_R] = LADSPA_PORT_OUTPUT | LADSPA_PORT_AUDIO;
-  for (int i = L_BYPASS; i <= L_GATE_TIME; i++)
+  for (int i = L_BYPASS; i <= L_EAR_PRESET; i++)
     port_descriptors[i] = LADSPA_PORT_INPUT | LADSPA_PORT_CONTROL;
   for (int i = L_M_RT60; i < L_N_PORTS; i++)
     port_descriptors[i] = LADSPA_PORT_OUTPUT | LADSPA_PORT_CONTROL;
@@ -193,6 +219,19 @@ static void init_descriptor(void) {
   port_names[L_DUCK_RELEASE] = "Duck Release (ms)";
   port_names[L_FREEZE] = "Freeze";
   port_names[L_GATE_TIME] = "Gate Time (ms)";
+  port_names[L_ROOM_TYPE] = "Room Type";
+  port_names[L_SOURCE_X] = "Source X";
+  port_names[L_SOURCE_Y] = "Source Y";
+  port_names[L_SOURCE_Z] = "Source Z";
+  port_names[L_LISTENER_X] = "Listener X";
+  port_names[L_LISTENER_Y] = "Listener Y";
+  port_names[L_LISTENER_Z] = "Listener Z";
+  port_names[L_SOURCE_SPACING] = "Source Spacing";
+  port_names[L_SOURCE_YAW] = "Source Yaw";
+  port_names[L_FACE_LOCK] = "Face Lock";
+  port_names[L_LISTENER_SPACING] = "Listener Spacing";
+  port_names[L_EAR_ANGLE] = "Ear Angle";
+  port_names[L_EAR_PRESET] = "Ear Preset";
   port_names[L_M_RT60] = "RT60 Est";
   port_names[L_M_ECHO] = "Echo Density";
   port_names[L_M_ER_TAIL] = "ER/Tail";
@@ -223,6 +262,19 @@ static void init_descriptor(void) {
   hint_range(L_DUCK_RELEASE, 10, 1000, 0, LADSPA_HINT_DEFAULT_MIDDLE);
   hint_range(L_FREEZE, 0, 1, 1, LADSPA_HINT_DEFAULT_0);
   hint_range(L_GATE_TIME, 0, 500, 0, LADSPA_HINT_DEFAULT_0);
+  hint_range(L_ROOM_TYPE, 0, 6, 0, LADSPA_HINT_DEFAULT_0);
+  hint_range(L_SOURCE_X, 0, 1, 0, LADSPA_HINT_DEFAULT_LOW);
+  hint_range(L_SOURCE_Y, 0, 1, 0, LADSPA_HINT_DEFAULT_MIDDLE);
+  hint_range(L_SOURCE_Z, 0, 1, 0, LADSPA_HINT_DEFAULT_LOW);
+  hint_range(L_LISTENER_X, 0, 1, 0, LADSPA_HINT_DEFAULT_HIGH);
+  hint_range(L_LISTENER_Y, 0, 1, 0, LADSPA_HINT_DEFAULT_MIDDLE);
+  hint_range(L_LISTENER_Z, 0, 1, 0, LADSPA_HINT_DEFAULT_HIGH);
+  hint_range(L_SOURCE_SPACING, 0, 1, 0, LADSPA_HINT_DEFAULT_LOW);
+  hint_range(L_SOURCE_YAW, -180, 180, 0, LADSPA_HINT_DEFAULT_0);
+  hint_range(L_FACE_LOCK, 0, 1, 1, LADSPA_HINT_DEFAULT_1);
+  hint_range(L_LISTENER_SPACING, 0, 1, 0, LADSPA_HINT_DEFAULT_LOW);
+  hint_range(L_EAR_ANGLE, 90, 180, 0, LADSPA_HINT_DEFAULT_HIGH);
+  hint_range(L_EAR_PRESET, 0, 1, 0, LADSPA_HINT_DEFAULT_0);
   for (int i = L_M_RT60; i < L_N_PORTS; i++)
     hint_range(i, 0, 20, 0, LADSPA_HINT_DEFAULT_0);
 

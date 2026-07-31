@@ -75,8 +75,23 @@ pub enum GlyphKind {
 pub struct GlyphCmd {
     pub kind: GlyphKind,
     pub pos: Vec3,
+    /// World yaw in radians (0 = +Z); used to orient Source cones.
+    pub yaw: f32,
     pub bloom: f32,
     pub rgba: Rgba,
+    pub sort_key: f32,
+}
+
+/// Room shell — room_type matches BusChain Room LADSPA enum (0–6).
+/// `half_extents`: (half_width, half_height, half_depth); floor at y=0, roof at y=2*hy.
+/// `face_heat`: 0–1 energy per face (+X −X +Z −Z floor roof / band proxies).
+#[derive(Clone, Debug)]
+pub struct ShellCmd {
+    pub room_type: u8,
+    pub half_extents: Vec3,
+    pub face_heat: [f32; 6],
+    pub material: SpatialMaterial,
+    pub segments: u8,
     pub sort_key: f32,
 }
 
@@ -87,6 +102,7 @@ pub enum SpatialCmd {
     Ray(RayCmd),
     Spark(SparkCmd),
     Glyph(GlyphCmd),
+    Shell(ShellCmd),
 }
 
 impl SpatialCmd {
@@ -97,6 +113,7 @@ impl SpatialCmd {
             Self::Ray(c) => c.sort_key,
             Self::Spark(c) => c.sort_key,
             Self::Glyph(c) => c.sort_key,
+            Self::Shell(c) => c.sort_key,
         }
     }
 }

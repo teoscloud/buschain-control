@@ -9,6 +9,17 @@
 extern "C" {
 #endif
 
+/* Room Type: 0 Shoebox … 6 Tunnel */
+enum {
+  BUSCHAIN_ROOM_SHOEBOX = 0,
+  BUSCHAIN_ROOM_CYLINDER = 1,
+  BUSCHAIN_ROOM_BARREL = 2,
+  BUSCHAIN_ROOM_CONE = 3,
+  BUSCHAIN_ROOM_PYRAMID = 4,
+  BUSCHAIN_ROOM_DOME = 5,
+  BUSCHAIN_ROOM_TUNNEL = 6
+};
+
 typedef struct {
   int   bypass;
   float mix;
@@ -31,6 +42,20 @@ typedef struct {
   float duck_release_ms;
   float freeze;
   float gate_time_ms;
+  /* Spatial (0–1 normalized floor / height) */
+  float room_type; /* 0–6 stepped */
+  float source_x;
+  float source_y;
+  float source_z;
+  float listener_x;
+  float listener_y;
+  float listener_z;
+  float source_spacing; /* 0–1 stereo baseline; ~0 → mono */
+  float source_yaw;     /* degrees, parallel aim when face_lock off */
+  float face_lock;      /* >=0.5 → toe-in each speaker to listener */
+  float listener_spacing; /* 0–1 interaural / head width */
+  float ear_angle;        /* degrees between ear facings; 180 = opposite */
+  float ear_preset;       /* 0 Flat 180, 1 Human (UI recipe; DSP uses spacing/angle) */
 } BuschainReverbParams;
 
 typedef struct {

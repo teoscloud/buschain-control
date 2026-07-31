@@ -1841,6 +1841,16 @@ struct ReverbVizCam {
     zoom: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReverbVizDrag {
+    None,
+    SizeShape,
+    Source,
+    Listener,
+    Yaw,
+    Spacing,
+}
+
 impl Default for ReverbVizCam {
     fn default() -> Self {
         // Prior fixed framing: eye ∝ (0.72, 0.48, 0.78).
@@ -1860,10 +1870,11 @@ fn draw_reverb_panel(
     insert_idx: usize,
 ) -> bool {
     use crate::design::spatial_viz::{
-        BackendRect, EguiPainterBackend, ReverbRoomParams, ReverbRoomScene, SpatialBackend,
-        SpatialCamera, SpatialFrame, SpatialMetricBus, SpatialScene, SpatialViewport, VizQuality,
-        METRIC_BAND_T60_HI, METRIC_BAND_T60_LO, METRIC_BAND_T60_MID, METRIC_DUCK_GR,
-        METRIC_ECHO_DENSITY, METRIC_ER_TAIL, METRIC_RT60, METRIC_WET_PEAK,
+        bearing_yaw_deg, camera_ray, intersect_floor, pick, room_half_extents, world_xz_to_norm,
+        BackendRect, EguiPainterBackend, ReverbRoomParams, ReverbRoomScene,
+        SpatialBackend, SpatialCamera, SpatialFrame, SpatialHitKind, SpatialMetricBus, SpatialScene,
+        SpatialViewport, VizQuality, METRIC_BAND_T60_HI, METRIC_BAND_T60_LO, METRIC_BAND_T60_MID,
+        METRIC_DUCK_GR, METRIC_ECHO_DENSITY, METRIC_ER_TAIL, METRIC_RT60, METRIC_WET_PEAK,
     };
     use egui::{CornerRadius, Frame, Margin, Stroke};
 
@@ -1895,14 +1906,37 @@ fn draw_reverb_panel(
     let mut duck_rel = plug.param("Duck Release (ms)").unwrap_or(200.0);
     let mut freeze = plug.param("Freeze").unwrap_or(0.0) >= 0.5;
     let mut gate_time = plug.param("Gate Time (ms)").unwrap_or(0.0);
+    let mut room_type = plug.param("Room Type").unwrap_or(0.0).round().clamp(0.0, 6.0);
+    let mut source_x = plug.param("Source X").unwrap_or(0.28);
+    let mut source_y = plug.param("Source Y").unwrap_or(0.55);
+    let mut source_z = plug.param("Source Z").unwrap_or(0.30);
+    let mut listener_x = plug.param("Listener X").unwrap_or(0.72);
+    let mut listener_y = plug.param("Listener Y").unwrap_or(0.50);
+    let mut listener_z = plug.param("Listener Z").unwrap_or(0.70);
+    let mut source_spacing = plug.param("Source Spacing").unwrap_or(0.35);
+    let mut source_yaw = plug.param("Source Yaw").unwrap_or(0.0);
+    let mut face_lock = plug.param("Face Lock").unwrap_or(1.0) >= 0.5;
+    let mut listener_spacing = plug.param("Listener Spacing").unwrap_or(0.35);
+    let mut ear_angle = plug.param("Ear Angle").unwrap_or(180.0);
+    let mut ear_preset = plug.param("Ear Preset").unwrap_or(0.0).round().clamp(0.0, 1.0);
     let mut changed = false;
 
     let viz_id = egui::Id::new(("reverb_viz", track_id, slot_id));
     let viz_cam_id = egui::Id::new(("reverb_viz_cam", track_id, slot_id));
     let viz_grab_id = egui::Id::new(("reverb_viz_grab", track_id, slot_id));
     let viz_orbit_id = egui::Id::new(("reverb_viz_orbit", track_id, slot_id));
-    let viz_size_drag_id = egui::Id::new(("reverb_viz_size", track_id, slot_id));
+    let viz_drag_id = egui::Id::new(("reverb_viz_drag", track_id, slot_id));
     let arch_id = egui::Id::new(("reverb_arch", track_id, slot_id));
+
+    const ROOM_TYPE_NAMES: &[&str] = &[
+        "Shoebox",
+        "Cylinder",
+        "Barrel vault",
+        "Cone roof",
+        "Pyramid",
+        "Dome",
+        "Tunnel",
+    ];
     let mut quality = ui.ctx().data(|d| {
         d.get_temp::<VizQuality>(viz_id)
             .unwrap_or(VizQuality::Cinematic)
@@ -1985,7 +2019,107 @@ fn draw_reverb_panel(
                                         freeze = plug.param("Freeze").unwrap_or(0.0) >= 0.5;
                                         gate_time =
                                             plug.param("Gate Time (ms)").unwrap_or(gate_time);
+                                        room_type = plug
+                                            .param("Room Type")
+                                            .unwrap_or(room_type)
+                                            .round()
+                                            .clamp(0.0, 6.0);
+                                        source_x = plug.param("Source X").unwrap_or(source_x);
+                                        source_y = plug.param("Source Y").unwrap_or(source_y);
+                                        source_z = plug.param("Source Z").unwrap_or(source_z);
+                                        listener_x =
+                                            plug.param("Listener X").unwrap_or(listener_x);
+                                        listener_y =
+                                            plug.param("Listener Y").unwrap_or(listener_y);
+                                        listener_z =
+                                            plug.param("Listener Z").unwrap_or(listener_z);
+                                        source_spacing = plug
+                                            .param("Source Spacing")
+                                            .unwrap_or(source_spacing);
+                                        source_yaw =
+                                            plug.param("Source Yaw").unwrap_or(source_yaw);
+                                        face_lock =
+                                            plug.param("Face Lock").unwrap_or(1.0) >= 0.5;
+                                        listener_spacing = plug
+                                            .param("Listener Spacing")
+                                            .unwrap_or(listener_spacing);
+                                        ear_angle = plug.param("Ear Angle").unwrap_or(ear_angle);
+                                        ear_preset = plug
+                                            .param("Ear Preset")
+                                            .unwrap_or(ear_preset)
+                                            .round()
+                                            .clamp(0.0, 1.0);
                                     }
+                                }
+                            }
+                        });
+                    ui.label(
+                        RichText::new("ROOM")
+                            .size(9.0)
+                            .strong()
+                            .color(theme.text_muted()),
+                    );
+                    let room_label = ROOM_TYPE_NAMES
+                        .get(room_type as usize)
+                        .copied()
+                        .unwrap_or("Shoebox");
+                    egui::ComboBox::from_id_salt(("reverb_room_combo", track_id, slot_id))
+                        .selected_text(
+                            RichText::new(room_label)
+                                .size(11.0)
+                                .strong()
+                                .color(theme.text()),
+                        )
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in ROOM_TYPE_NAMES.iter().enumerate() {
+                                let selected = room_type as usize == i;
+                                if ui.selectable_label(selected, *name).clicked() {
+                                    room_type = i as f32;
+                                    source_x = source_x.clamp(0.05, 0.95);
+                                    source_z = source_z.clamp(0.05, 0.95);
+                                    listener_x = listener_x.clamp(0.05, 0.95);
+                                    listener_z = listener_z.clamp(0.05, 0.95);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.label(
+                        RichText::new("EARS")
+                            .size(9.0)
+                            .strong()
+                            .color(theme.text_muted()),
+                    );
+                    const EAR_PRESET_NAMES: &[&str] = &["Flat 180", "Human"];
+                    let ear_label = EAR_PRESET_NAMES
+                        .get(ear_preset as usize)
+                        .copied()
+                        .unwrap_or("Flat 180");
+                    egui::ComboBox::from_id_salt(("reverb_ear_combo", track_id, slot_id))
+                        .selected_text(
+                            RichText::new(ear_label)
+                                .size(11.0)
+                                .strong()
+                                .color(theme.text()),
+                        )
+                        .width(100.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in EAR_PRESET_NAMES.iter().enumerate() {
+                                let selected = ear_preset as usize == i;
+                                if ui.selectable_label(selected, *name).clicked() {
+                                    ear_preset = i as f32;
+                                    match i {
+                                        1 => {
+                                            // Human: ~17cm IA + pinnae angled forward of lateral.
+                                            listener_spacing = 0.28;
+                                            ear_angle = 155.0;
+                                        }
+                                        _ => {
+                                            listener_spacing = 0.35;
+                                            ear_angle = 180.0;
+                                        }
+                                    }
+                                    changed = true;
                                 }
                             }
                         });
@@ -1999,6 +2133,23 @@ fn draw_reverb_panel(
                             } else {
                                 VizQuality::Essential
                             };
+                        }
+                        let was_face = face_lock;
+                        if design::toggle_chip(ui, &theme, "FACE", &mut face_lock, theme.accent())
+                            .changed()
+                        {
+                            changed = true;
+                            if was_face && !face_lock {
+                                // Unlock: seed yaw from center→ear so aim doesn't jump.
+                                let he = room_half_extents(size, shape, room_type as u8);
+                                let center = crate::design::spatial_viz::scenes::reverb_room::norm_to_world(
+                                    source_x, source_y, source_z, he,
+                                );
+                                let ear = crate::design::spatial_viz::scenes::reverb_room::norm_to_world(
+                                    listener_x, listener_y, listener_z, he,
+                                );
+                                source_yaw = bearing_yaw_deg(center, ear);
+                            }
                         }
                         ui.label(
                             RichText::new("VIZ")
@@ -2078,6 +2229,40 @@ fn draw_reverb_panel(
                             );
                             changed |= reverb_knob(
                                 ui, &theme, "MOD", &mut modulation, 0.0..=1.0, knob, &fmt01,
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            changed |= reverb_knob(
+                                ui, &theme, "SRC Y", &mut source_y, 0.0..=1.0, 36.0, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "EAR Y", &mut listener_y, 0.0..=1.0, 36.0, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "SPACE", &mut source_spacing, 0.0..=1.0, 36.0, &fmt01,
+                            );
+                            if face_lock {
+                                ui.add_enabled_ui(false, |ui| {
+                                    let mut yaw_disp = source_yaw;
+                                    let _ = reverb_knob(
+                                        ui, &theme, "YAW", &mut yaw_disp, -180.0..=180.0, 36.0,
+                                        &|v| format!("{v:.0}°"),
+                                    );
+                                });
+                            } else {
+                                changed |= reverb_knob(
+                                    ui, &theme, "YAW", &mut source_yaw, -180.0..=180.0, 36.0,
+                                    &|v| format!("{v:.0}°"),
+                                );
+                            }
+                            changed |= reverb_knob(
+                                ui, &theme, "EARS", &mut listener_spacing, 0.0..=1.0, 36.0, &fmt01,
+                            );
+                            changed |= reverb_knob(
+                                ui, &theme, "EAR∠", &mut ear_angle, 90.0..=180.0, 36.0,
+                                &|v| format!("{v:.0}°"),
                             );
                         });
                     });
@@ -2179,70 +2364,18 @@ fn draw_reverb_panel(
                                 )
                             });
                         let over = resp.contains_pointer() || resp.hovered();
-                        let mut size_dragging = ui.ctx().data(|d| {
-                            d.get_temp::<bool>(viz_size_drag_id).unwrap_or(false)
+                        let mut lmb_drag = ui.ctx().data(|d| {
+                            d.get_temp::<ReverbVizDrag>(viz_drag_id)
+                                .unwrap_or(ReverbVizDrag::None)
                         });
                         let mut orbiting = ui
                             .ctx()
                             .data(|d| d.get_temp::<bool>(viz_orbit_id).unwrap_or(false));
-                        if over && primary_pressed {
-                            size_dragging = true;
-                        }
-                        if over && middle_pressed {
-                            orbiting = true;
-                        }
-                        if !primary_down {
-                            size_dragging = false;
-                        }
-                        if !middle_down {
-                            orbiting = false;
-                        }
-                        // Prefer orbit when both somehow overlap.
-                        if orbiting {
-                            size_dragging = false;
-                        }
-                        ui.ctx().data_mut(|d| {
-                            d.insert_temp(viz_size_drag_id, size_dragging);
-                            d.insert_temp(viz_orbit_id, orbiting);
-                        });
 
-                        let adjusting = size_dragging || orbiting;
-                        design::capture_cursor_while(ui, adjusting, viz_grab_id);
-
-                        if size_dragging {
-                            size = (size + ptr_delta.x * 0.008).clamp(0.1, 4.0);
-                            shape = (shape - ptr_delta.y * 0.006).clamp(0.5, 2.0);
-                            changed = true;
-                        }
-                        if orbiting {
-                            viz_cam.yaw -= ptr_delta.x * 0.01;
-                            viz_cam.pitch =
-                                (viz_cam.pitch + ptr_delta.y * 0.008).clamp(-0.12, 1.35);
-                        }
-                        if over && !adjusting {
-                            let (raw_y, smooth_y) =
-                                ui.input(|i| (i.raw_scroll_delta.y, i.smooth_scroll_delta.y));
-                            let dy = if raw_y.abs() > 0.0 { raw_y } else { smooth_y };
-                            if dy.abs() > 0.01 {
-                                ui.ctx().input_mut(|i| {
-                                    i.smooth_scroll_delta = Vec2::ZERO;
-                                });
-                                // Scroll up → zoom in (closer).
-                                let step = if raw_y.abs() > 0.0 {
-                                    (raw_y / 14.0).clamp(-4.0, 4.0)
-                                } else {
-                                    (smooth_y / 48.0).clamp(-2.5, 2.5)
-                                };
-                                viz_cam.zoom =
-                                    (viz_cam.zoom * (1.0 - step * 0.08)).clamp(0.35, 2.8);
-                            }
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-                        }
-
-                        // Orbitable view of the whole room (default isometric-ish framing).
-                        let room_w = 1.0 * size * shape.sqrt();
-                        let room_h = 0.65 * size;
-                        let room_d = 1.25 * size / shape.sqrt();
+                        let he = room_half_extents(size, shape, room_type as u8);
+                        let room_w = he.x;
+                        let room_h = he.y;
+                        let room_d = he.z;
                         let span = room_w.max(room_h).max(room_d);
                         let cam_dist = (4.8 + span * 1.65) * viz_cam.zoom;
                         let target = crate::design::spatial_viz::math::Vec3::new(
@@ -2274,10 +2407,22 @@ fn draw_reverb_panel(
                             },
                         };
 
-                        let scene = ReverbRoomScene {
-                            params: ReverbRoomParams {
-                                size,
-                                shape,
+                        let make_params = |sx: f32,
+                                           sy: f32,
+                                           sz: f32,
+                                           lx: f32,
+                                           ly: f32,
+                                           lz: f32,
+                                           spacing: f32,
+                                           yaw: f32,
+                                           lst_sp: f32,
+                                           ear_ang: f32,
+                                           sz_sz: f32,
+                                           sh: f32|
+                         -> ReverbRoomParams {
+                            ReverbRoomParams {
+                                size: sz_sz,
+                                shape: sh,
                                 predelay_ms: predelay,
                                 rt60,
                                 character,
@@ -2288,9 +2433,191 @@ fn draw_reverb_panel(
                                 decay_hi,
                                 freeze: if freeze { 1.0 } else { 0.0 },
                                 gate_time_ms: gate_time,
-                            },
+                                room_type: room_type as u8,
+                                source_x: sx,
+                                source_y: sy,
+                                source_z: sz,
+                                listener_x: lx,
+                                listener_y: ly,
+                                listener_z: lz,
+                                source_spacing: spacing,
+                                source_yaw_deg: yaw,
+                                face_lock: if face_lock { 1.0 } else { 0.0 },
+                                listener_spacing: lst_sp,
+                                ear_angle_deg: ear_ang,
+                                wall_heat: [0.0; 6],
+                            }
                         };
-                        let list = scene.build(&frame, &metrics);
+                        let list = ReverbRoomScene {
+                            params: make_params(
+                                source_x,
+                                source_y,
+                                source_z,
+                                listener_x,
+                                listener_y,
+                                listener_z,
+                                source_spacing,
+                                source_yaw,
+                                listener_spacing,
+                                ear_angle,
+                                size,
+                                shape,
+                            ),
+                        }
+                        .build(&frame, &metrics);
+
+                        let (alt_down, ctrl_down) = ui.input(|i| {
+                            (
+                                i.modifiers.alt || i.modifiers.command,
+                                i.modifiers.ctrl,
+                            )
+                        });
+
+                        if over && middle_pressed {
+                            orbiting = true;
+                        }
+                        if !middle_down {
+                            orbiting = false;
+                        }
+                        if over && primary_pressed && !orbiting {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let nx = ((pos.x - rect.min.x) / rect.width().max(1.0)) * 2.0 - 1.0;
+                                let ny =
+                                    1.0 - ((pos.y - rect.min.y) / rect.height().max(1.0)) * 2.0;
+                                let ray = camera_ray(&frame, nx, ny);
+                                if !face_lock && alt_down {
+                                    lmb_drag = ReverbVizDrag::Yaw;
+                                } else if ctrl_down {
+                                    lmb_drag = ReverbVizDrag::Spacing;
+                                } else {
+                                    lmb_drag = match pick(&list, ray).map(|h| h.kind) {
+                                        Some(SpatialHitKind::Source) => ReverbVizDrag::Source,
+                                        Some(SpatialHitKind::Listener) => ReverbVizDrag::Listener,
+                                        _ => ReverbVizDrag::SizeShape,
+                                    };
+                                }
+                            } else {
+                                lmb_drag = ReverbVizDrag::SizeShape;
+                            }
+                        }
+                        if !primary_down {
+                            lmb_drag = ReverbVizDrag::None;
+                        }
+                        if orbiting {
+                            lmb_drag = ReverbVizDrag::None;
+                        }
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(viz_drag_id, lmb_drag);
+                            d.insert_temp(viz_orbit_id, orbiting);
+                        });
+
+                        let glyph_drag = matches!(
+                            lmb_drag,
+                            ReverbVizDrag::Source | ReverbVizDrag::Listener
+                        );
+                        let yaw_dragging = lmb_drag == ReverbVizDrag::Yaw;
+                        let spacing_dragging = lmb_drag == ReverbVizDrag::Spacing;
+                        let size_dragging = lmb_drag == ReverbVizDrag::SizeShape;
+                        let adjusting =
+                            size_dragging || orbiting || glyph_drag || yaw_dragging || spacing_dragging;
+                        design::capture_cursor_while(
+                            ui,
+                            adjusting && !glyph_drag && !yaw_dragging && !spacing_dragging,
+                            viz_grab_id,
+                        );
+
+                        if size_dragging {
+                            size = (size + ptr_delta.x * 0.008).clamp(0.1, 4.0);
+                            shape = (shape - ptr_delta.y * 0.006).clamp(0.5, 2.0);
+                            changed = true;
+                        }
+                        if glyph_drag || yaw_dragging || spacing_dragging {
+                            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                                let nx = ((pos.x - rect.min.x) / rect.width().max(1.0)) * 2.0 - 1.0;
+                                let ny =
+                                    1.0 - ((pos.y - rect.min.y) / rect.height().max(1.0)) * 2.0;
+                                let ray = camera_ray(&frame, nx, ny);
+                                if let Some(hit) = intersect_floor(ray, 0.0) {
+                                    match lmb_drag {
+                                        ReverbVizDrag::Source => {
+                                            let (nxz, nzz) = world_xz_to_norm(hit, he);
+                                            source_x = nxz;
+                                            source_z = nzz;
+                                        }
+                                        ReverbVizDrag::Listener => {
+                                            let (nxz, nzz) = world_xz_to_norm(hit, he);
+                                            listener_x = nxz;
+                                            listener_z = nzz;
+                                        }
+                                        ReverbVizDrag::Yaw if !face_lock => {
+                                            let center = crate::design::spatial_viz::scenes::reverb_room::norm_to_world(
+                                                source_x, source_y, source_z, he,
+                                            );
+                                            source_yaw = bearing_yaw_deg(center, hit);
+                                        }
+                                        ReverbVizDrag::Spacing => {
+                                            let center = crate::design::spatial_viz::scenes::reverb_room::norm_to_world(
+                                                source_x, source_y, source_z, he,
+                                            );
+                                            let dist = ((hit.x - center.x).hypot(hit.z - center.z))
+                                                / (he.x.min(he.z) * 0.45).max(1e-3);
+                                            source_spacing = dist.clamp(0.0, 1.0);
+                                        }
+                                        _ => {}
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if orbiting {
+                            viz_cam.yaw -= ptr_delta.x * 0.01;
+                            viz_cam.pitch =
+                                (viz_cam.pitch + ptr_delta.y * 0.008).clamp(-0.12, 1.35);
+                        }
+                        if over && !adjusting {
+                            let (raw_y, smooth_y) =
+                                ui.input(|i| (i.raw_scroll_delta.y, i.smooth_scroll_delta.y));
+                            let dy = if raw_y.abs() > 0.0 { raw_y } else { smooth_y };
+                            if dy.abs() > 0.01 {
+                                ui.ctx().input_mut(|i| {
+                                    i.smooth_scroll_delta = Vec2::ZERO;
+                                });
+                                let step = if raw_y.abs() > 0.0 {
+                                    (raw_y / 14.0).clamp(-4.0, 4.0)
+                                } else {
+                                    (smooth_y / 48.0).clamp(-2.5, 2.5)
+                                };
+                                viz_cam.zoom =
+                                    (viz_cam.zoom * (1.0 - step * 0.08)).clamp(0.35, 2.8);
+                            }
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        } else if glyph_drag || yaw_dragging || spacing_dragging {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                        }
+
+                        // Rebuild after interaction so glyphs / shell track the drag this frame.
+                        let list = if adjusting && !orbiting {
+                            ReverbRoomScene {
+                                params: make_params(
+                                    source_x,
+                                    source_y,
+                                    source_z,
+                                    listener_x,
+                                    listener_y,
+                                    listener_z,
+                                    source_spacing,
+                                    source_yaw,
+                                    listener_spacing,
+                                    ear_angle,
+                                    size,
+                                    shape,
+                                ),
+                            }
+                            .build(&frame, &metrics)
+                        } else {
+                            list
+                        };
+
                         let mut backend = EguiPainterBackend::new();
                         backend.begin_frame(
                             &frame,
@@ -2312,7 +2639,28 @@ fn draw_reverb_panel(
                         ui.painter().text(
                             rect.left_bottom() + egui::vec2(8.0, -6.0),
                             egui::Align2::LEFT_BOTTOM,
-                            "LMB size/shape · MMB orbit · scroll zoom",
+                            if face_lock {
+                                "LMB SPEAKER/EAR · Ctrl spacing · empty size/shape · MMB orbit"
+                            } else {
+                                "LMB SPEAKER/EAR · Alt yaw · Ctrl spacing · empty size · MMB orbit"
+                            },
+                            egui::FontId::proportional(9.0),
+                            theme.text_muted().gamma_multiply(0.65),
+                        );
+                        ui.painter().text(
+                            rect.right_bottom() + egui::vec2(-8.0, -6.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            format!(
+                                "sp {:.2}  {}  S {:.2},{:.2}",
+                                source_spacing,
+                                if face_lock {
+                                    "FACE".to_string()
+                                } else {
+                                    format!("{source_yaw:.0}°")
+                                },
+                                source_x,
+                                source_z
+                            ),
                             egui::FontId::proportional(9.0),
                             theme.text_muted().gamma_multiply(0.65),
                         );
@@ -2403,6 +2751,19 @@ fn draw_reverb_panel(
         plug.set_param("Duck Release (ms)", duck_rel);
         plug.set_param("Freeze", if freeze { 1.0 } else { 0.0 });
         plug.set_param("Gate Time (ms)", gate_time);
+        plug.set_param("Room Type", room_type);
+        plug.set_param("Source X", source_x);
+        plug.set_param("Source Y", source_y);
+        plug.set_param("Source Z", source_z);
+        plug.set_param("Listener X", listener_x);
+        plug.set_param("Listener Y", listener_y);
+        plug.set_param("Listener Z", listener_z);
+        plug.set_param("Source Spacing", source_spacing);
+        plug.set_param("Source Yaw", source_yaw);
+        plug.set_param("Face Lock", if face_lock { 1.0 } else { 0.0 });
+        plug.set_param("Listener Spacing", listener_spacing);
+        plug.set_param("Ear Angle", ear_angle);
+        plug.set_param("Ear Preset", ear_preset);
     }
     changed
 }

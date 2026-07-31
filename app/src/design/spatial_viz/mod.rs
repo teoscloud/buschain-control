@@ -19,13 +19,16 @@ pub use backend::{BackendRect, SpatialBackend};
 pub use backend::egui::EguiPainterBackend;
 pub use draw_list::{SpatialDrawList, SpatialMaterial, SpatialMeshId};
 pub use frame::{SpatialCamera, SpatialFrame, SpatialTheme, SpatialViewport, VizQuality};
-pub use hit::{SpatialHit, SpatialRay};
+pub use hit::{camera_ray, intersect_floor, pick, SpatialHit, SpatialHitKind, SpatialRay};
 pub use metrics::{
     SpatialMetricBus, METRIC_BAND_T60_HI, METRIC_BAND_T60_LO, METRIC_BAND_T60_MID, METRIC_DUCK_GR,
     METRIC_ECHO_DENSITY, METRIC_ER_TAIL, METRIC_RT60, METRIC_WET_PEAK, REVERB_METRIC_IDS,
 };
 pub use scene::SpatialScene;
-pub use scenes::reverb_room::ReverbRoomParams;
+pub use scenes::reverb_room::{
+    bearing_yaw_deg, room_half_extents, stereo_ears, stereo_speakers, world_xz_to_norm,
+    ReverbRoomParams,
+};
 pub use scenes::{ReverbRoomScene, TapFieldScene};
 
 #[cfg(test)]

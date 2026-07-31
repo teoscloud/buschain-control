@@ -3,7 +3,9 @@
 use egui::{Color32, Pos2, Rect, Shape, Stroke, Ui, epaint::CircleShape};
 
 use crate::design::spatial_viz::backend::{BackendRect, SpatialBackend};
-use crate::design::spatial_viz::draw_list::{GlyphKind, MeshKind, SpatialCmd, SpatialDrawList};
+use crate::design::spatial_viz::draw_list::{
+    GlyphKind, MeshKind, ShellCmd, SpatialCmd, SpatialDrawList,
+};
 use crate::design::spatial_viz::frame::SpatialFrame;
 use crate::design::spatial_viz::math::{Mat4, Rgba, Vec3};
 
@@ -87,6 +89,363 @@ impl EguiPainterBackend {
             (c.b.clamp(0.0, 1.0) * 255.0) as u8,
             (c.a.clamp(0.0, 1.0) * 255.0) as u8,
         )
+    }
+
+    fn heat_tint(base: Rgba, heat: f32) -> Rgba {
+        // Cool/dim at low heat; orange only on peaks (smoothstep knee).
+        let h = heat.clamp(0.0, 1.0);
+        let t = (h * h * (3.0 - 2.0 * h)).clamp(0.0, 1.0); // smoothstep
+        let t = t.powf(1.25);
+        Rgba::new(
+            base.r * (1.0 - t) + 0.98 * t,
+            base.g * (1.0 - t) + (0.38 + 0.12 * (1.0 - t)) * t,
+            base.b * (1.0 - t) + 0.10 * t,
+            (base.a * 0.22 * (1.0 - t) + 0.78 * t).clamp(0.06, 0.82),
+        )
+    }
+
+    fn line3(&mut self, a: Vec3, b: Vec3, stroke: Stroke) {
+        if let (Some(pa), Some(pb)) = (self.project(a), self.project(b)) {
+            self.painter_shapes
+                .push(Shape::line_segment([pa, pb], stroke));
+        }
+    }
+
+    fn quad_fill(&mut self, pts: [Vec3; 4], fill: Color32) {
+        let mut screen = Vec::new();
+        for p in pts {
+            if let Some(q) = self.project(p) {
+                screen.push(q);
+            }
+        }
+        if screen.len() == 4 {
+            self.painter_shapes
+                .push(Shape::convex_polygon(screen, fill, Stroke::NONE));
+        }
+    }
+
+    fn submit_shell(&mut self, s: &ShellCmd) {
+        let w = s.half_extents.x;
+        let h = s.half_extents.y * 2.0;
+        let d = s.half_extents.z;
+        let segs = (s.segments as usize).clamp(8, 32);
+        let wire = Stroke::new(
+            1.0 * self.dpi,
+            Self::color(s.material.albedo.scale_rgb(0.55).with_alpha(0.85)),
+        );
+        let base = s.material.albedo;
+
+        match s.room_type {
+            1 => {
+                // Cylinder
+                let r = w.min(d);
+                for ring_y in [0.0f32, h * 0.5, h] {
+                    let mut prev = None;
+                    for i in 0..=segs {
+                        let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                        let p = Vec3::new(r * a.cos(), ring_y, r * a.sin());
+                        if let Some(q) = prev {
+                            self.line3(q, p, wire);
+                        }
+                        prev = Some(p);
+                    }
+                }
+                for i in 0..segs {
+                    if i % (segs / 8).max(1) != 0 {
+                        continue;
+                    }
+                    let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                    let x = r * a.cos();
+                    let z = r * a.sin();
+                    self.line3(Vec3::new(x, 0.0, z), Vec3::new(x, h, z), wire);
+                    let band = ((a / std::f32::consts::FRAC_PI_2).floor() as usize) % 4;
+                    let fill = Self::color(Self::heat_tint(base, s.face_heat[band]));
+                    let a1 = a;
+                    let a2 = a + std::f32::consts::TAU / segs as f32;
+                    self.quad_fill(
+                        [
+                            Vec3::new(r * a1.cos(), 0.0, r * a1.sin()),
+                            Vec3::new(r * a2.cos(), 0.0, r * a2.sin()),
+                            Vec3::new(r * a2.cos(), h, r * a2.sin()),
+                            Vec3::new(r * a1.cos(), h, r * a1.sin()),
+                        ],
+                        fill,
+                    );
+                }
+                // Roof disc tint
+                let roof = Self::color(Self::heat_tint(base, s.face_heat[5]));
+                let mut roof_pts = Vec::new();
+                for i in 0..8 {
+                    let a = (i as f32 / 8.0) * std::f32::consts::TAU;
+                    if let Some(q) = self.project(Vec3::new(r * 0.9 * a.cos(), h, r * 0.9 * a.sin()))
+                    {
+                        roof_pts.push(q);
+                    }
+                }
+                if roof_pts.len() >= 3 {
+                    self.painter_shapes
+                        .push(Shape::convex_polygon(roof_pts, roof, Stroke::NONE));
+                }
+            }
+            2 => {
+                // Barrel vault: rect walls + arched roof along X
+                self.quad_fill(
+                    [
+                        Vec3::new(-w, 0.0, -d),
+                        Vec3::new(w, 0.0, -d),
+                        Vec3::new(w, h * 0.55, -d),
+                        Vec3::new(-w, h * 0.55, -d),
+                    ],
+                    Self::color(Self::heat_tint(base, s.face_heat[3])),
+                );
+                self.quad_fill(
+                    [
+                        Vec3::new(-w, 0.0, d),
+                        Vec3::new(w, 0.0, d),
+                        Vec3::new(w, h * 0.55, d),
+                        Vec3::new(-w, h * 0.55, d),
+                    ],
+                    Self::color(Self::heat_tint(base, s.face_heat[2])),
+                );
+                for side in [-1.0f32, 1.0] {
+                    let x = side * w;
+                    let fi = if side > 0.0 { 0 } else { 1 };
+                    self.quad_fill(
+                        [
+                            Vec3::new(x, 0.0, -d),
+                            Vec3::new(x, 0.0, d),
+                            Vec3::new(x, h * 0.55, d),
+                            Vec3::new(x, h * 0.55, -d),
+                        ],
+                        Self::color(Self::heat_tint(base, s.face_heat[fi])),
+                    );
+                }
+                let arch_n = segs / 2;
+                for zi in 0..arch_n {
+                    let z0 = -d + 2.0 * d * (zi as f32 / arch_n as f32);
+                    let z1 = -d + 2.0 * d * ((zi + 1) as f32 / arch_n as f32);
+                    let mut prev0 = None;
+                    let mut prev1 = None;
+                    for i in 0..=arch_n {
+                        let t = i as f32 / arch_n as f32;
+                        let ang = std::f32::consts::PI * t;
+                        let y = h * 0.55 + (h * 0.45) * ang.sin();
+                        let x = -w + 2.0 * w * t;
+                        let p0 = Vec3::new(x, y, z0);
+                        let p1 = Vec3::new(x, y, z1);
+                        if let (Some(a), Some(b)) = (prev0, Some(p0)) {
+                            self.line3(a, b, wire);
+                        }
+                        if let (Some(a), Some(b)) = (prev1, Some(p1)) {
+                            self.line3(a, b, wire);
+                        }
+                        if let (Some(a0), Some(a1)) = (prev0, prev1) {
+                            self.quad_fill(
+                                [a0, p0, p1, a1],
+                                Self::color(Self::heat_tint(base, s.face_heat[5] * 0.85 + 0.1)),
+                            );
+                        }
+                        prev0 = Some(p0);
+                        prev1 = Some(p1);
+                    }
+                }
+            }
+            3 | 4 => {
+                // Cone / pyramid
+                let apex = Vec3::new(0.0, h, 0.0);
+                let base_pts = [
+                    Vec3::new(-w, 0.0, -d),
+                    Vec3::new(w, 0.0, -d),
+                    Vec3::new(w, 0.0, d),
+                    Vec3::new(-w, 0.0, d),
+                ];
+                for i in 0..4 {
+                    let a = base_pts[i];
+                    let b = base_pts[(i + 1) % 4];
+                    self.line3(a, b, wire);
+                    self.line3(a, apex, wire);
+                    let mid = Vec3::new((a.x + b.x) * 0.5, 0.0, (a.z + b.z) * 0.5);
+                    // Approximate face index from mid direction
+                    let fi = face_index_approx(mid);
+                    let fill = Self::color(Self::heat_tint(base, s.face_heat[fi]));
+                    if let (Some(pa), Some(pb), Some(pc)) =
+                        (self.project(a), self.project(b), self.project(apex))
+                    {
+                        self.painter_shapes.push(Shape::convex_polygon(
+                            vec![pa, pb, pc],
+                            fill,
+                            Stroke::NONE,
+                        ));
+                    }
+                }
+            }
+            5 => {
+                // Dome: cylindrical lower + hemisphere
+                let r = w.min(d);
+                let wall_h = h * 0.45;
+                for i in 0..segs {
+                    let a0 = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                    let a1 = ((i + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+                    let band = ((a0 / std::f32::consts::FRAC_PI_2).floor() as usize) % 4;
+                    self.quad_fill(
+                        [
+                            Vec3::new(r * a0.cos(), 0.0, r * a0.sin()),
+                            Vec3::new(r * a1.cos(), 0.0, r * a1.sin()),
+                            Vec3::new(r * a1.cos(), wall_h, r * a1.sin()),
+                            Vec3::new(r * a0.cos(), wall_h, r * a0.sin()),
+                        ],
+                        Self::color(Self::heat_tint(base, s.face_heat[band])),
+                    );
+                    self.line3(
+                        Vec3::new(r * a0.cos(), 0.0, r * a0.sin()),
+                        Vec3::new(r * a0.cos(), wall_h, r * a0.sin()),
+                        wire,
+                    );
+                }
+                let lat_n = (segs / 3).max(4);
+                for j in 0..lat_n {
+                    let v0 = (j as f32 / lat_n as f32) * std::f32::consts::FRAC_PI_2;
+                    let v1 = ((j + 1) as f32 / lat_n as f32) * std::f32::consts::FRAC_PI_2;
+                    for i in 0..segs {
+                        let u0 = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                        let u1 = ((i + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+                        let p = |u: f32, v: f32| {
+                            Vec3::new(
+                                r * v.cos() * u.cos(),
+                                wall_h + r * v.sin() * (h - wall_h) / r.max(0.1) * 0.55,
+                                r * v.cos() * u.sin(),
+                            )
+                        };
+                        // Keep dome inside height
+                        let p00 = {
+                            let mut q = p(u0, v0);
+                            q.y = q.y.min(h);
+                            q
+                        };
+                        let p10 = {
+                            let mut q = p(u1, v0);
+                            q.y = q.y.min(h);
+                            q
+                        };
+                        let p11 = {
+                            let mut q = p(u1, v1);
+                            q.y = q.y.min(h);
+                            q
+                        };
+                        let p01 = {
+                            let mut q = p(u0, v1);
+                            q.y = q.y.min(h);
+                            q
+                        };
+                        self.quad_fill(
+                            [p00, p10, p11, p01],
+                            Self::color(Self::heat_tint(base, s.face_heat[5])),
+                        );
+                        if j == lat_n - 1 || i % 2 == 0 {
+                            self.line3(p00, p10, wire);
+                        }
+                    }
+                }
+            }
+            6 => {
+                // Tunnel: horizontal cylinder along Z
+                let r = w.min(h * 0.5);
+                let cy = r;
+                for zi in 0..=4 {
+                    let z = -d + 2.0 * d * (zi as f32 / 4.0);
+                    let mut prev = None;
+                    for i in 0..=segs {
+                        let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                        let p = Vec3::new(r * a.cos(), cy + r * a.sin(), z);
+                        if let Some(q) = prev {
+                            self.line3(q, p, wire);
+                        }
+                        prev = Some(p);
+                    }
+                }
+                for i in 0..segs {
+                    let a0 = (i as f32 / segs as f32) * std::f32::consts::TAU;
+                    let a1 = ((i + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+                    let band = ((a0 / std::f32::consts::FRAC_PI_2).floor() as usize) % 4;
+                    self.quad_fill(
+                        [
+                            Vec3::new(r * a0.cos(), cy + r * a0.sin(), -d),
+                            Vec3::new(r * a1.cos(), cy + r * a1.sin(), -d),
+                            Vec3::new(r * a1.cos(), cy + r * a1.sin(), d),
+                            Vec3::new(r * a0.cos(), cy + r * a0.sin(), d),
+                        ],
+                        Self::color(Self::heat_tint(base, s.face_heat[band])),
+                    );
+                }
+            }
+            _ => {
+                // Shoebox
+                let faces = [
+                    (
+                        [
+                            Vec3::new(w, 0.0, -d),
+                            Vec3::new(w, 0.0, d),
+                            Vec3::new(w, h, d),
+                            Vec3::new(w, h, -d),
+                        ],
+                        0usize,
+                    ),
+                    (
+                        [
+                            Vec3::new(-w, 0.0, -d),
+                            Vec3::new(-w, 0.0, d),
+                            Vec3::new(-w, h, d),
+                            Vec3::new(-w, h, -d),
+                        ],
+                        1,
+                    ),
+                    (
+                        [
+                            Vec3::new(-w, 0.0, d),
+                            Vec3::new(w, 0.0, d),
+                            Vec3::new(w, h, d),
+                            Vec3::new(-w, h, d),
+                        ],
+                        2,
+                    ),
+                    (
+                        [
+                            Vec3::new(-w, 0.0, -d),
+                            Vec3::new(w, 0.0, -d),
+                            Vec3::new(w, h, -d),
+                            Vec3::new(-w, h, -d),
+                        ],
+                        3,
+                    ),
+                    (
+                        [
+                            Vec3::new(-w, h, -d),
+                            Vec3::new(w, h, -d),
+                            Vec3::new(w, h, d),
+                            Vec3::new(-w, h, d),
+                        ],
+                        5,
+                    ),
+                ];
+                for (pts, fi) in faces {
+                    self.quad_fill(pts, Self::color(Self::heat_tint(base, s.face_heat[fi])));
+                    self.line3(pts[0], pts[1], wire);
+                    self.line3(pts[1], pts[2], wire);
+                    self.line3(pts[2], pts[3], wire);
+                    self.line3(pts[3], pts[0], wire);
+                }
+            }
+        }
+    }
+}
+
+fn face_index_approx(p: Vec3) -> usize {
+    if p.x.abs() > p.z.abs() {
+        if p.x > 0.0 { 0 } else { 1 }
+    } else if p.z > 0.0 {
+        2
+    } else {
+        3
     }
 }
 
@@ -251,19 +610,41 @@ impl SpatialBackend for EguiPainterBackend {
                         }));
                     }
                 }
+                SpatialCmd::Shell(s) => {
+                    self.submit_shell(&s);
+                }
                 SpatialCmd::Glyph(g) => {
                     if let Some(center) = self.project(g.pos) {
                         let col = Self::color(g.rgba.with_alpha(0.95));
                         let stroke = Stroke::new(1.4_f32 * self.dpi, col);
                         match g.kind {
                             GlyphKind::Source => {
-                                // Compact speaker: body + cone
+                                // Compact speaker: body + cone, oriented by world yaw
                                 let s = 5.0 * self.dpi;
+                                let tip_w = Vec3::new(
+                                    g.pos.x + g.yaw.sin() * 0.35,
+                                    g.pos.y,
+                                    g.pos.z + g.yaw.cos() * 0.35,
+                                );
+                                let (cos_a, sin_a) = if let Some(tip) = self.project(tip_w) {
+                                    let dx = tip.x - center.x;
+                                    let dy = tip.y - center.y;
+                                    let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+                                    (dx / len, dy / len)
+                                } else {
+                                    (1.0, 0.0)
+                                };
+                                let rot = |lx: f32, ly: f32| {
+                                    Pos2::new(
+                                        center.x + lx * cos_a - ly * sin_a,
+                                        center.y + lx * sin_a + ly * cos_a,
+                                    )
+                                };
                                 let body = [
-                                    Pos2::new(center.x - s * 0.9, center.y - s * 0.55),
-                                    Pos2::new(center.x - s * 0.15, center.y - s * 0.55),
-                                    Pos2::new(center.x - s * 0.15, center.y + s * 0.55),
-                                    Pos2::new(center.x - s * 0.9, center.y + s * 0.55),
+                                    rot(-s * 0.9, -s * 0.55),
+                                    rot(-s * 0.15, -s * 0.55),
+                                    rot(-s * 0.15, s * 0.55),
+                                    rot(-s * 0.9, s * 0.55),
                                 ];
                                 self.painter_shapes.push(Shape::convex_polygon(
                                     body.to_vec(),
@@ -272,10 +653,10 @@ impl SpatialBackend for EguiPainterBackend {
                                 ));
                                 self.painter_shapes.push(Shape::convex_polygon(
                                     vec![
-                                        Pos2::new(center.x - s * 0.1, center.y - s * 0.35),
-                                        Pos2::new(center.x + s * 1.1, center.y - s * 0.95),
-                                        Pos2::new(center.x + s * 1.1, center.y + s * 0.95),
-                                        Pos2::new(center.x - s * 0.1, center.y + s * 0.35),
+                                        rot(-s * 0.1, -s * 0.35),
+                                        rot(s * 1.1, -s * 0.95),
+                                        rot(s * 1.1, s * 0.95),
+                                        rot(-s * 0.1, s * 0.35),
                                     ],
                                     Self::color(g.rgba.with_alpha(0.55)),
                                     stroke,

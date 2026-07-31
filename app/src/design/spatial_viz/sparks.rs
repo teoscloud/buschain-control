@@ -26,9 +26,22 @@ pub fn push_glyph(
     rgba: Rgba,
     sort_key: f32,
 ) {
+    push_glyph_yaw(list, kind, pos, 0.0, bloom, rgba, sort_key);
+}
+
+pub fn push_glyph_yaw(
+    list: &mut SpatialDrawList,
+    kind: GlyphKind,
+    pos: Vec3,
+    yaw: f32,
+    bloom: f32,
+    rgba: Rgba,
+    sort_key: f32,
+) {
     list.push(SpatialCmd::Glyph(GlyphCmd {
         kind,
         pos,
+        yaw,
         bloom,
         rgba,
         sort_key,

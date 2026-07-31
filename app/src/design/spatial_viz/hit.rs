@@ -1,4 +1,5 @@
 use super::draw_list::{MeshKind, SpatialCmd, SpatialDrawList};
+use super::frame::SpatialFrame;
 use super::math::Vec3;
 
 #[derive(Clone, Copy, Debug)]
@@ -23,9 +24,37 @@ pub struct SpatialHit {
     pub point: Vec3,
 }
 
+/// Camera ray through a normalized screen point in [-1,1] NDC (y up).
+pub fn camera_ray(frame: &SpatialFrame, ndc_x: f32, ndc_y: f32) -> SpatialRay {
+    let eye = frame.camera.eye;
+    let target = frame.camera.target;
+    let up = frame.camera.up;
+    let f = (target - eye).normalize();
+    let s = f.cross(up).normalize();
+    let u = s.cross(f);
+    let tan = (frame.camera.fovy_deg.to_radians() * 0.5).tan();
+    let aspect = frame.viewport.aspect();
+    let dir = (f + s * (ndc_x * tan * aspect) + u * (ndc_y * tan)).normalize();
+    SpatialRay { origin: eye, dir }
+}
+
+/// Intersect ray with y = plane_y floor; returns world point if hit in front.
+pub fn intersect_floor(ray: SpatialRay, plane_y: f32) -> Option<Vec3> {
+    if ray.dir.y.abs() < 1e-6 {
+        return None;
+    }
+    let t = (plane_y - ray.origin.y) / ray.dir.y;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(ray.origin + ray.dir * t)
+}
+
 /// CPU raycast against draw-list geometry (works for both backends).
+/// Glyphs win over walls when both are near the ray.
 pub fn pick(list: &SpatialDrawList, ray: SpatialRay) -> Option<SpatialHit> {
-    let mut best: Option<SpatialHit> = None;
+    let mut best_wall: Option<SpatialHit> = None;
+    let mut best_glyph: Option<SpatialHit> = None;
     for cmd in &list.cmds {
         match cmd {
             SpatialCmd::Mesh(m) if matches!(m.kind, MeshKind::Box | MeshKind::Plane) => {
@@ -39,8 +68,8 @@ pub fn pick(list: &SpatialDrawList, ray: SpatialRay) -> Option<SpatialHit> {
                         t,
                         point,
                     };
-                    if best.as_ref().map(|b| t < b.t).unwrap_or(true) {
-                        best = Some(hit);
+                    if best_wall.as_ref().map(|b| t < b.t).unwrap_or(true) {
+                        best_wall = Some(hit);
                     }
                 }
             }
@@ -49,7 +78,8 @@ pub fn pick(list: &SpatialDrawList, ray: SpatialRay) -> Option<SpatialHit> {
                 let t = d.dot(ray.dir);
                 if t > 0.0 {
                     let closest = ray.origin + ray.dir * t;
-                    if (closest - g.pos).length() < 0.25 {
+                    // Slightly generous for floor-drag UX.
+                    if (closest - g.pos).length() < 0.38 {
                         let kind = match g.kind {
                             super::draw_list::GlyphKind::Source => SpatialHitKind::Source,
                             super::draw_list::GlyphKind::Listener => SpatialHitKind::Listener,
@@ -60,8 +90,8 @@ pub fn pick(list: &SpatialDrawList, ray: SpatialRay) -> Option<SpatialHit> {
                             t,
                             point: g.pos,
                         };
-                        if best.as_ref().map(|b| t < b.t).unwrap_or(true) {
-                            best = Some(hit);
+                        if best_glyph.as_ref().map(|b| t < b.t).unwrap_or(true) {
+                            best_glyph = Some(hit);
                         }
                     }
                 }
@@ -69,7 +99,7 @@ pub fn pick(list: &SpatialDrawList, ray: SpatialRay) -> Option<SpatialHit> {
             _ => {}
         }
     }
-    best
+    best_glyph.or(best_wall)
 }
 
 fn ray_aabb(ray: SpatialRay, min: Vec3, max: Vec3) -> Option<f32> {
