@@ -10,15 +10,17 @@ Stubs (unstyled): [`packaging/quickshell/`](../packaging/quickshell/).
 ## Architecture
 
 ```
-Waybar pill (status + click)
+Waybar pill / tray left-click / buschain-ctl popup
         │
         ▼
-buschain-ctl popup ──► daemon popup_playback
+daemon popup_playback ──► popup_launch
                             │
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
-         Quickshell      GTK mixer      egui
-         (preferred)     (fallback)   (last)
+         Quickshell      GTK mixer     egui popup
+         (Quant /        (general      (last resort)
+          opted in)       desktop
+                          layer-shell)
 
 QS scroll strip ──poke──► adjust_hw_volume ──► RTMIN+9 → Waybar pill
 ```
@@ -41,10 +43,11 @@ chmod +x ~/.config/quickshell/scripts/qs-mixer-toggle.sh
 Popup order (`popup_launch`):
 
 1. Quickshell — if `BUSCHAIN_CONTROL_QS_MIXER=1`, **or** toggle script exists, **or** `qs` on PATH
-2. GTK — unless `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`
-3. egui — `buschain-control --popup`
+2. GTK layer-shell — when `buschain-mixer-gtk` is available (opt out: `USE_GTK_MIXER=0`)
+3. egui — `buschain-control --popup` (last resort)
 
-Strip: GTK strip is **not** spawned when `BUSCHAIN_CONTROL_QS_STRIP=1` or `BUSCHAIN_CONTROL_QS_MIXER=1`. Hard off: `BUSCHAIN_CONTROL_SCROLL_STRIP=0`.
+Strip: GTK strip is **opt-in** (`BUSCHAIN_CONTROL_SCROLL_STRIP=1`). Not spawned when
+`BUSCHAIN_CONTROL_QS_STRIP=1` or `BUSCHAIN_CONTROL_QS_MIXER=1` (QS owns the hit target).
 
 ---
 

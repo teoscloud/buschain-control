@@ -17,7 +17,7 @@
 
 **Process model:** one `buschain-control` process owns the graph
 (in-process worker + coalesce). On startup it binds
-`$XDG_RUNTIME_DIR/buschain-control/daemon.sock` and forwards ctl/waybar/GTK mixer
+`$XDG_RUNTIME_DIR/buschain-control/daemon.sock` and forwards ctl/waybar/egui mixer
 commands into the same worker. Close hides to tray; Quit tears the graph down.
 Hyprland: `exec-once = buschain-control --hidden`. Do **not** run a separate
 `buschain-daemon` unit — that forces a laggy thin-client hop.

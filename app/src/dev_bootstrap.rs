@@ -202,6 +202,7 @@ pub fn run() {
     {
         env::set_var("BUSCHAIN_CONTROL_MIXER_CSS", &mixer_css);
     }
+    // Prefer GTK layer-shell popup when the checkout mixer is on PATH (QS still wins).
     if env::var_os("BUSCHAIN_CONTROL_USE_GTK_MIXER").is_none() {
         env::set_var("BUSCHAIN_CONTROL_USE_GTK_MIXER", "1");
     }

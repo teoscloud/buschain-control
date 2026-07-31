@@ -22,7 +22,7 @@ fn main() -> eframe::Result<()> {
                (default)        in-process graph + embedded IPC for ctl/waybar\n\
                --hidden         tray only — no window until Show (autostart)\n\
                --daemon-client  debug: attach to external buschain-daemon\n\
-               --popup [playback]  small playback popup\n\n\
+               --popup [playback]  compact QS-like mixer popup\n\n\
                Dev: `cargo run` / `cargo run -- --hidden` bootstraps plugins + buschain-ctl.\n"
         );
         std::process::exit(0);
@@ -104,13 +104,8 @@ fn main() -> eframe::Result<()> {
 }
 
 fn run_popup(args: &[String]) -> eframe::Result<()> {
-    // Direct `buschain-control --popup`: prefer GTK panel when packaged / on PATH.
-    // Tray / ctl / waybar go through `popup_launch::spawn_mixer_popup` (same order).
-    // Do not call spawn_mixer_popup here — its egui fallback re-execs --popup.
-    if buschain_control::popup_launch::try_gtk_mixer() {
-        std::process::exit(0);
-    }
-
+    // Direct egui popup only. Tray / ctl / waybar use
+    // `popup_launch::spawn_mixer_popup` (QS → GTK → egui).
     let _tab = args
         .windows(2)
         .find(|w| w[0] == "--popup" || w[0] == "popup")
@@ -119,9 +114,9 @@ fn run_popup(args: &[String]) -> eframe::Result<()> {
 
     let icon = window_icon();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([440.0, 560.0])
-        .with_min_inner_size([320.0, 280.0])
-        .with_title("BusChain Control — Mixer")
+        .with_inner_size([480.0, 560.0])
+        .with_min_inner_size([360.0, 320.0])
+        .with_title("BusChain Mixer")
         .with_decorations(true)
         .with_always_on_top()
         .with_app_id("buschain-control-popup");
@@ -209,6 +204,12 @@ impl eframe::App for BusChainApp {
 
         // Always tick (levels / worker) — keeps the graph responsive while hidden.
         self.state.tick();
+
+        // Tray left-click mixer popup (works while withdrawn).
+        if self.state.mixer_popup_open {
+            self.state.theme.apply_egui(ctx);
+            ui::draw_embedded_popup(ctx, &mut self.state);
+        }
 
         if self.withdrawn {
             if self.runtime.is_live() {

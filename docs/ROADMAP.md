@@ -25,7 +25,7 @@
 
 - [x] In-process graph ownership (no auto-attach thin client)
 - [x] Embedded IPC inside tray UI
-- [x] StatusNotifier tray (Show / Hide / Mixer / Quit)
+- [x] StatusNotifier tray (left-click popup · Open full app / Hide / Quit)
 - [x] Hyprland `exec-once = buschain-control --hidden`
 - [x] Drop systemd `buschain-daemon` user unit
 
@@ -37,6 +37,11 @@
 - [x] Gen-swap structural edits (no A/B helpers, no `pipewire -c`)
 - [x] Click-free bypass fades, denormals FTZ/DAZ, xrun counters, latency publish
 - [x] Retire Props FX / `.sig` / dual-helper A/B cutover
+
+## Desktop popup
+
+- [x] Popup order: Quickshell → GTK layer-shell → egui last resort
+- [ ] GTK scroll strip remains opt-in (`SCROLL_STRIP=1`); QS strip for Quant
 
 ## Done (DAW apex v2)
 

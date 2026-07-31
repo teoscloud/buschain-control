@@ -122,17 +122,25 @@ def ctl(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def fetch_state() -> dict:
+    """Prefer aggregate `mixer` JSON (QS contract); fall back to older list ops."""
     t0 = time.monotonic()
-    r = ctl("devices", "list")
-    if r.returncode != 0 or not r.stdout.strip():
-        r = ctl("playback", "list")
-    _lat(f"fetch_state {int((time.monotonic() - t0) * 1000)}ms rc={r.returncode}")
-    if r.returncode != 0 or not r.stdout.strip():
-        return {}
-    try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return {}
+    for args in (("mixer",), ("devices", "list"), ("playback", "list")):
+        r = ctl(*args)
+        if r.returncode != 0 or not r.stdout.strip():
+            continue
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and (
+            "streams" in data or "tracks" in data or "status" in data or "sinks" in data
+        ):
+            _lat(
+                f"fetch_state {args[0]} {int((time.monotonic() - t0) * 1000)}ms"
+            )
+            return data
+    _lat(f"fetch_state fail {int((time.monotonic() - t0) * 1000)}ms")
+    return {}
 
 
 def load_favorites() -> list[str]:
@@ -965,6 +973,7 @@ class Mixer(Gtk.Window):
         on_fav=None,
         badge: str | None = None,
         vol_max: float = VOL_MAX,
+        readout_db: bool = False,
     ) -> Gtk.Box:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         card.get_style_context().add_class("stream-card")
@@ -1003,12 +1012,17 @@ class Mixer(Gtk.Window):
         fader_row.pack_start(scale, False, False, 0)
         card.pack_start(fader_row, True, True, 0)
 
-        # Live volume % (updates on drag + daemon refresh) — replaces the old side meter.
-        pct = Gtk.Label(label=f"{int(min(vol_ui, vol_max))}%", xalign=0.5)
+        def _fmt(ui_v: float) -> str:
+            if readout_db:
+                db = ui_to_db(ui_v)
+                return "0dB" if abs(db) < 0.05 else f"{db:+.0f}dB"
+            return f"{int(min(ui_v, vol_max))}%"
+
+        pct = Gtk.Label(label=_fmt(min(vol_ui, vol_max)), xalign=0.5)
         pct.get_style_context().add_class("stream-pct")
         scale.connect(
             "value-changed",
-            lambda sc, lab: lab.set_text(f"{int(sc.get_value())}%"),
+            lambda sc, lab: lab.set_text(_fmt(sc.get_value())),
             pct,
         )
         card.pack_start(pct, False, False, 0)
@@ -1076,16 +1090,26 @@ class Mixer(Gtk.Window):
             lab.get_style_context().add_class("empty")
             hw.pack_start(lab, True, True, 0)
         else:
-            title = Gtk.Label(label="Output", xalign=0)
+            hw_title = (
+                st.get("master_hw_desc")
+                or st.get("master_hw")
+                or "Master HW"
+            )
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            title = Gtk.Label(label=str(hw_title), xalign=0)
             title.get_style_context().add_class("hw-label")
-            hw.pack_start(title, False, False, 0)
+            title.set_ellipsize(Pango.EllipsizeMode.END)
+            badge = Gtk.Label(label="Master HW")
+            badge.get_style_context().add_class("stream-meta")
+            head.pack_start(title, True, True, 0)
+            head.pack_end(badge, False, False, 0)
+            hw.pack_start(head, False, False, 0)
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             scale = Gtk.Scale.new_with_range(
                 Gtk.Orientation.HORIZONTAL, 0, HW_VOL_MAX, 1
             )
             scale.set_value(min(hw_pct, int(HW_VOL_MAX)))
-            scale.set_draw_value(True)
-            scale.set_value_pos(Gtk.PositionType.RIGHT)
+            scale.set_draw_value(False)
             scale.get_style_context().add_class("horizontal")
             # Relative up/down scroll — never racing absolute set from the wheel.
             _bind_master_hw_scroll(scale, row, self._apply_hw_notches)
@@ -1137,6 +1161,7 @@ class Mixer(Gtk.Window):
                 on_mute=lambda btn, i=tid: self._on_track_mute(btn, i),
                 favorited=True,
                 badge="track",
+                readout_db=True,
             )
             streams.pack_start(card, False, False, 0)
 
@@ -1179,7 +1204,8 @@ class Mixer(Gtk.Window):
             try:
                 vol = db_to_ui(float(t.get("gain_db") or 0))
                 w["scale"].set_value(vol)
-                w["pct"].set_text(f"{int(vol)}%")
+                db = float(t.get("gain_db") or 0)
+                w["pct"].set_text("0dB" if abs(db) < 0.05 else f"{db:+.0f}dB")
                 w["mute"].set_active(bool(t.get("mute")))
                 _set_mute_icon(w["mute"])
             finally:
@@ -1202,14 +1228,22 @@ class Mixer(Gtk.Window):
                 self._building = False
 
     def _rebuild_tracks(self) -> None:
-        tracks = self._tracks_cache
+        # Favorites leftmost (same as Playback / egui), then remaining session tracks.
+        fav_order = {pid: i for i, pid in enumerate(self._favorites)}
+        tracks = sorted(
+            self._tracks_cache,
+            key=lambda t: (
+                0 if str(t.get("id")) in fav_order else 1,
+                fav_order.get(str(t.get("id")), 0),
+            ),
+        )
         fp = tuple(
             (
                 t.get("id"),
                 t.get("name"),
                 round(float(t.get("gain_db") or 0), 2),
                 bool(t.get("mute")),
-                t.get("id") in self._favorites,
+                str(t.get("id")) in self._favorites,
             )
             for t in tracks
         )
@@ -1219,7 +1253,7 @@ class Mixer(Gtk.Window):
         self._clear(self.tracks_box)
 
         hint = Gtk.Label(
-            label="Star a track to show it on Playback for quick gain.",
+            label="Star a track to pin it on Playback (leftmost).",
             xalign=0,
         )
         hint.get_style_context().add_class("section-hint")
@@ -1267,6 +1301,7 @@ class Mixer(Gtk.Window):
                 favorited=starred,
                 on_fav=lambda btn, i=tid: self._on_fav_toggle(btn, i),
                 badge="Master" if kind == "master" else "Track",
+                readout_db=True,
             )
             strips.pack_start(card, False, False, 0)
 
@@ -1330,14 +1365,31 @@ class Mixer(Gtk.Window):
             top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             # Titles only — never dump alsa/node codenames into the UI.
-            title = Gtk.Label(label=d.get("desc") or d.get("name") or "Device", xalign=0)
+            desc = (d.get("desc") or "").strip()
+            name_raw = (d.get("name") or "").strip()
+            title_txt = desc if desc and desc != name_raw else "Device"
+            if name_raw.startswith("buschain_"):
+                for t in self._tracks_cache:
+                    if (t.get("bus") or "") == name_raw:
+                        title_txt = (
+                            "Master"
+                            if t.get("kind") == "master"
+                            else (t.get("name") or title_txt)
+                        )
+                        break
+                else:
+                    if title_txt in ("Device", name_raw):
+                        title_txt = "BusChain"
+            title = Gtk.Label(label=title_txt, xalign=0)
             title.get_style_context().add_class("device-title")
             title.set_ellipsize(Pango.EllipsizeMode.END)
             badges = []
             if d.get("is_default"):
                 badges.append("Default")
             if kind == "sink" and d.get("is_master"):
-                badges.append("HW out")
+                badges.append("Master HW")
+            if d.get("is_virtual"):
+                badges.append("Virtual")
             if badges:
                 meta = Gtk.Label(label=" · ".join(badges), xalign=0)
                 meta.get_style_context().add_class("device-meta")
@@ -1401,8 +1453,7 @@ class Mixer(Gtk.Window):
                 if "hw_mute" in st:
                     muted = bool(st.get("hw_mute"))
             scale.set_value(min(vol_pct, int(HW_VOL_MAX)))
-            scale.set_draw_value(True)
-            scale.set_value_pos(Gtk.PositionType.RIGHT)
+            scale.set_draw_value(False)
             scale.get_style_context().add_class("horizontal")
             is_master_hw = kind == "sink" and bool(d.get("is_master"))
             if is_master_hw:

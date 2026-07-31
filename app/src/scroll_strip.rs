@@ -18,11 +18,9 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
-fn strip_disabled() -> bool {
-    matches!(
-        std::env::var("BUSCHAIN_CONTROL_SCROLL_STRIP").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE") | Ok("off") | Ok("OFF") | Ok("no") | Ok("NO")
-    )
+/// GTK scroll strip is opt-in (`BUSCHAIN_CONTROL_SCROLL_STRIP=1`). QS strip unchanged.
+fn strip_enabled() -> bool {
+    env_truthy("BUSCHAIN_CONTROL_SCROLL_STRIP")
 }
 
 /// Quickshell owns the Master HW hit target — do not spawn the GTK strip.
@@ -105,15 +103,15 @@ fn kill_existing_strip() {
 
 /// Spawn the scroll strip after IPC is up (non-blocking).
 pub fn spawn_scroll_strip_async() {
-    if strip_disabled() {
-        return;
-    }
     if qs_owns_strip() {
         // Reap any leftover GTK strip so QS can own the hit target cleanly.
         thread::spawn(|| {
             kill_existing_strip();
             eprintln!("buschain-control: scroll strip → Quickshell (BUSCHAIN_CONTROL_QS_STRIP)");
         });
+        return;
+    }
+    if !strip_enabled() {
         return;
     }
     thread::spawn(|| {

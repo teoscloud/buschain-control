@@ -93,8 +93,12 @@ pub struct AppState {
     /// Settings → Session "Save as…" draft.
     pub session_save_as_open: bool,
     pub session_save_as_name: String,
-    /// Compact overlay window (waybar / tray popup).
+    /// Compact overlay window (`buschain-control --popup` process).
     pub popup_mode: bool,
+    /// In-process QS-like mixer popup (tray left-click while UI is running).
+    pub mixer_popup_open: bool,
+    /// Popup tab: 0 Playback · 1 Tracks · 2 Output · 3 Input.
+    pub mixer_popup_tab: u8,
     /// Set by Settings → Quit (window close only hides).
     pub request_quit: bool,
     /// Tray / IPC asked to show the main window.
@@ -207,6 +211,8 @@ impl AppState {
             session_save_as_open: false,
             session_save_as_name: String::new(),
             popup_mode: false,
+            mixer_popup_open: false,
+            mixer_popup_tab: 0,
             request_quit: false,
             request_show: false,
             request_hide: false,

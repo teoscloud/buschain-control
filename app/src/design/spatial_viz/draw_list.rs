@@ -85,11 +85,13 @@ pub struct GlyphCmd {
 /// Room shell — room_type matches BusChain Room LADSPA enum (0–6).
 /// `half_extents`: (half_width, half_height, half_depth); floor at y=0, roof at y=2*hy.
 /// `face_heat`: 0–1 energy per face (+X −X +Z −Z floor roof / band proxies).
+/// `heat_anchor`: source position for within-face falloff (hot near speakers).
 #[derive(Clone, Debug)]
 pub struct ShellCmd {
     pub room_type: u8,
     pub half_extents: Vec3,
     pub face_heat: [f32; 6],
+    pub heat_anchor: Vec3,
     pub material: SpatialMaterial,
     pub segments: u8,
     pub sort_key: f32,

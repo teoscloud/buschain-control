@@ -1,13 +1,17 @@
-# BusChain scroll strip
+# BusChain scroll strip — **deprecated** (opt-in)
 
-Always-on transparent **GtkLayerShell** hit target that owns Master HW
-hover-scroll. Waybar custom `on-scroll-*` cannot do 1:1 notches (SMOOTH
-magnitude is discarded after one forkExec).
+Transparent **GtkLayerShell** hit target for Master HW hover-scroll. Prefer
+Quickshell strip when rice-enabled (`BUSCHAIN_CONTROL_QS_STRIP=1`), or skip
+strip entirely and use the tray / egui popup for volume.
+
+Waybar custom `on-scroll-*` cannot do 1:1 notches (SMOOTH magnitude is discarded
+after one forkExec) — this strip existed to fix that.
 
 ## Lifecycle
 
-Started by the tray (`buschain-control --hidden`) when IPC comes up.
-Disable: `BUSCHAIN_CONTROL_SCROLL_STRIP=0`.
+**Opt-in:** set `BUSCHAIN_CONTROL_SCROLL_STRIP=1`. The tray does **not** spawn
+the GTK strip by default. Quickshell still claims the hit target when
+`BUSCHAIN_CONTROL_QS_STRIP=1` or `BUSCHAIN_CONTROL_QS_MIXER=1` (reaps leftover GTK).
 
 ## Geometry
 

@@ -56,9 +56,9 @@ Standalone Nix flake — build and run from this repository.
 
 ### Desktop shell
 
-- Tray icon (Show / Hide / Quit)
-- Waybar pill + Master HW scroll (GTK strip or Quickshell; hard-capped at 100%)
-- Mixer popup: Quickshell (auto / env) → GTK layer-shell → egui `--popup` fallback
+- Tray icon (left-click popup · Open full app / Hide / Quit)
+- Waybar pill optional; Master HW scroll via Quickshell strip or opt-in GTK strip
+- Mixer popup: Quickshell (opt-in) → GTK layer-shell → egui `--popup` last
 
 ### Sessions
 
@@ -72,10 +72,10 @@ Standalone Nix flake — build and run from this repository.
 
 | Surface | Role |
 |---------|------|
-| **Full egui window** | Mixer, Playback, Recording, Output/Input devices, MIDI, Settings |
-| **GTK layer-shell panel** | Default waybar / tray mixer popup (`buschain-mixer-gtk`) |
-| **egui `--popup`** | Fallback popup if GTK is unavailable / disabled |
-| **Quickshell mixer + strip** | Optional — see [`HANDOVER-QUICKSHELL.md`](HANDOVER-QUICKSHELL.md) |
+| **Full egui window** | Mixer, Playback, Recording, Output/Input devices, MIDI, Settings (tray menu) |
+| **Quickshell mixer + strip** | Preferred for Quant / Hyprland — see [`HANDOVER-QUICKSHELL.md`](HANDOVER-QUICKSHELL.md) |
+| **GTK layer-shell panel** | General-desktop tray/bar popup (QS-like tabs) when `buschain-mixer-gtk` is available |
+| **egui `--popup`** | Last-resort mixer when QS/GTK are unavailable |
 
 ---
 
@@ -199,36 +199,34 @@ forkExec). Do **not** put `hw-vol up|down` on the Waybar module.
 ```bash
 buschain-ctl status
 buschain-ctl hw-vol get|set <pct>|up|down|mute toggle
-buschain-waybar popup          # click → GTK / egui
+buschain-waybar popup          # click → QS → GTK → egui
 ```
 
 Scroll strip geometry: [`packaging/scroll-strip/README.md`](../packaging/scroll-strip/README.md).
-Disable: `BUSCHAIN_CONTROL_SCROLL_STRIP=0`.
+GTK strip opt-in: `BUSCHAIN_CONTROL_SCROLL_STRIP=1`.
 
 ---
 
 ## Waybar + mixer popup
 
-**Start tray → paste module → done.** BusChain owns ctl, IPC, Master HW scroll
-strip, and the GTK modal. Your rice only merges the Waybar module entry (CSS
-optional). This project never writes `~/.config/waybar`. Home Manager is
-**optional** (bins on PATH). Snippets: [`packaging/waybar/`](../packaging/waybar/).
+**Start tray → optional Waybar pill.** BusChain owns ctl + IPC. Tray / pill
+click uses **QS → GTK → egui**. Snippets: [`packaging/waybar/`](../packaging/waybar/).
 
 ### Behavior
 
 | Action | Behavior |
 |--------|----------|
 | Status pill | `buschain-ctl status` → Master HW % (interval + RTMIN+9) |
-| Scroll | BusChain scroll strip → N× `AdjustHwVolume` (±5%, cap 100%) |
-| Click | Strip or module → mixer popup (GTK default, egui fallback) |
+| Scroll | QS strip or opt-in GTK strip → `AdjustHwVolume` (±5%, cap 100%) |
+| Click | Module / tray → mixer popup (QS → GTK → egui) |
 
-Click path: `buschain-waybar popup` → `buschain-ctl popup` → tray → GTK → egui `--popup`.
+Click path: `buschain-waybar popup` → `buschain-ctl popup` → QS → GTK → egui `--popup`.
 
 ### Checklist
 
-1. Tray running (`cargo run -- --hidden`) — starts scroll strip
+1. Tray running (`cargo run -- --hidden`)
 2. Paste `custom/buschain-control` from [`packaging/waybar/module.jsonc`](../packaging/waybar/module.jsonc) (**no** `on-scroll-*`)
-3. Align strip with the pill if needed (`BUSCHAIN_CONTROL_SCROLL_*` env)
+3. Optional: `BUSCHAIN_CONTROL_SCROLL_STRIP=1` + align `BUSCHAIN_CONTROL_SCROLL_*` if using legacy GTK strip
 4. Pill CSS optional; restart Waybar after config/CSS edits
 
 ### Module (waybar `config`)
@@ -340,12 +338,12 @@ Reference snippets also ship at `$out/share/buschain-control/waybar/`.
 | Priority | Surface | Enable |
 |----------|---------|--------|
 | 1 | Quickshell mixer | `BUSCHAIN_CONTROL_QS_MIXER=1`, toggle script, or `qs` on PATH |
-| 2 | GTK layer-shell | default when `buschain-mixer-gtk` is available |
-| 3 | egui `--popup` | fallback |
+| 2 | GTK layer-shell | `buschain-mixer-gtk` available (opt out: `USE_GTK_MIXER=0`) |
+| 3 | egui `--popup` | last resort |
 
-Opt out of GTK: `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`.  
-Force GTK over QS auto-detect: `BUSCHAIN_CONTROL_USE_GTK_MIXER=1`.  
-Skip GTK scroll strip when QS owns it: `BUSCHAIN_CONTROL_QS_STRIP=1`.  
+Opt out of GTK popup: `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`.  
+Opt in GTK scroll strip: `BUSCHAIN_CONTROL_SCROLL_STRIP=1`.  
+Skip GTK strip when QS owns it: `BUSCHAIN_CONTROL_QS_STRIP=1`.  
 Override mixer binary: `BUSCHAIN_CONTROL_MIXER=/path/to/buschain-mixer-gtk`.  
 Quant handover: [`HANDOVER-QUICKSHELL.md`](HANDOVER-QUICKSHELL.md) · stubs in [`packaging/quickshell/`](../packaging/quickshell/).
 
@@ -355,10 +353,10 @@ Quant handover: [`HANDOVER-QUICKSHELL.md`](HANDOVER-QUICKSHELL.md) · stubs in [
 |---------|-----|
 | `vol —` / class `offline` | Start tray; check socket exists |
 | Click does nothing | `on-click` → `buschain-waybar popup` and tray running |
-| Click OK, no panel | Use packaged/`nix develop` mixer (system python often lacks `gi`) |
+| Click OK, no panel | Tray running; GTK needs `gi` + layer-shell (`nix develop`); else egui `--popup` |
 | Scroll works, status stale | `signal: 9`; tray sends RTMIN+9; restart tray + Waybar |
-| Scroll skips / need to spam wheel | Remove Waybar `on-scroll-*`. Confirm tray log `scroll strip → …`. Align `BUSCHAIN_CONTROL_SCROLL_*` over the pill. |
-| No scroll / strip missing | `nix develop` + rebuild tray; `BUSCHAIN_CONTROL_SCROLL_STRIP` must not be `0` |
+| Scroll skips / need to spam wheel | Remove Waybar `on-scroll-*`. Prefer QS strip; legacy GTK needs `SCROLL_STRIP=1` + align geometry. |
+| No scroll / strip missing | Expected unless `SCROLL_STRIP=1` or QS strip; set env and rebuild tray |
 | ctl / helper not found | Build ctl (`cargo build -p buschain-tools --bin buschain-ctl`); absolute path for bare Waybar PATH |
 | VST3 editor tiled (Hyprland) | Ensure `hyprctl` works; add the optional `windowrulev2` above |
 | VST3 missing `.so` | Expand `vst3PluginRuntimeLibs` in `flake.nix` |
@@ -381,9 +379,9 @@ command -v buschain-plugin-surface
 | `BUSCHAIN_SANDBOX_ALL` | Sandbox all non-trusted inserts |
 | `BUSCHAIN_SANDBOX_PLUGINS` | CSV of plugin keys to sandbox |
 | `BUSCHAIN_CONTROL_SKIP_BOOTSTRAP` | Skip debug bootstrap on `cargo run` |
-| `BUSCHAIN_CONTROL_USE_GTK_MIXER` | `0` disables GTK popup |
+| `BUSCHAIN_CONTROL_USE_GTK_MIXER` | `0` disables GTK popup (default on when packaged) |
 | `BUSCHAIN_CONTROL_MIXER` | Override GTK mixer binary |
-| `BUSCHAIN_CONTROL_SCROLL_STRIP` | `0` disables Master HW scroll strip |
+| `BUSCHAIN_CONTROL_SCROLL_STRIP` | `1` enables legacy GTK Master HW scroll strip (default off) |
 | `BUSCHAIN_CONTROL_SCROLL_STRIP_BIN` | Path to scroll-strip launcher |
 | `BUSCHAIN_CONTROL_SCROLL_ANCHOR` | `left` / `right` (strip over pill) |
 | `BUSCHAIN_CONTROL_SCROLL_MARGIN_TOP` / `_MARGIN_X` / `_WIDTH` / `_HEIGHT` | Strip geometry (px) |

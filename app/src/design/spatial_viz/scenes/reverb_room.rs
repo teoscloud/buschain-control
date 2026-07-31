@@ -312,41 +312,41 @@ fn derive_heat(p: &ReverbRoomParams, he: Vec3, src: Vec3, lst: Vec3) -> [f32; 6]
     if p.wall_heat.iter().any(|v| *v > 1e-4) {
         return p.wall_heat;
     }
+    let w = he.x;
+    let h = he.y;
+    let d = he.z;
+    // Face centers — proximity to source dominates (sparse, readable hotspots).
+    let centers = [
+        Vec3::new(w, h, 0.0),
+        Vec3::new(-w, h, 0.0),
+        Vec3::new(0.0, h, d),
+        Vec3::new(0.0, h, -d),
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, h * 2.0, 0.0),
+    ];
     let mut heat = [0.0f32; 6];
-    let n = 4 + (p.er_level * 8.0).round() as usize;
-    for i in 0..n.min(12) {
+    for (i, c) in centers.iter().enumerate() {
+        let ds = (*c - src).length();
+        let dl = (*c - lst).length();
+        heat[i] = 1.35 / (0.12 + ds * 0.85) + 0.55 / (0.18 + dl * 0.55);
+    }
+    // Bounce hits as a lighter secondary (won't flatten proximity contrast).
+    let n = 3 + (p.er_level * 5.0).round() as usize;
+    for i in 0..n.min(8) {
         let b = shell_bounce(p.room_type, he, src, i, p.er_level);
         let fi = face_index(p.room_type, he, b);
         let dist = (b - src).length() + (lst - b).length();
-        let e = (p.er_level * 0.9 + p.diffusion * 0.2) / (0.4 + dist * 0.22);
-        heat[fi] += e;
+        heat[fi] += 0.35 * (p.er_level * 0.8 + 0.15) / (0.5 + dist * 0.3);
     }
-    // Prox bias only when clearly near a face (keeps far walls cool).
-    let near = [
-        (1.0 - (he.x - src.x).abs() / he.x.max(0.1)).clamp(0.0, 1.0),
-        (1.0 - (he.x + src.x).abs() / he.x.max(0.1)).clamp(0.0, 1.0),
-        (1.0 - (he.z - src.z).abs() / he.z.max(0.1)).clamp(0.0, 1.0),
-        (1.0 - (he.z + src.z).abs() / he.z.max(0.1)).clamp(0.0, 1.0),
-        (1.0 - src.y / (he.y * 2.0).max(0.1)).clamp(0.0, 1.0) * 0.35,
-        (src.y / (he.y * 2.0).max(0.1)).clamp(0.0, 1.0) * 0.25,
-    ];
-    for (j, n) in near.iter().enumerate() {
-        let w = (*n - 0.55).max(0.0) / 0.45; // only close proximity
-        heat[j] += w * w * (0.2 + p.er_level * 0.45);
-    }
-    let late = (p.rt60 / 12.0) * (0.15 + p.diffusion * 0.3) * (0.3 + p.mix);
-    let peak = heat.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
-    for h in &mut heat {
-        if *h > peak * 0.35 {
-            *h += late * (*h / peak) * 0.2;
-        }
-    }
-    // Peak-normalize (not min–max): cool faces stay near 0, hottest → 1.
-    // Power > 1 compresses mids so concentration reads as sparse hot spots.
     let max_h = heat.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+    // Winner-take-more: below ~half of peak → nearly cool; peaks stay hot.
     for h in &mut heat {
         let t = (*h / max_h).clamp(0.0, 1.0);
-        *h = t.powf(1.65);
+        *h = if t < 0.5 {
+            (t / 0.5).powf(2.4) * 0.12
+        } else {
+            0.12 + ((t - 0.5) / 0.5).powf(0.75) * 0.88
+        };
     }
     heat
 }
@@ -381,16 +381,16 @@ impl SpatialScene for ReverbRoomScene {
             VizQuality::Essential => 12,
         };
 
-        // Floor (hit target + grid base)
+        // Floor (hit target) — keep cool; shell panels carry the heatmap.
         mesh::push_plane(
             &mut list,
             SpatialMeshId(1),
             Vec3::new(0.0, 0.0, 0.0),
             Vec3::new(w * 2.0, 0.02, d * 2.0),
             SpatialMaterial {
-                albedo: wall_albedo.scale_rgb(0.7).with_alpha(0.45),
+                albedo: wall_albedo.scale_rgb(0.55).with_alpha(0.18),
                 roughness: 0.9,
-                emission: heat[4] * 0.15,
+                emission: 0.0,
                 absorption: abs_lo,
             },
             12.0,
@@ -401,10 +401,11 @@ impl SpatialScene for ReverbRoomScene {
             p.room_type,
             he,
             heat,
+            src,
             SpatialMaterial {
-                albedo: wall_albedo.with_alpha(0.32 + sheen * 0.15),
+                albedo: wall_albedo.with_alpha(0.14 + sheen * 0.08),
                 roughness: 0.75,
-                emission: sheen * 0.05,
+                emission: 0.0,
                 absorption: (abs_lo + abs_hi) * 0.5,
             },
             segs,

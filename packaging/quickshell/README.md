@@ -15,9 +15,8 @@ Full contract: [`docs/HANDOVER-QUICKSHELL.md`](../../docs/HANDOVER-QUICKSHELL.md
 
 ```bash
 export BUSCHAIN_CONTROL_QS_MIXER=1
-export BUSCHAIN_CONTROL_QS_STRIP=1   # skip GTK scroll strip
-# optional hard-disable GTK strip forever:
-# export BUSCHAIN_CONTROL_SCROLL_STRIP=0
+export BUSCHAIN_CONTROL_QS_STRIP=1   # claim Master HW strip (skip GTK strip)
+# GTK strip is opt-in only; leave SCROLL_STRIP unset unless you need legacy GTK
 ```
 
-Popup order: QS (script / `qs ipc`) → GTK fallback → egui.
+Popup order: QS (script / `qs ipc`) → GTK → egui last.

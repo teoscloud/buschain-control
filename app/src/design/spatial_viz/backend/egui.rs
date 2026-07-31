@@ -92,16 +92,23 @@ impl EguiPainterBackend {
     }
 
     fn heat_tint(base: Rgba, heat: f32) -> Rgba {
-        // Cool/dim at low heat; orange only on peaks (smoothstep knee).
+        // Cool nearly-invisible at low heat; orange only on true peaks.
         let h = heat.clamp(0.0, 1.0);
-        let t = (h * h * (3.0 - 2.0 * h)).clamp(0.0, 1.0); // smoothstep
-        let t = t.powf(1.25);
+        let t = ((h - 0.18) / 0.82).clamp(0.0, 1.0).powf(1.9);
         Rgba::new(
-            base.r * (1.0 - t) + 0.98 * t,
-            base.g * (1.0 - t) + (0.38 + 0.12 * (1.0 - t)) * t,
-            base.b * (1.0 - t) + 0.10 * t,
-            (base.a * 0.22 * (1.0 - t) + 0.78 * t).clamp(0.06, 0.82),
+            base.r * 0.55 * (1.0 - t) + 0.98 * t,
+            base.g * 0.55 * (1.0 - t) + 0.38 * t,
+            base.b * 0.58 * (1.0 - t) + 0.08 * t,
+            (0.03 * (1.0 - t) + 0.78 * t).clamp(0.02, 0.8),
         )
+    }
+
+    /// Within-face falloff: panels near the source read hotter.
+    fn panel_heat(face_h: f32, panel: Vec3, anchor: Vec3, room_span: f32) -> f32 {
+        let dist = (panel - anchor).length();
+        let fall = (1.0 - dist / room_span.max(0.4)).clamp(0.0, 1.0);
+        let fall = fall.powf(1.8);
+        (face_h * (0.2 + 0.8 * fall)).clamp(0.0, 1.0)
     }
 
     fn line3(&mut self, a: Vec3, b: Vec3, stroke: Stroke) {
@@ -129,6 +136,7 @@ impl EguiPainterBackend {
         let h = s.half_extents.y * 2.0;
         let d = s.half_extents.z;
         let segs = (s.segments as usize).clamp(8, 32);
+        let span = (w * 2.0).max(h).max(d * 2.0);
         let wire = Stroke::new(
             1.0 * self.dpi,
             Self::color(s.material.albedo.scale_rgb(0.55).with_alpha(0.85)),
@@ -151,17 +159,21 @@ impl EguiPainterBackend {
                     }
                 }
                 for i in 0..segs {
-                    if i % (segs / 8).max(1) != 0 {
-                        continue;
-                    }
                     let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
                     let x = r * a.cos();
                     let z = r * a.sin();
-                    self.line3(Vec3::new(x, 0.0, z), Vec3::new(x, h, z), wire);
+                    if i % (segs / 8).max(1) == 0 {
+                        self.line3(Vec3::new(x, 0.0, z), Vec3::new(x, h, z), wire);
+                    }
                     let band = ((a / std::f32::consts::FRAC_PI_2).floor() as usize) % 4;
-                    let fill = Self::color(Self::heat_tint(base, s.face_heat[band]));
                     let a1 = a;
                     let a2 = a + std::f32::consts::TAU / segs as f32;
+                    let mid = Vec3::new(
+                        r * ((a1 + a2) * 0.5).cos(),
+                        h * 0.5,
+                        r * ((a1 + a2) * 0.5).sin(),
+                    );
+                    let ph = Self::panel_heat(s.face_heat[band], mid, s.heat_anchor, span);
                     self.quad_fill(
                         [
                             Vec3::new(r * a1.cos(), 0.0, r * a1.sin()),
@@ -169,7 +181,7 @@ impl EguiPainterBackend {
                             Vec3::new(r * a2.cos(), h, r * a2.sin()),
                             Vec3::new(r * a1.cos(), h, r * a1.sin()),
                         ],
-                        fill,
+                        Self::color(Self::heat_tint(base, ph)),
                     );
                 }
                 // Roof disc tint
@@ -379,61 +391,73 @@ impl EguiPainterBackend {
                 }
             }
             _ => {
-                // Shoebox
-                let faces = [
+                // Shoebox — subdivide each wall so heat varies toward the source.
+                let span = (w * 2.0).max(h).max(d * 2.0);
+                let div = (segs as usize / 6).clamp(2, 4);
+                let walls: [(usize, Vec3, Vec3, Vec3); 5] = [
+                    // fi, origin (u=0,v=0), u-axis, v-axis
                     (
-                        [
-                            Vec3::new(w, 0.0, -d),
-                            Vec3::new(w, 0.0, d),
-                            Vec3::new(w, h, d),
-                            Vec3::new(w, h, -d),
-                        ],
-                        0usize,
+                        0,
+                        Vec3::new(w, 0.0, -d),
+                        Vec3::new(0.0, 0.0, 2.0 * d),
+                        Vec3::new(0.0, h, 0.0),
                     ),
                     (
-                        [
-                            Vec3::new(-w, 0.0, -d),
-                            Vec3::new(-w, 0.0, d),
-                            Vec3::new(-w, h, d),
-                            Vec3::new(-w, h, -d),
-                        ],
                         1,
+                        Vec3::new(-w, 0.0, -d),
+                        Vec3::new(0.0, 0.0, 2.0 * d),
+                        Vec3::new(0.0, h, 0.0),
                     ),
                     (
-                        [
-                            Vec3::new(-w, 0.0, d),
-                            Vec3::new(w, 0.0, d),
-                            Vec3::new(w, h, d),
-                            Vec3::new(-w, h, d),
-                        ],
                         2,
+                        Vec3::new(-w, 0.0, d),
+                        Vec3::new(2.0 * w, 0.0, 0.0),
+                        Vec3::new(0.0, h, 0.0),
                     ),
                     (
-                        [
-                            Vec3::new(-w, 0.0, -d),
-                            Vec3::new(w, 0.0, -d),
-                            Vec3::new(w, h, -d),
-                            Vec3::new(-w, h, -d),
-                        ],
                         3,
+                        Vec3::new(-w, 0.0, -d),
+                        Vec3::new(2.0 * w, 0.0, 0.0),
+                        Vec3::new(0.0, h, 0.0),
                     ),
                     (
-                        [
-                            Vec3::new(-w, h, -d),
-                            Vec3::new(w, h, -d),
-                            Vec3::new(w, h, d),
-                            Vec3::new(-w, h, d),
-                        ],
                         5,
+                        Vec3::new(-w, h, -d),
+                        Vec3::new(2.0 * w, 0.0, 0.0),
+                        Vec3::new(0.0, 0.0, 2.0 * d),
                     ),
                 ];
-                for (pts, fi) in faces {
-                    self.quad_fill(pts, Self::color(Self::heat_tint(base, s.face_heat[fi])));
-                    self.line3(pts[0], pts[1], wire);
-                    self.line3(pts[1], pts[2], wire);
-                    self.line3(pts[2], pts[3], wire);
-                    self.line3(pts[3], pts[0], wire);
+                for (fi, origin, u_ax, v_ax) in walls {
+                    let fh = s.face_heat[fi];
+                    for iu in 0..div {
+                        for iv in 0..div {
+                            let u0 = iu as f32 / div as f32;
+                            let u1 = (iu + 1) as f32 / div as f32;
+                            let v0 = iv as f32 / div as f32;
+                            let v1 = (iv + 1) as f32 / div as f32;
+                            let p00 = origin + u_ax * u0 + v_ax * v0;
+                            let p10 = origin + u_ax * u1 + v_ax * v0;
+                            let p11 = origin + u_ax * u1 + v_ax * v1;
+                            let p01 = origin + u_ax * u0 + v_ax * v1;
+                            let mid = (p00 + p11) * 0.5;
+                            let ph = Self::panel_heat(fh, mid, s.heat_anchor, span);
+                            self.quad_fill([p00, p10, p11, p01], Self::color(Self::heat_tint(base, ph)));
+                        }
+                    }
+                    let c0 = origin;
+                    let c1 = origin + u_ax;
+                    let c2 = origin + u_ax + v_ax;
+                    let c3 = origin + v_ax;
+                    self.line3(c0, c1, wire);
+                    self.line3(c1, c2, wire);
+                    self.line3(c2, c3, wire);
+                    self.line3(c3, c0, wire);
                 }
+                // Cool floor outline only (heatmap on walls/ceiling).
+                self.line3(Vec3::new(-w, 0.0, -d), Vec3::new(w, 0.0, -d), wire);
+                self.line3(Vec3::new(w, 0.0, -d), Vec3::new(w, 0.0, d), wire);
+                self.line3(Vec3::new(w, 0.0, d), Vec3::new(-w, 0.0, d), wire);
+                self.line3(Vec3::new(-w, 0.0, d), Vec3::new(-w, 0.0, -d), wire);
             }
         }
     }

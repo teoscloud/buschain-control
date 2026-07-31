@@ -2,8 +2,8 @@
 //!
 //! Order (see `docs/HANDOVER-QUICKSHELL.md`):
 //! 1. Quickshell — if `BUSCHAIN_CONTROL_QS_MIXER=1`, or toggle script exists, or `qs` is on PATH
-//! 2. GTK layer-shell — `buschain-mixer-gtk` (opt out: `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`)
-//! 3. egui — `buschain-control --popup`
+//! 2. GTK layer-shell — when `buschain-mixer-gtk` is available (opt out: `USE_GTK_MIXER=0`)
+//! 3. egui — `buschain-control --popup` (last resort)
 //!
 //! GTK open must never treat `--toggle` exit-0 (close) as “GTK failed → egui”.
 //! Popup settle never blocks the daemon IPC mutex — `spawn_mixer_popup_async`.
@@ -422,10 +422,10 @@ fn ensure_mixer_css(mixer: &Path) {
     }
 }
 
-/// GTK layer-shell panel. Opt out with `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`.
+/// GTK layer-shell panel (general-desktop preferred when packaged / on PATH).
 ///
-/// Implements toggle in the tray: close if live, otherwise `--open`. Never treats
-/// a successful close as GTK unavailability (that was the egui fallthrough bug).
+/// Opt out with `BUSCHAIN_CONTROL_USE_GTK_MIXER=0`. Toggle: close if live, else
+/// `--open`. Never treats a successful close as GTK unavailability.
 pub fn try_gtk_mixer() -> bool {
     if env_falsy("BUSCHAIN_CONTROL_USE_GTK_MIXER") {
         return false;
@@ -504,7 +504,7 @@ pub fn spawn_mixer_popup() {
         return;
     }
     if try_egui_popup() {
-        append_spawn_log("fallback: egui popup (GTK open failed)");
+        append_spawn_log("fallback: egui popup (no QS / GTK)");
         lat_trace(&format!(
             "spawn_mixer_popup egui {}ms",
             t0.elapsed().as_millis()
@@ -513,7 +513,7 @@ pub fn spawn_mixer_popup() {
     }
     eprintln!(
         "buschain-control: could not open mixer popup \
-         (need buschain-mixer-gtk + BUSCHAIN_CONTROL_PYTHON, or buschain-control --popup)"
+         (need Quickshell, buschain-mixer-gtk, or buschain-control --popup)"
     );
     append_spawn_log("fallback: all popup paths failed");
 }

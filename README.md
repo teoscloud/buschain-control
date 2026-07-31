@@ -13,7 +13,7 @@ Close the window to **hide to tray**. Quit from the tray (or Settings) to tear t
 - **Mixer tracks** — assign apps, set gain / mute, listen, create virtual system outputs
 - **Insert FX** — BusChain builtins (EQ, reverb, denoiser, limiter, …) plus LADSPA / LV2 / CLAP / VST3 discovery
 - **Sessions** — named setups under `~/.config/buschain-control/`
-- **Desktop shell** — Waybar pill, Master HW scroll, mixer popup (Quickshell preferred, GTK fallback, egui last)
+- **Desktop shell** — tray left-click mixer popup (Quickshell → GTK → egui); Waybar pill optional
 
 ---
 
@@ -21,7 +21,7 @@ Close the window to **hide to tray**. Quit from the tray (or Settings) to tear t
 
 - Linux with **PipeWire** (PulseAudio compatibility tools such as `pactl` available)
 - A Wayland session for the tray UI (Hyprland is the primary target)
-- For the GTK mixer popup: GTK 3 + gtk-layer-shell + PyGObject (included in the Nix package / `nix develop`)
+- Optional legacy GTK mixer / scroll strip: GTK 3 + gtk-layer-shell + PyGObject (Nix package / `nix develop`)
 
 ---
 
@@ -157,9 +157,22 @@ systemctl --user disable --now buschain-control 2>/dev/null || true
 
 ---
 
-## Usage — Hyprland + Quickshell (recommended)
+## Usage — tray first (all desktops)
 
-This is the primary desktop target: tray owns audio; Quickshell owns the styled mixer / scroll strip; Waybar shows a volume pill.
+Recommend `buschain-control --hidden` everywhere: left-click the tray for the
+compact mixer popup; right-click → **Open BusChain Control** for the full window.
+
+| Action | Behavior |
+|--------|----------|
+| Tray left-click | Toggle mixer popup (**QS → GTK → egui**) |
+| Tray right-click menu | Open full app · Hide · Quit |
+| `buschain-ctl popup` / Waybar click | Same router |
+
+---
+
+## Usage — Hyprland + Quickshell (recommended rice)
+
+Quant / Hyprland: tray owns audio; Quickshell owns the styled mixer / scroll strip; Waybar shows a volume pill.
 
 ### 1. Autostart the tray
 
@@ -220,9 +233,9 @@ Clicking the Waybar pill runs `buschain-waybar popup` → tray prefers Quickshel
 
 | Action | How |
 |--------|-----|
-| Open full mixer | Tray → Show |
-| Bar mixer popup | Click Waybar BusChain pill |
-| Master HW volume | Scroll over the strip on the pill (not Waybar `on-scroll`) |
+| Open full mixer | Tray → **Open BusChain Control** |
+| Compact mixer popup | Tray left-click, or Waybar BusChain pill |
+| Master HW volume | QS scroll strip (or opt-in GTK strip) over the pill — not Waybar `on-scroll` |
 | Assign an app to a track | Playback tab → pick track / drag onto channel rack |
 | Add FX | Channel rack → Add plugin |
 | Save layout | Session tab → Save / Save as… |
@@ -230,32 +243,21 @@ Clicking the Waybar pill runs `buschain-waybar popup` → tray prefers Quickshel
 
 ---
 
-## Usage — general desktop (Waybar + GTK)
+## Usage — general desktop (no Quickshell)
 
-Works without Quickshell: GTK layer-shell mixer popup and GTK Master HW scroll strip.
+Tray + **GTK layer-shell** mixer (when packaged / on PATH). egui `--popup` is the
+fallback if GTK is missing. Waybar may call `buschain-ctl status` + `popup`.
 
-1. Start the tray: `buschain-control --hidden` (Hyprland `exec-once`, or your WM autostart).
-2. Add the same Waybar module as above (**no** `on-scroll-*`).
-3. Ensure `buschain-mixer-gtk` and `buschain-scroll-strip` are on `PATH` (Nix package includes them; from source, copy from `packaging/`).
-4. Click the pill → GTK mixer. Scroll the strip over the pill → Master HW ±5% (capped at 100%).
-
-Force GTK even if Quickshell is installed:
+1. Start the tray: `buschain-control --hidden`.
+2. Left-click the tray icon (or Waybar pill) for the compact mixer.
+3. Optional Waybar module: same as Hyprland (**no** `on-scroll-*`).
 
 ```bash
-export BUSCHAIN_CONTROL_USE_GTK_MIXER=1
+export BUSCHAIN_CONTROL_USE_GTK_MIXER=0   # force skip GTK → egui
+export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 ```
 
-Disable GTK popup (egui `--popup` fallback only):
-
-```bash
-export BUSCHAIN_CONTROL_USE_GTK_MIXER=0
-```
-
-If the scroll strip doesn’t line up with your pill, adjust geometry env vars — see [`docs/TECHNICAL.md`](docs/TECHNICAL.md#master-hw-volume).
-
-### Without Waybar
-
-You can still use BusChain as a tray app only: Show the full egui window, use Settings / Output for Master HW, and ignore bar integration.
+Strip geometry: [`docs/TECHNICAL.md`](docs/TECHNICAL.md#master-hw-volume).
 
 ---
 

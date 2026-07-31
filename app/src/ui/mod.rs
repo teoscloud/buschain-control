@@ -3,6 +3,7 @@ mod config;
 mod devices;
 mod midi;
 mod mixer;
+mod mixer_popup;
 mod playback;
 mod plugin_windows;
 mod recording;
@@ -11,6 +12,7 @@ pub mod runtime;
 pub use config::{draw_config, draw_session};
 pub use devices::{draw_input_devices, draw_output_devices};
 pub use midi::draw_midi;
+pub use mixer_popup::{draw_embedded_popup, draw_popup};
 pub use playback::draw_playback;
 pub use recording::draw_recording;
 pub use runtime::{UiRuntime, VizMode, IDLE_REPAINT_MS, LIVE_REPAINT_MS};
@@ -199,208 +201,6 @@ fn draw_graph_loading_overlay(ctx: &egui::Context, state: &AppState) {
             );
         });
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
-}
-
-fn popup_favorites_path() -> std::path::PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("buschain-control/mixer-pins.json")
-}
-
-fn load_popup_favorites() -> Vec<String> {
-    let path = popup_favorites_path();
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-fn db_to_ui(db: f32) -> f32 {
-    let lin = 10f32.powf(db / 20.0);
-    (lin * 100.0).clamp(0.0, 150.0)
-}
-
-fn ui_to_db(ui: f32) -> f32 {
-    let lin = (ui / 100.0).max(1e-4);
-    (20.0 * lin.log10()).clamp(-48.0, 12.0)
-}
-
-/// Compact overlay — Master HW + favorited tracks + app streams (egui fallback).
-pub fn draw_popup(ctx: &egui::Context, state: &mut AppState) {
-    use crate::audio::worker::Command;
-    use egui::RichText;
-
-    let theme = state.theme;
-    let favorites = load_popup_favorites();
-
-    egui::CentralPanel::default()
-        .frame(
-            egui::Frame::NONE
-                .fill(theme.bg_app())
-                .inner_margin(egui::Margin::symmetric(12, 10)),
-        )
-        .show(ctx, |ui| {
-            ui.label(
-                RichText::new("BUSCHAIN MIXER")
-                    .size(14.0)
-                    .strong()
-                    .color(theme.text()),
-            );
-            ui.label(
-                RichText::new("Esc to close · portable egui fallback")
-                    .size(10.0)
-                    .color(theme.text_muted()),
-            );
-            ui.add_space(8.0);
-
-            design::panel(ui, &theme, |ui| {
-                let hw_name = state
-                    .session
-                    .master_output
-                    .clone()
-                    .unwrap_or_else(|| "(no Master HW)".into());
-                let hw_desc = state
-                    .session
-                    .master_output_desc
-                    .clone()
-                    .unwrap_or_else(|| hw_name.clone());
-                ui.label(
-                    RichText::new(format!("Master HW — {hw_desc}"))
-                        .size(12.0)
-                        .strong()
-                        .color(theme.accent()),
-                );
-                let hw_snap = state
-                    .snapshot
-                    .sinks
-                    .iter()
-                    .find(|s| s.name == hw_name)
-                    .map(|s| (s.mute, s.volume_pct));
-                if let Some((hw_mute, hw_pct)) = hw_snap {
-                    let mut mute = hw_mute;
-                    ui.horizontal(|ui| {
-                        if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
-                            .changed()
-                        {
-                            // One writer with waybar/GTK — embedded IPC hw-vol path.
-                            let _ = crate::ipc::Client::call_fast(&crate::ipc::Request::SetHwMute {
-                                mute,
-                            })
-                            .or_else(|_| {
-                                crate::ipc::Client::call(&crate::ipc::Request::SetHwMute { mute })
-                            });
-                            if let Some(s) =
-                                state.snapshot.sinks.iter_mut().find(|s| s.name == hw_name)
-                            {
-                                s.mute = mute;
-                            }
-                        }
-                    });
-                    let mut vol = (hw_pct as f32).min(100.0);
-                    if design::h_slider(ui, &theme, &mut vol, 0.0..=100.0, "HW volume")
-                        .changed()
-                    {
-                        let pct = vol.clamp(0.0, 100.0) as u32;
-                        let _ = crate::ipc::Client::call_fast(&crate::ipc::Request::SetHwVolume {
-                            pct,
-                        })
-                        .or_else(|_| {
-                            crate::ipc::Client::call(&crate::ipc::Request::SetHwVolume { pct })
-                        });
-                        if let Some(s) =
-                            state.snapshot.sinks.iter_mut().find(|s| s.name == hw_name)
-                        {
-                            s.volume_pct = pct;
-                        }
-                    }
-                } else {
-                    ui.label(
-                        RichText::new("Hardware sink not in snapshot yet")
-                            .size(11.0)
-                            .color(theme.warning()),
-                    );
-                }
-            });
-
-            // Favorited BusChain tracks (same pins as QS / GTK mixer-pins.json)
-            let fav_tracks: Vec<_> = state
-                .session
-                .tracks
-                .iter()
-                .filter(|t| favorites.iter().any(|id| id == &t.id.to_string()))
-                .cloned()
-                .collect();
-            if !fav_tracks.is_empty() {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("FAVORITES")
-                        .size(11.0)
-                        .strong()
-                        .color(theme.text_muted()),
-                );
-                ui.add_space(4.0);
-                egui::ScrollArea::horizontal()
-                    .id_salt("popup_fav_tracks")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for track in fav_tracks {
-                                design::panel(ui, &theme, |ui| {
-                                    ui.set_min_width(72.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            RichText::new("★")
-                                                .size(12.0)
-                                                .color(theme.accent()),
-                                        );
-                                        ui.label(
-                                            RichText::new(track.name.clone())
-                                                .size(10.0)
-                                                .color(theme.text()),
-                                        );
-                                        let mut ui_vol = db_to_ui(track.gain_db);
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut ui_vol, 0.0..=150.0)
-                                                    .vertical()
-                                                    .show_value(false),
-                                            )
-                                            .changed()
-                                        {
-                                            let gain_db = ui_to_db(ui_vol);
-                                            if let Some(t) = state
-                                                .session
-                                                .tracks
-                                                .iter_mut()
-                                                .find(|t| t.id == track.id)
-                                            {
-                                                t.gain_db = gain_db;
-                                            }
-                                            crate::daemon::push_track_mixer_to_daemon(
-                                                track.id,
-                                                gain_db,
-                                                track.mute,
-                                            );
-                                            state.worker.send(Command::SetTrackLevel {
-                                                sink: track.expected_sink_name(),
-                                                gain_db,
-                                                muted: track.mute,
-                                            });
-                                        }
-                                        ui.label(
-                                            RichText::new(format!("{:.0}%", db_to_ui(track.gain_db)))
-                                                .size(10.0)
-                                                .color(theme.text_muted()),
-                                        );
-                                    });
-                                });
-                            }
-                        });
-                    });
-            }
-
-            ui.add_space(10.0);
-            draw_playback(ui, state);
-        });
 }
 
 /// Ctrl+1‥9 → open (or focus) floating plugin window for selected track insert N.

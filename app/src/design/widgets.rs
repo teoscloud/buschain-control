@@ -448,7 +448,13 @@ pub fn fader_db(
     };
 
     // Traditional console fader: narrow steel track, light metallic throw.
-    let track_w = (size.x * 0.22).clamp(4.0, 7.0);
+    // Compact when the hit rect is tray-popup narrow (caps must not dominate).
+    let compact = size.x < 36.0;
+    let track_w = if compact {
+        (size.x * 0.18).clamp(3.0, 5.0)
+    } else {
+        (size.x * 0.22).clamp(4.0, 7.0)
+    };
     let track = Rect::from_center_size(
         rect.center(),
         Vec2::new(track_w, rect.height() - 8.0),
@@ -462,7 +468,8 @@ pub fn fader_db(
     );
 
     // Scale ticks (behind fill/cap) — 0 dB is the major rail.
-    if lo < 0.0 && hi > 0.0 && track.height() > 40.0 {
+    // Skip side ticks in compact popup strips (they skew visual centering).
+    if !compact && lo < 0.0 && hi > 0.0 && track.height() > 40.0 {
         let marks: &[(f32, bool)] = if span >= 36.0 {
             &[
                 (12.0, false),
@@ -527,10 +534,17 @@ pub fn fader_db(
     // Skeuomorphic console fader cap — tall rectangle, bevel + grip grooves.
     let at_zero = value_db.abs() < 0.05;
     let above_zero = *value_db > 0.05;
-    let cap_w = (size.x * 0.82).clamp(15.0, 20.0);
-    let cap_h = (cap_w * 1.85).clamp(28.0, 38.0); // taller throw-cap
+    let (cap_w, cap_h) = if compact {
+        let w = (size.x * 0.50).clamp(9.0, 12.0);
+        let h = (w * 1.35).clamp(12.0, 16.0);
+        (w, h)
+    } else {
+        let w = (size.x * 0.82).clamp(15.0, 20.0);
+        let h = (w * 1.85).clamp(28.0, 38.0);
+        (w, h)
+    };
     let cap = Rect::from_center_size(egui::pos2(track.center().x, y), Vec2::new(cap_w, cap_h));
-    let r = CornerRadius::same(2);
+    let r = CornerRadius::same(if compact { 1 } else { 2 });
 
     // Soft drop shadow (bottom-right)
     let shadow = cap.translate(egui::vec2(1.5, 2.0));
@@ -575,25 +589,32 @@ pub fn fader_db(
         Stroke::new(1.0_f32, bevel_lo),
     );
 
-    // Five horizontal grip grooves (extra line above + below the prior trio)
+    // Grip grooves — fewer on compact popup caps.
     let grip = Color32::from_rgb(0x5a, 0x5e, 0x64);
     let grip_hi = Color32::from_rgba_unmultiplied(255, 255, 255, 45);
     let cy = cap.center().y;
-    let grip_span = (cap_h * 0.28).clamp(5.5, 9.0);
-    for i in -2..=2 {
+    let grip_span = if compact {
+        (cap_h * 0.22).clamp(3.0, 5.0)
+    } else {
+        (cap_h * 0.28).clamp(5.5, 9.0)
+    };
+    let groove_range = if compact { -1..=1 } else { -2..=2 };
+    let inset = if compact { 2.0 } else { 3.0 };
+    for i in groove_range {
         let dy = i as f32 * (grip_span * 0.5);
         let gy = cy + dy;
         painter.hline(
-            egui::Rangef::new(cap.left() + 3.0, cap.right() - 3.0),
+            egui::Rangef::new(cap.left() + inset, cap.right() - inset),
             gy,
-            Stroke::new(1.35_f32, grip),
+            Stroke::new(if compact { 1.0_f32 } else { 1.35_f32 }, grip),
         );
-        // Tiny highlight under each groove for depth
-        painter.hline(
-            egui::Rangef::new(cap.left() + 3.0, cap.right() - 3.0),
-            gy + 1.0,
-            Stroke::new(1.0_f32, grip_hi),
-        );
+        if !compact {
+            painter.hline(
+                egui::Rangef::new(cap.left() + inset, cap.right() - inset),
+                gy + 1.0,
+                Stroke::new(1.0_f32, grip_hi),
+            );
+        }
     }
 
     painter.rect_stroke(
@@ -612,13 +633,27 @@ pub fn fader_db(
         egui::StrokeKind::Outside,
     );
 
-    // Redraw 0 dB rail on top of fill so it stays visible under the trough
+    // Redraw 0 dB rail on top of fill so it stays visible under the trough.
+    // Compact: tick only across the track (full-width rail skews popup strips).
     if lo < 0.0 && hi > 0.0 {
         let y0 = db_to_y(0.0);
+        let x0 = if compact {
+            track.left() - 1.0
+        } else {
+            rect.left() + 1.0
+        };
+        let x1 = if compact {
+            track.right() + 1.0
+        } else {
+            rect.right() - 1.0
+        };
         painter.hline(
-            egui::Rangef::new(rect.left() + 1.0, rect.right() - 1.0),
+            egui::Rangef::new(x0, x1),
             y0,
-            Stroke::new(1.75_f32, theme.accent().gamma_multiply(0.95)),
+            Stroke::new(
+                if compact { 1.25_f32 } else { 1.75_f32 },
+                theme.accent().gamma_multiply(0.95),
+            ),
         );
     }
 

@@ -1,6 +1,6 @@
 //! StatusNotifier tray for hide-on-close.
 //!
-//! Uses `ksni` over D-Bus. Menu: Show · Hide · Mixer popup · Quit.
+//! Uses `ksni` over D-Bus. Left-click → mixer popup; menu: Open full app · Hide · Quit.
 //!
 //! `--hidden` runs headless (no egui window) until [`wait_until_show`].
 
@@ -66,7 +66,7 @@ impl ksni::Tray for BusChainTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "BusChain Control".into(),
-            description: "System mixer — click Show or use the menu".into(),
+            description: "Mixer — left-click popup · right-click for full app".into(),
             ..Default::default()
         }
     }
@@ -75,7 +75,7 @@ impl ksni::Tray for BusChainTray {
         use ksni::menu::*;
         vec![
             StandardItem {
-                label: "Show".into(),
+                label: "Open BusChain Control".into(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayCmd::Show);
                 }),
@@ -86,14 +86,6 @@ impl ksni::Tray for BusChainTray {
                 label: "Hide".into(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.tx.send(TrayCmd::Hide);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Mixer popup".into(),
-                activate: Box::new(|this: &mut Self| {
-                    let _ = this.tx.send(TrayCmd::Popup);
                 }),
                 ..Default::default()
             }
@@ -111,7 +103,7 @@ impl ksni::Tray for BusChainTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.tx.send(TrayCmd::Show);
+        let _ = self.tx.send(TrayCmd::Popup);
     }
 }
 
@@ -162,6 +154,7 @@ pub fn wait_until_show() -> HeadlessWait {
                     teardown_headless(state);
                     return HeadlessWait::Quit;
                 }
+                // No egui yet — cold-start compact popup process.
                 Ok(TrayCmd::Popup) => spawn_popup_playback(),
                 Ok(TrayCmd::Hide) => {}
                 Err(TryRecvError::Empty) => break,
@@ -200,6 +193,7 @@ pub fn poll_tray_commands(state: &mut AppState, _ctx: &Context) {
                 state.request_hide = true;
             }
             Ok(TrayCmd::Popup) => {
+                // Same router as ctl/waybar: QS → GTK → egui (not in-process egui).
                 spawn_popup_playback();
             }
             Ok(TrayCmd::Quit) => {
@@ -213,7 +207,7 @@ pub fn poll_tray_commands(state: &mut AppState, _ctx: &Context) {
 
 pub fn shutdown() {}
 
-/// Spawn the compact playback overlay (used by ctl / tray menu).
+/// Spawn the compact mixer popup (ctl / cold headless tray / external callers).
 pub fn spawn_popup_playback() {
     crate::popup_launch::spawn_mixer_popup();
 }
