@@ -107,7 +107,10 @@ QS can `FileView` this instead of blind polling. While panel open, poll ~100–2
       "kind": "master|track",
       "gain_db": 0.0,
       "mute": false,
-      "bus": "buschain_master|buschain_track_…"
+      "bus": "buschain_master|buschain_track_…",
+      "virtual_output": false,
+      "virtual_input": false,
+      "virtual_input_source": null
     }
   ],
   "sinks": [
@@ -117,7 +120,8 @@ QS can `FileView` this instead of blind polling. While panel open, poll ~100–2
       "volume_pct": 50,
       "mute": false,
       "is_master": true,
-      "is_default": false
+      "is_default": false,
+      "is_virtual": false
     }
   ],
   "sources": [
@@ -126,7 +130,8 @@ QS can `FileView` this instead of blind polling. While panel open, poll ~100–2
       "desc": "…",
       "volume_pct": 50,
       "mute": false,
-      "is_default": true
+      "is_default": true,
+      "is_virtual": false
     }
   ],
   "default_sink": "…",
@@ -139,6 +144,16 @@ Notes:
 - Master HW UI is **0–100%** (never boost).
 - Track gain is **dB** (−48…+12). GTK mapped UI 0–150 ↔ dB via `20*log10(ui/100)`.
 - `Default` sink ≠ `Master HW` (`is_default` vs `is_master`).
+- **Virtual devices (output):** `sinks[]` only includes BusChain buses that are
+  **app-facing**: `buschain_master` and tracks with channel-rack
+  **Create system virtual output** on (`tracks[].virtual_output == true`). Other
+  `buschain_track_*` sinks exist for internal routing and are **omitted**. Use
+  `is_virtual: true` (or `tracks[].virtual_output`) — do **not** treat every track
+  as a device.
+- **Virtual devices (input):** `sources[]` may include `buschain_vin_*` when a
+  track has **Create system virtual input** on (`tracks[].virtual_input == true`).
+  Those are post-FX capture sources (`is_virtual: true`). Internal feed sinks
+  (`buschain_vinf_*`) are never listed. See also `tracks[].virtual_input_source`.
 
 ---
 

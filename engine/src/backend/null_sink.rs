@@ -9,11 +9,12 @@ use crate::domain::{NodeRole, NodeSpec};
 pub fn ensure_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
     let name = spec.name.as_str();
     let is_app_bus = matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus);
+    let is_vin_feed = matches!(spec.role, NodeRole::VirtualInputFeed);
     if sink_exists(name) {
         let live = probe_sink_running_rate(name);
         // App buses: never auto-migrate here (cork risk / idle thrash).
         // Rate retarget is BindMasterClock → migrate_recreate_null_sink only.
-        if is_app_bus {
+        if is_app_bus || is_vin_feed {
             let _ = push_clock_props(name, clock);
             // Keep device.description in sync with session track renames.
             let _ = push_description(name, &spec.description);
@@ -90,6 +91,7 @@ pub fn migrate_recreate_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result
 fn create_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
     let name = spec.name.as_str();
     let is_app_bus = matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus);
+    let is_vin_feed = matches!(spec.role, NodeRole::VirtualInputFeed);
     let props = format!(
         "sink_properties=device.description={} media.name=buschain-control session.suspend-timeout-seconds={} node.virtual=true node.latency={} audio.rate={} node.force-quantum={} node.lock-quantum={}",
         sanitize_desc(&spec.description),
@@ -113,7 +115,11 @@ fn create_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
         ],
     )?;
 
-    if is_app_bus || spec.start_muted {
+    if is_vin_feed {
+        // Virtual-mic feed must stay open so remap-source hears post/bus audio.
+        let _ = run_ok("pactl", &["set-sink-volume", name, "100%"]);
+        let _ = run_ok("pactl", &["set-sink-mute", name, "0"]);
+    } else if is_app_bus || spec.start_muted {
         let _ = run_ok("pactl", &["set-sink-mute", name, "1"]);
         let _ = run_ok("pactl", &["set-sink-volume", name, "0%"]);
     } else {

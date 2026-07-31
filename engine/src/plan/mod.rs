@@ -44,6 +44,8 @@ pub struct DesiredState {
     pub speakers_armed: bool,
     /// Buses whose FX ensure Failed (dry restored) — counts as resolved for barrier.
     pub fx_failed: HashSet<String>,
+    /// Track buses that should expose `buschain_vin_*` (description for remap).
+    pub virtual_inputs: HashMap<String, String>,
 }
 
 impl DesiredState {
@@ -86,6 +88,17 @@ impl DesiredState {
 
     pub fn set_bus_egress(&mut self, bus: &str, dests: Vec<String>) {
         self.bus_egress.insert(bus.to_string(), dests);
+    }
+
+    pub fn set_virtual_input(&mut self, bus: &str, description: Option<String>) {
+        match description {
+            Some(d) => {
+                self.virtual_inputs.insert(bus.to_string(), d);
+            }
+            None => {
+                self.virtual_inputs.remove(bus);
+            }
+        }
     }
 
     pub fn egress_dests(&self, bus: &str) -> Vec<String> {

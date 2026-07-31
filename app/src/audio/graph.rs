@@ -1518,17 +1518,26 @@ fn resolve_input_source(track: &crate::session::Track, sources: &[DeviceNode]) -
     if name.is_empty() || name == "(none)" || name.contains("buschain_") {
         return None;
     }
+    // Never capture a track's own virtual input (hard feedback).
+    let own_vin = track.expected_virtual_input_name();
+    if name == own_vin {
+        return None;
+    }
     resolve_device(
         Some(name),
         track.input_source_desc.as_deref(),
         sources,
-        |d| !d.name.ends_with(".monitor") && !d.name.starts_with("buschain_"),
+        |d| {
+            !d.name.ends_with(".monitor")
+                && !d.name.starts_with("buschain_")
+                && d.name != own_vin
+        },
     )
     .or_else(|| {
-        // Last resort: exact name if still listed
+        // Last resort: exact name if still listed (never own vin / buschain_*).
         sources
             .iter()
-            .find(|s| s.name == name)
+            .find(|s| s.name == name && s.name != own_vin && !s.name.starts_with("buschain_"))
             .map(|s| s.name.clone())
     })
 }
@@ -2235,6 +2244,12 @@ pub fn prune_removed_track(
     let _ = unload_loopbacks_for_track_bus(removed_bus, &fx_name);
     unload_mids_for_bus(removed_bus);
     unload_post_sink_for_bus(removed_bus);
+    // Drop system virtual input (remap-source + feed) before the track bus.
+    crate::audio::engine_handle::with_engine(|eng| {
+        let _ = eng.apply(buschain_engine::Intent::TeardownVirtualInput {
+            bus: buschain_engine::NodeName::new(removed_bus),
+        });
+    });
     // Move any stragglers off the doomed bus before unload.
     let fallback = session
         .preferred_default_sink

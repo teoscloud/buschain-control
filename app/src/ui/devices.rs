@@ -277,6 +277,7 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                     || s.name.starts_with("buschain_post_")
                     || s.name.starts_with("buschain_mid_")
                     || s.name.starts_with("buschain_rs_")
+                    || s.name.starts_with("buschain_vinf_")
                     || s.name == "buschain_hold"
                     || s.name.starts_with("shadow_")
                     || s.description.starts_with("ShadowAudio_")
@@ -544,6 +545,12 @@ pub fn draw_input_devices(ui: &mut egui::Ui, state: &mut AppState) {
             .filter(|s| {
                 if state.show_hidden_recording {
                     return true;
+                }
+                // Show app-facing virtual mics; hide feed/helpers.
+                if s.name.starts_with("buschain_vin_") {
+                    return state.session.tracks.iter().any(|t| {
+                        t.virtual_input && t.expected_virtual_input_name() == s.name
+                    });
                 }
                 !s.name.starts_with("buschain_")
             })

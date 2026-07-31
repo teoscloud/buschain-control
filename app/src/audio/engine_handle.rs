@@ -84,6 +84,7 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
         eng.desired_mut().bus_levels.clear();
         eng.desired_mut().fx_chains.clear();
         eng.desired_mut().bus_egress.clear();
+        eng.desired_mut().virtual_inputs.clear();
 
         for track in &session.tracks {
             let bus = track.expected_sink_name();
@@ -99,7 +100,7 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             };
             eng.desired_mut().ensure_bus(NodeSpec {
                 name: NodeName::new(&bus),
-                description: desc,
+                description: desc.clone(),
                 role,
                 start_muted: true,
             });
@@ -140,6 +141,22 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                 }
                 if dests.is_empty() {
                     dests.push("buschain_master".into());
+                }
+                // System virtual input: arm post/bus into feed sink (remap masters .monitor).
+                if track.virtual_input {
+                    let feed = track.expected_virtual_input_feed_name();
+                    let vin_desc = format!("{desc}_In");
+                    eng.desired_mut().ensure_bus(NodeSpec {
+                        name: NodeName::new(&feed),
+                        description: format!("{desc}_VinFeed"),
+                        role: NodeRole::VirtualInputFeed,
+                        start_muted: false,
+                    });
+                    eng.desired_mut()
+                        .set_virtual_input(&bus, Some(vin_desc));
+                    if !dests.iter().any(|d| d == &feed) {
+                        dests.push(feed);
+                    }
                 }
             }
             eng.desired_mut().set_bus_egress(&bus, dests.clone());
@@ -208,6 +225,41 @@ pub fn arm_session(session: &Session, hw_sink: &str, force_fx: bool) -> anyhow::
         }
     }
     Ok(msg)
+}
+
+/// Ensure or tear down system virtual input for one track (session flag is truth).
+pub fn apply_virtual_input(session: &Session, track_id: uuid::Uuid) -> anyhow::Result<String> {
+    let hw = crate::audio::graph::resolve_hardware_output(session)
+        .unwrap_or_else(|_| session.master_output.clone().unwrap_or_default());
+    sync_desired_from_session(session, &hw);
+    let track = session
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .ok_or_else(|| anyhow::anyhow!("track not found"))?;
+    if track.kind.is_master() {
+        return Ok("virtual input: master ignored".into());
+    }
+    let bus = track.expected_sink_name();
+    let desc = format!(
+        "BusChainControl_{}_In",
+        track.name.replace(' ', "_")
+    );
+    let report = with_engine(|eng| {
+        if track.virtual_input {
+            eng.apply(Intent::EnsureVirtualInput {
+                bus: NodeName::new(&bus),
+                description: desc,
+            })
+        } else {
+            eng.apply(Intent::TeardownVirtualInput {
+                bus: NodeName::new(&bus),
+            })
+        }
+    })?;
+    // Relink so feed is in/out of egress allow-lists.
+    let _ = relink_routes(session, &hw);
+    Ok(report.join())
 }
 
 /// Arm one track's configured egress hops (wet post→dests or dry bus→dests).

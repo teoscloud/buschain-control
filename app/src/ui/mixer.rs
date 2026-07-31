@@ -708,15 +708,18 @@ fn draw_virtual_output_section(ui: &mut egui::Ui, state: &mut AppState, track_id
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let mut virt = state.session.tracks[track_idx].virtual_output;
-            if design::toggle_chip(
-                ui,
-                &theme,
-                "Create",
-                &mut virt,
-                theme.accent(),
-            )
-            .changed()
-            {
+            // Off = create action; on = feature engaged (toggle, not a one-shot).
+            let label = if virt {
+                "System virtual output"
+            } else {
+                "Create system virtual output"
+            };
+            let resp = design::toggle_chip(ui, &theme, label, &mut virt, theme.accent());
+            resp.clone().on_hover_text(
+                "Expose this track as a PipeWire sink other apps can select \
+                 (Move to / system default). Off keeps the bus internal for routing only.",
+            );
+            if resp.changed() {
                 state.session.tracks[track_idx].virtual_output = virt;
                 let tid = state.session.tracks[track_idx].id;
                 state.dirty = true;
@@ -728,6 +731,8 @@ fn draw_virtual_output_section(ui: &mut egui::Ui, state: &mut AppState, track_id
                 state
                     .worker
                     .send(Command::ApplyLevels(state.session.clone()));
+                // Wake QS / shell mixers — sinks list membership just changed.
+                crate::mixer_api::touch_mixer_tick();
             }
         });
 }
@@ -886,57 +891,80 @@ fn draw_output_rack(
         .collect();
 
     let popup_id = ui.make_persistent_id(("output_to_popup", self_id));
-    let trigger = ui.add(
-        egui::Button::new(
-            RichText::new(format!("{}  Output to…", egui_phosphor::regular::PLUS))
-                .size(12.0)
-                .strong()
-                .color(theme.text()),
-        )
-        .fill(theme.bg_elevated())
-        .stroke(egui::Stroke::new(1.0_f32, theme.border()))
-        .corner_radius(theme.rounding())
-        .min_size(Vec2::new(110.0, 26.0)),
-    );
-    if trigger.clicked() {
-        ui.memory_mut(|m| m.toggle_popup(popup_id));
-    }
+    ui.horizontal(|ui| {
+        let trigger = ui.add(
+            egui::Button::new(
+                RichText::new(format!("{}  Output to…", egui_phosphor::regular::PLUS))
+                    .size(12.0)
+                    .strong()
+                    .color(theme.text()),
+            )
+            .fill(theme.bg_elevated())
+            .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+            .corner_radius(theme.rounding())
+            .min_size(Vec2::new(110.0, 26.0)),
+        );
+        if trigger.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup_id));
+        }
 
-    egui::popup::popup_below_widget(
-        ui,
-        popup_id,
-        &trigger,
-        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-        |ui| {
-            ui.set_min_width(180.0);
-            if choices.is_empty() {
-                ui.label(
-                    RichText::new("All destinations added")
-                        .size(11.0)
-                        .color(theme.text_muted()),
-                );
-                return;
-            }
-            for (id, name) in &choices {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(name).size(12.0).color(theme.text()))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE)
-                            .min_size(Vec2::new(ui.available_width(), 22.0)),
-                    )
-                    .clicked()
-                {
-                    let targets = &mut state.session.tracks[track_idx].output_targets;
-                    if !targets.contains(id) {
-                        targets.push(*id);
-                    }
-                    state.mark_routing_dirty();
-                    ui.close_menu();
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &trigger,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(180.0);
+                if choices.is_empty() {
+                    ui.label(
+                        RichText::new("All destinations added")
+                            .size(11.0)
+                            .color(theme.text_muted()),
+                    );
+                    return;
                 }
-            }
-        },
-    );
+                for (id, name) in &choices {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(name).size(12.0).color(theme.text()))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .min_size(Vec2::new(ui.available_width(), 22.0)),
+                        )
+                        .clicked()
+                    {
+                        let targets = &mut state.session.tracks[track_idx].output_targets;
+                        if !targets.contains(id) {
+                            targets.push(*id);
+                        }
+                        state.mark_routing_dirty();
+                        ui.close_menu();
+                    }
+                }
+            },
+        );
+
+        ui.add_space(6.0);
+        let mut vin = state.session.tracks[track_idx].virtual_input;
+        let vin_label = if vin {
+            "System virtual input"
+        } else {
+            "Create system virtual input"
+        };
+        let vin_resp = design::toggle_chip(ui, &theme, vin_label, &mut vin, theme.accent());
+        vin_resp.clone().on_hover_text(
+            "Expose this track as a PipeWire capture source (mic) so other apps \
+             hear its post-FX output. Off removes the system virtual input.",
+        );
+        if vin_resp.changed() {
+            state.session.tracks[track_idx].virtual_input = vin;
+            let tid = state.session.tracks[track_idx].id;
+            state.dirty = true;
+            let _ = state.session.save();
+            state.commit(crate::audio::LiveChange::VirtualInput { track_id: tid });
+            crate::mixer_api::touch_mixer_tick();
+        }
+    });
 }
 
 fn mini_rack_row(
@@ -995,14 +1023,20 @@ fn draw_input_dropdown(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize
         short_device_title(&current)
     };
 
+    let own_vin = state.session.tracks[track_idx].expected_virtual_input_name();
     let sources: Vec<(String, String)> = std::iter::once(("(none)".into(), "(none)".into()))
-        .chain(
-            state
-                .snapshot
-                .sources
-                .iter()
-                .map(|s| (s.name.clone(), input_device_title(&s.name, &s.description))),
-        )
+        .chain(state.snapshot.sources.iter().filter_map(|s| {
+            // Hide graph helpers + this track's own virtual mic (feedback).
+            if s.name.contains(".monitor")
+                || s.name.starts_with("buschain_vinf_")
+                || s.name.starts_with("buschain_post_")
+                || s.name.starts_with("buschain_hold")
+                || s.name == own_vin
+            {
+                return None;
+            }
+            Some((s.name.clone(), input_device_title(&s.name, &s.description)))
+        }))
         .collect();
 
     let input_salt = state.session.tracks[track_idx].id;

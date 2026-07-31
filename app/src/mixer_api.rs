@@ -6,11 +6,59 @@ use crate::audio::graph::PwSnapshot;
 use crate::ipc::Status;
 use crate::session::Session;
 
-fn is_buschain_node(name: &str) -> bool {
-    name.starts_with("buschain_")
-        || name.starts_with("easyeffects_")
+fn is_internal_helper_node(name: &str) -> bool {
+    name.starts_with("easyeffects_")
         || name.contains("filter-chain")
         || name == "auto_null"
+        // Graph helpers — not user-facing virtual I/O
+        || name.starts_with("buschain_hold")
+        || name.starts_with("buschain_post_")
+        || name.starts_with("buschain_rs_")
+        || name.starts_with("buschain_vinf_")
+        || name.starts_with("buschain_fx_")
+}
+
+/// Track/master bus names that are app-facing virtual sinks.
+/// Internal track buses always exist in PW; only session `virtual_output`
+/// (plus master) should appear in shell Output / QS device lists.
+fn is_exposed_virtual_sink(name: &str, session: &Session) -> bool {
+    session.tracks.iter().any(|t| {
+        t.expected_sink_name() == name && (t.kind.is_master() || t.virtual_output)
+    })
+}
+
+/// App-facing virtual mics created via Create system virtual input.
+fn is_exposed_virtual_source(name: &str, session: &Session) -> bool {
+    session.tracks.iter().any(|t| {
+        !t.kind.is_master() && t.virtual_input && t.expected_virtual_input_name() == name
+    })
+}
+
+fn include_sink(name: &str, session: Option<&Session>) -> bool {
+    if is_internal_helper_node(name) {
+        return false;
+    }
+    if name.starts_with("buschain_") {
+        return session
+            .map(|s| is_exposed_virtual_sink(name, s))
+            .unwrap_or(false);
+    }
+    true
+}
+
+fn include_source(name: &str, session: Option<&Session>) -> bool {
+    if is_internal_helper_node(name) || name.contains(".monitor") {
+        return false;
+    }
+    if name.starts_with("buschain_vin_") {
+        return session
+            .map(|s| is_exposed_virtual_source(name, s))
+            .unwrap_or(false);
+    }
+    if name.starts_with("buschain_") {
+        return false;
+    }
+    true
 }
 
 /// Stable poll payload for shell mixers (QS / GTK parity).
@@ -47,12 +95,17 @@ pub fn build_mixer_json(
         })
         .unwrap_or_default();
 
+    // Only session-exposed virtual buses (master + tracks with Create system
+    // virtual output on). Other buschain_track_* sinks stay internal for routing.
     let sinks: Vec<Value> = snapshot
         .map(|snap| {
             snap.sinks
                 .iter()
-                .filter(|s| !is_buschain_node(&s.name))
+                .filter(|s| include_sink(&s.name, session))
                 .map(|s| {
+                    let is_virtual = session
+                        .map(|sess| is_exposed_virtual_sink(&s.name, sess))
+                        .unwrap_or(false);
                     json!({
                         "name": s.name,
                         "desc": s.description,
@@ -60,6 +113,7 @@ pub fn build_mixer_json(
                         "mute": s.mute,
                         "is_master": master.as_deref() == Some(s.name.as_str()),
                         "is_default": default_sink.as_deref() == Some(s.name.as_str()),
+                        "is_virtual": is_virtual,
                     })
                 })
                 .collect()
@@ -70,14 +124,18 @@ pub fn build_mixer_json(
         .map(|snap| {
             snap.sources
                 .iter()
-                .filter(|s| !is_buschain_node(&s.name) && !s.name.contains(".monitor"))
+                .filter(|s| include_source(&s.name, session))
                 .map(|s| {
+                    let is_virtual = session
+                        .map(|sess| is_exposed_virtual_source(&s.name, sess))
+                        .unwrap_or(false);
                     json!({
                         "name": s.name,
                         "desc": s.description,
                         "volume_pct": s.volume_pct,
                         "mute": s.mute,
                         "is_default": default_source.as_deref() == Some(s.name.as_str()),
+                        "is_virtual": is_virtual,
                     })
                 })
                 .collect()
@@ -101,6 +159,13 @@ pub fn build_mixer_json(
                         "gain_db": t.gain_db,
                         "mute": t.mute,
                         "bus": t.expected_sink_name(),
+                        "virtual_output": t.virtual_output,
+                        "virtual_input": t.virtual_input,
+                        "virtual_input_source": if t.virtual_input && !t.kind.is_master() {
+                            Some(t.expected_virtual_input_name())
+                        } else {
+                            None
+                        },
                     })
                 })
                 .collect()

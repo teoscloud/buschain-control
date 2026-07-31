@@ -31,6 +31,8 @@ impl NodeName {
             || self.0.starts_with("buschain_post_")
             || self.0.starts_with("buschain_mid_")
             || self.0.starts_with("buschain_rs_")
+            || self.0.starts_with("buschain_vinf_")
+            || self.0.starts_with("buschain_vin_")
             || self.0 == "buschain_hold"
     }
 
@@ -65,6 +67,8 @@ pub enum NodeRole {
     Hold,
     FxSink,
     RateBridge,
+    /// Internal null-sink that receives post/bus egress for a virtual mic remap.
+    VirtualInputFeed,
     External,
 }
 

@@ -326,6 +326,13 @@ impl AppState {
                 });
                 self.status = "Live ensure track bus…".into();
             }
+            LiveChange::VirtualInput { track_id } => {
+                self.worker.send(Command::VirtualInput {
+                    session: self.session.clone(),
+                    track_id,
+                });
+                self.status = "Live virtual input…".into();
+            }
             LiveChange::Route => {
                 // Links only — never clear pending Props (Route must not starve knobs).
                 self.worker.send(Command::RewireSessionRoutes(
@@ -1049,6 +1056,10 @@ impl AppState {
         if self.levels_pending_full {
             self.levels_pending_full = false;
             self.pending_level_track = None;
+            // Keep embedded IPC session (get_mixer) aligned with UI mute/solo recount.
+            for t in &self.session.tracks {
+                crate::daemon::push_track_mixer_to_daemon(t.id, t.gain_db, t.mute);
+            }
             self.worker
                 .send(Command::ApplyLevels(self.session.clone()));
             return;
@@ -1066,6 +1077,7 @@ impl AppState {
                 let sink = track.expected_sink_name();
                 let muted =
                     track.mute || (any_solo && !track.solo && !track.kind.is_master());
+                crate::daemon::push_track_mixer_to_daemon(track_id, track.gain_db, track.mute);
                 self.worker.send(Command::SetTrackLevel {
                     sink,
                     gain_db: track.gain_db,
@@ -1413,6 +1425,13 @@ impl AppState {
             self.caps_probe_budget = 0;
         }
         self.drain_editor_params_into_session();
+        // Quickshell / ctl track vol → visual faders + dB readouts.
+        for p in crate::daemon::take_track_mixer_ui_patches() {
+            if let Some(t) = self.session.tracks.iter_mut().find(|t| t.id == p.track_id) {
+                t.gain_db = p.gain_db;
+                t.mute = p.mute;
+            }
+        }
 
         for ev in self.worker.poll() {
             match ev {

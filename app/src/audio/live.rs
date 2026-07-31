@@ -41,6 +41,8 @@ pub enum LiveChange {
     FxRewire { track_id: Uuid },
     /// New track bus.
     EnsureTrack { track_id: Uuid },
+    /// Create or tear down system virtual input for one track (session flag is source of truth).
+    VirtualInput { track_id: Uuid },
     /// Master HW out, listen, app assign targets, etc. (links only).
     Route,
     /// Idle reconcile / cold bring-up / manual recovery.
@@ -55,6 +57,7 @@ impl LiveChange {
             Self::FxParams { .. } => "live params",
             Self::FxRewire { .. } => "FX rewire",
             Self::EnsureTrack { .. } => "ensure track",
+            Self::VirtualInput { .. } => "virtual input",
             Self::Route => "routing",
             Self::Reconcile => "reconcile",
         }

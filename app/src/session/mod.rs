@@ -72,6 +72,10 @@ pub struct Track {
     /// Missing field in old JSON ⇒ false (opt-in), matching new-track defaults.
     #[serde(default)]
     pub virtual_output: bool,
+    /// Create a system virtual *input* (Audio/Source) fed from this track's post-FX
+    /// wet tap (or bus.monitor when dry). Opt-in; not available on Master.
+    #[serde(default)]
+    pub virtual_input: bool,
     /// Runtime: null-sink / filter-chain sink name for this track
     #[serde(skip)]
     pub sink_name: Option<String>,
@@ -89,6 +93,16 @@ impl Track {
         } else {
             format!("buschain_track_{}", self.id.simple())
         }
+    }
+
+    /// App-facing virtual mic / capture source (`module-remap-source`).
+    pub fn expected_virtual_input_name(&self) -> String {
+        format!("buschain_vin_{}", self.id.simple())
+    }
+
+    /// Internal feed null-sink; egress arms into this, remap masters its `.monitor`.
+    pub fn expected_virtual_input_feed_name(&self) -> String {
+        format!("buschain_vinf_{}", self.id.simple())
     }
 }
 
@@ -175,6 +189,7 @@ impl Default for Session {
                     input_source_desc: None,
                     output_targets: vec![],
                     virtual_output: true,
+                    virtual_input: false,
                     sink_name: None,
                 },
                 Track {
@@ -191,6 +206,7 @@ impl Default for Session {
                     input_source_desc: None,
                     output_targets: vec![master_id],
                     virtual_output: false,
+                    virtual_input: false,
                     sink_name: None,
                 },
             ],
@@ -349,6 +365,7 @@ impl Session {
             output_targets: master.into_iter().collect(),
             // Opt-in: new buses are not system virtual devices until enabled.
             virtual_output: false,
+            virtual_input: false,
             sink_name: None,
         });
         id
@@ -360,6 +377,15 @@ impl Session {
             .iter()
             .find(|t| t.id == track_id)
             .map(|t| t.kind.is_master() || t.virtual_output)
+            .unwrap_or(false)
+    }
+
+    /// Whether this track exposes a system virtual input (capture source).
+    pub fn is_virtual_input(&self, track_id: Uuid) -> bool {
+        self.tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .map(|t| !t.kind.is_master() && t.virtual_input)
             .unwrap_or(false)
     }
 

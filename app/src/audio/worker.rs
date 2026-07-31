@@ -151,6 +151,11 @@ pub enum Command {
     },
     /// Bring one new track bus online (no other-track FX reload).
     EnsureTrack { session: Session, track_id: uuid::Uuid },
+    /// Create / tear down system virtual input for one track.
+    VirtualInput {
+        session: Session,
+        track_id: uuid::Uuid,
+    },
     /// Tear down a removed track's bus only.
     PruneTrack {
         session: Session,
@@ -487,7 +492,9 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
             Command::PushFxControls { bus, inserts } => {
                 fx_controls.insert(bus, inserts);
             }
-            m @ (Command::EnsureTrack { .. } | Command::PruneTrack { .. }) => {
+            m @ (Command::EnsureTrack { .. }
+                | Command::VirtualInput { .. }
+                | Command::PruneTrack { .. }) => {
                 ensure.push(m);
             }
             m @ Command::PlaceApp { .. } => {
@@ -1277,6 +1284,26 @@ fn process_command_batch(
                         }
                         Err(e) => {
                             let _ = tx.send(Event::Error(format!("ensure track: {e:#}")));
+                        }
+                    }
+                }
+                Command::VirtualInput {
+                    session,
+                    track_id,
+                } => {
+                    sync_engine_clock(&session);
+                    match crate::audio::engine_handle::apply_virtual_input(&session, track_id) {
+                        Ok(message) => {
+                            *last_session = Some(session.clone());
+                            let _ = tx.send(Event::SessionApplied {
+                                session,
+                                message,
+                                kind: SessionAppliedKind::Ensure,
+                            });
+                            let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!("virtual input: {e:#}")));
                         }
                     }
                 }

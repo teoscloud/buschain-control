@@ -12,11 +12,104 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use uuid::Uuid;
 
 use crate::audio::graph::{self, PwSnapshot};
 use crate::audio::worker::{AudioWorker, Command, Event};
 use crate::ipc::{self, Request, Response, SessionListItem, Status};
 use crate::session::{self, Session};
+
+/// Track gain/mute patch for UI ↔ embedded IPC session sync.
+#[derive(Debug, Clone, Copy)]
+pub struct TrackMixerPatch {
+    pub track_id: Uuid,
+    pub gain_db: f32,
+    pub mute: bool,
+}
+
+fn ui_track_mixer_patches() -> &'static Mutex<Vec<TrackMixerPatch>> {
+    static Q: OnceLock<Mutex<Vec<TrackMixerPatch>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn daemon_track_mixer_patches() -> &'static Mutex<Vec<TrackMixerPatch>> {
+    static Q: OnceLock<Mutex<Vec<TrackMixerPatch>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// QS/ctl changed a track fader — UI should adopt on next tick.
+pub fn push_track_mixer_to_ui(track_id: Uuid, gain_db: f32, mute: bool) {
+    if let Ok(mut q) = ui_track_mixer_patches().lock() {
+        // Coalesce: keep latest patch per track.
+        if let Some(p) = q.iter_mut().find(|p| p.track_id == track_id) {
+            *p = TrackMixerPatch {
+                track_id,
+                gain_db,
+                mute,
+            };
+        } else {
+            q.push(TrackMixerPatch {
+                track_id,
+                gain_db,
+                mute,
+            });
+        }
+    }
+}
+
+/// Drain patches for the tray UI mixer strips.
+pub fn take_track_mixer_ui_patches() -> Vec<TrackMixerPatch> {
+    ui_track_mixer_patches()
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
+/// UI changed a track fader — embedded daemon session / get_mixer should adopt.
+pub fn push_track_mixer_to_daemon(track_id: Uuid, gain_db: f32, mute: bool) {
+    if let Ok(mut q) = daemon_track_mixer_patches().lock() {
+        if let Some(p) = q.iter_mut().find(|p| p.track_id == track_id) {
+            *p = TrackMixerPatch {
+                track_id,
+                gain_db,
+                mute,
+            };
+        } else {
+            q.push(TrackMixerPatch {
+                track_id,
+                gain_db,
+                mute,
+            });
+        }
+    }
+}
+
+fn apply_track_mixer_patches(session: &mut Session, patches: &[TrackMixerPatch]) -> bool {
+    let mut dirty = false;
+    for p in patches {
+        if let Some(t) = session.tracks.iter_mut().find(|t| t.id == p.track_id) {
+            if (t.gain_db - p.gain_db).abs() > 0.001 || t.mute != p.mute {
+                t.gain_db = p.gain_db;
+                t.mute = p.mute;
+                dirty = true;
+            }
+        }
+    }
+    dirty
+}
+
+fn drain_daemon_track_mixer_patches(session: &mut Session) {
+    let patches = daemon_track_mixer_patches()
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
+    if patches.is_empty() {
+        return;
+    }
+    if apply_track_mixer_patches(session, &patches) {
+        let _ = session.save();
+    }
+}
 
 /// Set by embedded IPC on `Shutdown` / tray Quit coordination.
 static EMBEDDED_QUIT: AtomicBool = AtomicBool::new(false);
@@ -510,6 +603,8 @@ impl DaemonState {
     }
 
     fn handle(&mut self, req: Request) -> Response {
+        // UI fader drags land here so get_mixer / QS see live track gains.
+        drain_daemon_track_mixer_patches(&mut self.session);
         match req {
             Request::Ping => Response::Ok {
                 message: "pong".into(),
@@ -580,6 +675,7 @@ impl DaemonState {
                         | Command::HotplugSession(_)
                         | Command::HotplugTrack { .. }
                         | Command::EnsureTrack { .. }
+                        | Command::VirtualInput { .. }
                         | Command::PruneTrack { .. }
                 );
                 // Keep daemon session in sync when UI sends a full session.
@@ -596,6 +692,7 @@ impl DaemonState {
                     | Command::HotplugTrack { session, .. }
                     | Command::PushFxParams { session, .. }
                     | Command::EnsureTrack { session, .. }
+                    | Command::VirtualInput { session, .. }
                     | Command::PruneTrack { session, .. } => {
                         self.session = session.clone();
                     }
@@ -885,6 +982,8 @@ impl DaemonState {
                 let gain = track.gain_db;
                 let muted = track.mute;
                 let _ = self.session.save();
+                // Tray mixer strips read AppState.session — push so faders/dB labels update.
+                push_track_mixer_to_ui(track_id, gain, muted);
                 self.cmds.send(Command::SetTrackLevel {
                     sink,
                     gain_db: gain,
@@ -1109,6 +1208,7 @@ fn serve_loop(state: Arc<Mutex<DaemonState>>, listener: std::os::unix::net::Unix
         let refresh = {
             let mut g = state.lock().unwrap();
             g.drain_events();
+            drain_daemon_track_mixer_patches(&mut g.session);
             if g.last_idle.elapsed() >= Duration::from_secs(2) {
                 g.last_idle = Instant::now();
                 true

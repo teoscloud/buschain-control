@@ -5,7 +5,13 @@ mod fx_chain;
 mod link;
 mod native;
 mod null_sink;
+mod virtual_input;
 pub mod pulse_compat;
+
+pub use virtual_input::{
+    ensure_virtual_input, is_virtual_input_feed, is_virtual_input_source, names_for_bus as virtual_input_names_for_bus,
+    push_virtual_input_description, teardown_virtual_input,
+};
 
 pub use cli::{invalidate_probe_caches, pw_link_inputs, pw_link_outputs};
 

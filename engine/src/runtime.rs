@@ -13,7 +13,7 @@ use crate::clock::{
     probe_master_hw_from_sinks, probe_sink_running_rate, resolve_profile, set_graph_force_clock,
     wait_hw_running_rate, AudioPreset, DeviceCaps, GraphClock, PerformanceProfile,
 };
-use crate::contract::{ApplyReport, Intent};
+use crate::contract::{ApplyReport, ClockProps, Intent};
 use crate::domain::{
     post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
     LinkSpec, NodeRole, NodeSpec, Props,
@@ -321,6 +321,41 @@ impl Engine {
                 self.teardown_fx_chain(bus.as_str())?;
                 report.push(format!("FX torn down on {}", bus.as_str()));
             }
+            Intent::EnsureVirtualInput { bus, description } => {
+                let clock = ClockProps::from(&self.desired.clock);
+                crate::backend::ensure_virtual_input(bus.as_str(), &description, &clock)?;
+                self.desired
+                    .set_virtual_input(bus.as_str(), Some(description.clone()));
+                if let Some((_, feed)) = crate::backend::virtual_input_names_for_bus(bus.as_str()) {
+                    self.desired.ensure_bus(NodeSpec {
+                        name: crate::domain::NodeName::new(&feed),
+                        description: format!("{description}_VinFeed"),
+                        role: NodeRole::VirtualInputFeed,
+                        start_muted: false,
+                    });
+                    let mut dests = self.desired.egress_dests(bus.as_str());
+                    if !dests.iter().any(|d| d == &feed) {
+                        dests.push(feed.clone());
+                        self.desired.set_bus_egress(bus.as_str(), dests.clone());
+                    }
+                    let wet = self.chain_is_wet(bus.as_str());
+                    let _ = self.arm_track_egress(bus.as_str(), wet, &dests);
+                }
+                report.push(format!("virtual input on {}", bus.as_str()));
+            }
+            Intent::TeardownVirtualInput { bus } => {
+                let _ = crate::backend::teardown_virtual_input(bus.as_str());
+                self.desired.set_virtual_input(bus.as_str(), None);
+                if let Some((_, feed)) = crate::backend::virtual_input_names_for_bus(bus.as_str()) {
+                    self.desired.buses.remove(&feed);
+                    let mut dests = self.desired.egress_dests(bus.as_str());
+                    dests.retain(|d| d != &feed);
+                    self.desired.set_bus_egress(bus.as_str(), dests.clone());
+                    let wet = self.chain_is_wet(bus.as_str());
+                    let _ = self.arm_track_egress(bus.as_str(), wet, &dests);
+                }
+                report.push(format!("virtual input off {}", bus.as_str()));
+            }
             Intent::Teardown => {
                 self.backend.teardown_links();
                 let _ = self.backend.teardown_rate_bridges();
@@ -330,11 +365,16 @@ impl Engine {
                 for bus in buses {
                     let _ = crate::host::registry::teardown_host(&bus);
                 }
+                let vins: Vec<String> = self.desired.virtual_inputs.keys().cloned().collect();
+                for bus in vins {
+                    let _ = crate::backend::teardown_virtual_input(&bus);
+                }
                 self.desired.clear_routes();
                 self.desired.bridges.clear();
                 self.desired.fx_chains.clear();
                 self.desired.bus_egress.clear();
                 self.desired.fx_failed.clear();
+                self.desired.virtual_inputs.clear();
                 self.desired.speakers_armed = false;
                 report.push("engine teardown");
             }
@@ -577,6 +617,11 @@ impl Engine {
             let name = spec.name.as_str().to_string();
             let mon = format!("{name}.monitor");
             let _ = self.backend.ensure_link_raw(&mon, "buschain_hold");
+            if matches!(spec.role, NodeRole::VirtualInputFeed) {
+                // Feed must stay open — remap-source masters this monitor.
+                let _ = self.backend.open_bus_gain(&name, 0.0);
+                continue;
+            }
             let level = self
                 .desired
                 .bus_levels
@@ -591,7 +636,44 @@ impl Engine {
                 self.applied_monitor_mute.insert(name.clone(), want_mute);
             }
         }
+        self.reconcile_virtual_inputs(&mut report);
         Ok(report)
+    }
+
+    /// Ensure / prune remap-sources for Desired virtual inputs.
+    fn reconcile_virtual_inputs(&mut self, report: &mut ApplyReport) {
+        let clock = ClockProps::from(&self.desired.clock);
+        let want: Vec<(String, String)> = self
+            .desired
+            .virtual_inputs
+            .iter()
+            .map(|(b, d)| (b.clone(), d.clone()))
+            .collect();
+        for (bus, desc) in &want {
+            if let Err(e) = crate::backend::ensure_virtual_input(bus, desc, &clock) {
+                report.push(format!("virtual input {bus}: {e:#}"));
+            }
+        }
+        // Drop orphan feeds/sources for track buses no longer flagged.
+        let live_feeds: Vec<String> = self
+            .desired
+            .buses
+            .keys()
+            .filter(|k| k.starts_with("buschain_vinf_"))
+            .cloned()
+            .collect();
+        for feed in live_feeds {
+            let Some(suffix) = feed.strip_prefix("buschain_vinf_") else {
+                continue;
+            };
+            let bus = format!("buschain_track_{suffix}");
+            if self.desired.virtual_inputs.contains_key(&bus) {
+                continue;
+            }
+            let _ = crate::backend::teardown_virtual_input(&bus);
+            self.desired.buses.remove(&feed);
+            report.push(format!("virtual input pruned {bus}"));
+        }
     }
 
     fn reconcile_fx(&mut self, report: &mut ApplyReport) {
@@ -909,6 +991,13 @@ impl Engine {
             .unwrap_or_default();
 
         for bus in self.desired.buses.keys() {
+            // Helpers are not egress-armed track buses.
+            if bus.starts_with("buschain_vinf_")
+                || bus.starts_with("buschain_vin_")
+                || bus == "buschain_hold"
+            {
+                continue;
+            }
             if !sink_exists(bus) {
                 return false;
             }
@@ -1233,6 +1322,9 @@ impl Engine {
         // Re-arm every bus egress from Desired (listen / outs / Master).
         let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
         for bus in buses {
+            if bus.starts_with("buschain_vinf_") || bus == "buschain_hold" {
+                continue;
+            }
             let dests = self
                 .desired
                 .bus_egress
@@ -1248,6 +1340,7 @@ impl Engine {
                 report.push(format!("relink {bus}: {e:#}"));
             }
         }
+        self.reconcile_virtual_inputs(&mut report);
         self.prune_parallel_fx_routes(&mut report);
         self.reconcile_master_and_default(&mut report)?;
         if report.messages.is_empty() {

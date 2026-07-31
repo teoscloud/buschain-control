@@ -375,6 +375,11 @@ pub fn draw_popup(ctx: &egui::Context, state: &mut AppState) {
                                             {
                                                 t.gain_db = gain_db;
                                             }
+                                            crate::daemon::push_track_mixer_to_daemon(
+                                                track.id,
+                                                gain_db,
+                                                track.mute,
+                                            );
                                             state.worker.send(Command::SetTrackLevel {
                                                 sink: track.expected_sink_name(),
                                                 gain_db,

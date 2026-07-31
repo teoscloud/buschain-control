@@ -32,6 +32,13 @@ pub enum Intent {
     },
     /// Tear down FX helpers for one bus (track prune / recovery).
     TeardownFxChain { bus: NodeName },
+    /// Ensure system virtual input (feed sink + remap-source) for a track bus.
+    EnsureVirtualInput {
+        bus: NodeName,
+        description: String,
+    },
+    /// Unload virtual input for a track bus.
+    TeardownVirtualInput { bus: NodeName },
     /// Drop all BusChain-owned links + rate bridges (recovery).
     Teardown,
     /// Re-apply desired routes after recovery.

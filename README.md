@@ -263,7 +263,8 @@ You can still use BusChain as a tray app only: Show the full egui window, use Se
 
 - **Plugins:** put VST3 under `~/.vst3` (or set `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Rebuild/restart the tray after installing new plugins.
 - **VST3 editors:** open from the insert chrome; on Hyprland they are floated automatically when possible.
-- **Virtual system output:** on a track, use **Create** (virtual output) so other apps can target that bus as a sink.
+- **Virtual system output:** on a track, enable **Create system virtual output** so other apps can target that bus as a sink (only then does it appear in shell Output / Quickshell device lists).
+- **Virtual system input:** beside **+ Output to…**, enable **Create system virtual input** so apps can capture that track’s post-FX audio as a mic (`buschain_vin_*`).
 - **Offline pill:** tray isn’t running or isn’t on `PATH` for Waybar — start `buschain-control --hidden` and restart Waybar if needed.
 
 ---
