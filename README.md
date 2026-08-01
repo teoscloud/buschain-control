@@ -198,6 +198,39 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 
 ---
 
+## Compact mixer — Quickshell rice & default egui
+
+Left-click the tray (or Waybar pill) for a compact mixer. Popup order is **Quickshell → GTK → egui**, so Hyprland rices can own the look while everyone else still gets a built-in panel.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/assets/qs-mixer.png" alt="Quickshell BusChain mixer popup" width="360" /><br />
+      <em>Quickshell rice</em> — same IPC contract, your panel styling
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/assets/egui-mixer.png" alt="Default egui BusChain mixer popup" width="360" /><br />
+      <em>Default egui mixer</em> — ships with the app, no rice required
+    </td>
+  </tr>
+</table>
+
+Wire QS with `BUSCHAIN_CONTROL_QS_MIXER=1` and the stubs in [`packaging/quickshell/`](packaging/quickshell/) — contract: [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md).
+
+---
+
+## Device clocks
+
+Most Linux desktop audio UIs bury or ignore **sample rate and quantum**. BusChain exposes them for **hardware outputs and inputs**: pick rate / buffer, soft-quantum if you want PipeWire to raise the period under load, and apply.
+
+<p align="center">
+  <img src="docs/assets/device-clocks.png" alt="Output / Input — PipeWire device clock and quantum controls" width="480" />
+</p>
+
+Force-rate and quantum live on the **Output** and **Input** tabs (same per-device editor). Applying on **Master HW** also binds the BusChain graph clock so tracks and FX stay aligned with the interface; other sinks/sources use **Apply device clock** without forcing the whole graph.
+
+---
+
 ## Features
 
 ### Mixer & graph
@@ -207,6 +240,7 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 - **Input** rack — multi HW capture, shared with the desktop / other tracks
 - **Virtual system output / input** — expose tracks as sinks or post-FX capture sources
 - Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → hardware / Master`
+- **Device clocks** — sample rate / quantum per HW output and input (see above)
 - Live hotplug and warm adopt when the graph already matches the session
 
 ### Insert FX
