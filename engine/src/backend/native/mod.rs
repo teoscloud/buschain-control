@@ -124,40 +124,29 @@ impl AudioBackend for PipewireNativeBackend {
     }
 
     fn ensure_link_raw(&mut self, source: &str, sink: &str) -> Result<LinkId> {
-        if session::is_ready() {
-            match session::ensure_link(source, sink) {
-                Ok(()) => return Ok(LinkId(format!("{source}->{sink}"))),
-                Err(e) => {
-                    // Host FX: never Pulse-loopback.
-                    let dst = ports::pw_node(sink);
-                    if dst.starts_with("buschain_fx_")
-                        || ports::pw_node(source).starts_with("buschain_fx_")
-                    {
-                        return Err(e);
-                    }
-                    // Foreign / race: CLI fallback once.
-                    super::link::ensure_link(source, sink)?;
-                    return Ok(LinkId(format!("{source}->{sink}")));
-                }
-            }
-        }
-        super::link::ensure_link(source, sink)?;
+        // Prefer shared verify policy (native-only when ready; Pulse demoted).
+        super::ensure_link(source, sink)?;
         Ok(LinkId(format!("{source}->{sink}")))
     }
 
     fn unlink_raw(&mut self, source: &str, sink: &str) -> Result<()> {
+        // Native-first: when registry is up, skip CLI `pw-link -d` (hundreds of ms).
         if session::is_ready() {
-            let _ = session::unlink(source, sink);
+            match session::unlink(source, sink) {
+                Ok(()) => return Ok(()),
+                Err(_) => {}
+            }
         }
         super::link::unlink(source, sink)
     }
 
     fn unlink_from_source_except(&mut self, source: &str, allow_sinks: &[&str]) -> u32 {
-        let mut n = 0;
+        // Native registry only when ready — CLI `pw-link -l` fallthrough was
+        // ~400ms per arm/disarm and made mute/unmute + Route feel multi-second.
         if session::is_ready() {
-            n += session::unlink_from_source_except(source, allow_sinks);
+            return session::unlink_from_source_except(source, allow_sinks);
         }
-        n + super::link::unlink_from_source_except(source, allow_sinks)
+        super::link::unlink_from_source_except(source, allow_sinks)
     }
 
     fn set_props(&mut self, node: &str, props: &Props) -> Result<()> {
@@ -208,14 +197,8 @@ impl AudioBackend for PipewireNativeBackend {
     }
 
     fn gate_monitor(&mut self, bus: &str, gated: bool) -> Result<()> {
-        let mon = format!("{bus}.monitor");
-        if session::is_ready() {
-            // Gate = mute + 0 volume on monitor source (never mute the app sink).
-            match session::set_levels(&mon, if gated { -120.0 } else { 0.0 }, gated) {
-                Ok(()) => return Ok(()),
-                Err(_) => {}
-            }
-        }
+        // Pactl source mute only — never SPA set_levels on `bus.monitor`
+        // (bind strips .monitor → corks the app sink / fails to silence egress).
         gate_bus_monitor(bus, gated)
     }
 

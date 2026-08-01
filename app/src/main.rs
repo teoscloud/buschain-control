@@ -241,6 +241,14 @@ impl eframe::App for BusChainApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Persist HW as preferred default so a saved buschain_* target cannot outlive Quit.
+        if let Some(hw) = self.state.session.master_output.clone() {
+            if !hw.starts_with("buschain_") {
+                self.state.session.preferred_default_sink = Some(hw);
+            }
+        } else {
+            self.state.session.preferred_default_sink = None;
+        }
         let _ = self.state.session.save();
         self.state.meters.shutdown();
         self.state.worker.send(audio::worker::Command::Shutdown);

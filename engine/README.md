@@ -19,8 +19,10 @@ First-class audio engine for BusChain Control. **App code must not call `pactl` 
 
 - **GraphClock** = Master HW rate + quantum after `BindMasterClock` (`PerformanceProfile`).
 - **DeviceCaps** = true rates from PipeWire `EnumFormat` ∪ ALSA `/proc/asound/cardN/stream*` `Rates:`.
-- Rate bridges are **inbound only** (external → BusChain bus), exclusive.
+- Rate bridges are **inbound only** (external → BusChain bus); capture is **shared**
+  (`exclusive: false`) so desktop apps keep the mic.
 - Outbound Master→HW is never bridged (device adapter).
+- Route / Add In: `Intent::SyncCapture` once + egress `relink_routes` (never ArmSession).
 
 ## Insert pipeline (sealed DAW contract)
 
@@ -45,6 +47,8 @@ apps → buschain_track_* / buschain_master
 | `EnsureFxChain(Force)` | Build next `Rack` off-thread; atomic publish; link spine | Second FX process; A/B `__stg` helpers |
 | `EnsureFxChain(Idempotent)` | No-op when fingerprint + host running + spine match | Silent dry when rack non-empty |
 | `ArmSession` | Cold: spines → barrier → Master→HW. Warm: adopt healthy graph | App-side `pw-link` arming |
+| `SyncCapture` | Desired `bus_inputs` → shared capture hops (one-shot Route) | N× per-track purge; ForceRespawn |
+| `SyncPlayback` | Desired `bus_playback` → move sink-inputs (one-shot Apps) | ApplyLevels HOL; N× per-key list |
 | `TeardownFxChain` | Destroy filter + drop rack for one bus | — |
 
 Types: `InsertSlot` → `ChainSpec` → `WirePlan` → `ChainState::{Dry,Building,Wet,Failed}`.
@@ -73,7 +77,7 @@ Continuous Desired↔live health. Idle worker ticks + after Hotplug sync session
 - **Levels / mute** — never mute or recreate app-facing buses; silence outbound monitors / FX only.
 - **FX power / knobs** — `PushFxControls` → host queue only.
 - **FX add/remove/reorder** — `EnsureFxChain(Force)` once per track (gen-swap).
-- **Rate bridges** — inbound external→BusChain only; mic hops exclusive.
+- **Rate bridges** — inbound external→BusChain only; mic hops shared (sink-side dual-path prune).
 - **Custom clock** — device-capable rates only; Apply switches HW + GraphClock together.
 
 ## Native PipeWire control plane (Phase F)

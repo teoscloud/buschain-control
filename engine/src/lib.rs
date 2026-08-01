@@ -46,7 +46,7 @@ pub use host::{
     ClapParamInfo, EditorParamEvent, Lv2ParamInfo,
     MidiEvent, OpenEditorRequest, SlotStateSnapshot, Vst3Instance, Vst3ParamInfo,
 };
-pub use runtime::Engine;
+pub use runtime::{plan_capture_delta, Engine};
 
 /// Convenience probe used by the app (lists sinks via CLI backend).
 pub fn probe_master_hw(master_output: Option<&str>) -> DeviceCaps {

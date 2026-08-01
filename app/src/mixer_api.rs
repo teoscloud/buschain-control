@@ -166,6 +166,13 @@ pub fn build_mixer_json(
                         } else {
                             None
                         },
+                        "inputs": t.inputs.iter().map(|i| json!({
+                            "source": i.source,
+                            "source_desc": i.source_desc,
+                            "mute": i.mute,
+                        })).collect::<Vec<_>>(),
+                        // Deprecated single-input mirror of inputs[0].
+                        "input_source": t.input_source,
                     })
                 })
                 .collect()

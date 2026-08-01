@@ -43,6 +43,11 @@
 - [x] Popup order: Quickshell → GTK layer-shell → egui last resort
 - [ ] GTK scroll strip remains opt-in (`SCROLL_STRIP=1`); QS strip for Quant
 
+## Pins (closer look later)
+
+- [x] **Audio safety + input rack** — surgical commits, preferred-default guard, shared capture, session orphan prune = PruneTrack, `Track.inputs` rack, `buschain-ctl recover-audio`. See TECHNICAL.md pin.
+- [ ] **Crash restore** — still audit `kill -9` / atexit watchdog + automated smoke matrix in TECHNICAL.md.
+
 ## Done (DAW apex v2)
 
 - [x] **F2** Native levels/mute/gate + Metadata defaults + registry snapshot/sources; PulseCompat for stream-move only; app levels/defaults via engine

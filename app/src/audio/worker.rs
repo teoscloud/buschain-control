@@ -177,7 +177,19 @@ pub enum Command {
     SetSinkInputMute { index: u32, mute: bool },
     MoveSinkInput { index: u32, sink: String },
     /// Fresh-list place: move every stream matching app_key onto sink (not snapshot-stale).
-    PlaceApp { app_key: String, sink: String },
+    /// `session` syncs pin truth into `last_session` without ApplyLevels HOL.
+    PlaceApp {
+        session: Session,
+        app_key: String,
+        sink: String,
+    },
+    /// One-shot enforce all session playback pins (`Intent::SyncPlayback`).
+    SyncPlayback(Session),
+    /// In-rack capture delta (add / mute-row / remove) — Class B, never Route.
+    SyncCaptureDelta {
+        session: Session,
+        track_id: uuid::Uuid,
+    },
     SetDefaultSink(String),
     SetDefaultSource(String),
     /// Light Master HW switch — relink only, never ApplySession / ForceRespawn.
@@ -210,6 +222,8 @@ pub enum SessionAppliedKind {
 
 pub enum Event {
     Snapshot(PwSnapshot),
+    /// Light PlaceApp refresh — merge sink-inputs only (keep sinks/sources).
+    SinkInputs(Vec<crate::audio::graph::StreamNode>),
     Status(String),
     SessionApplied {
         session: Session,
@@ -271,11 +285,38 @@ impl AudioWorker {
     pub fn spawn_local() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let (ev_tx, ev_rx) = mpsc::channel::<Event>();
+        let (int_tx, int_rx) = mpsc::channel::<Command>();
+        let (sup_tx, sup_rx) = mpsc::channel::<Command>();
+        let (obs_tx, obs_rx) = mpsc::channel::<Command>();
+        let shared_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
+
+        let int_session = Arc::clone(&shared_session);
+        let sup_session = Arc::clone(&shared_session);
+        let ev_int = ev_tx.clone();
+        let ev_sup = ev_tx.clone();
+        let ev_obs = ev_tx;
 
         thread::Builder::new()
-            .name("buschain-pw".into())
-            .spawn(move || worker_loop(cmd_rx, ev_tx))
-            .expect("spawn audio worker");
+            .name("buschain-router".into())
+            .spawn(move || control_plane_router(cmd_rx, int_tx, sup_tx, obs_tx))
+            .expect("spawn control-plane router");
+
+        thread::Builder::new()
+            .name("buschain-interactive".into())
+            .spawn(move || interactive_loop(int_rx, ev_int, int_session))
+            .expect("spawn interactive lane");
+
+        thread::Builder::new()
+            .name("buschain-supervisor".into())
+            .spawn(move || supervisor_loop(sup_rx, ev_sup, sup_session))
+            .expect("spawn supervisor lane");
+
+        thread::Builder::new()
+            .name("buschain-observer".into())
+            .spawn(move || observer_loop(obs_rx, ev_obs))
+            .expect("spawn observer lane");
+
+        eprintln!("buschain-control: dual-thread control plane (interactive/supervisor/observer)");
 
         Self {
             tx: cmd_tx,
@@ -452,9 +493,85 @@ fn daemon_client_loop(cmd_rx: Receiver<Command>, ev_tx: Sender<Event>) {
     }
 }
 
-/// Collapse queued level updates so fader drags never backlog behind themselves.
-/// Order: levels/Props → Ensure/Prune buses → PlaceApp → other heavy (FX/Apply).
-/// PlaceApp must not run before EnsureTrack in the same batch (cold bus → place fail).
+/// Command lane for the dual-thread control plane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Interactive,
+    Supervisor,
+    Observer,
+}
+
+fn command_lane(cmd: &Command) -> Lane {
+    match cmd {
+        Command::Refresh => Lane::Observer,
+        Command::Shutdown
+        | Command::Teardown
+        | Command::BindMasterClock(_)
+        | Command::BindDeviceClock { .. }
+        | Command::ApplySession(_)
+        | Command::RewireSessionRoutes(_)
+        | Command::HotplugSession(_)
+        | Command::RewireTrackFx { .. }
+        | Command::HotplugTrack { .. }
+        | Command::EnsureTrack { .. }
+        | Command::VirtualInput { .. }
+        | Command::PruneTrack { .. } => Lane::Supervisor,
+        _ => Lane::Interactive,
+    }
+}
+
+fn control_plane_router(
+    cmd_rx: Receiver<Command>,
+    int_tx: Sender<Command>,
+    sup_tx: Sender<Command>,
+    obs_tx: Sender<Command>,
+) {
+    while let Ok(cmd) = cmd_rx.recv() {
+        if matches!(cmd, Command::Shutdown) {
+            let _ = int_tx.send(Command::Shutdown);
+            let _ = sup_tx.send(Command::Shutdown);
+            let _ = obs_tx.send(Command::Shutdown);
+            break;
+        }
+        match command_lane(&cmd) {
+            Lane::Interactive => {
+                let _ = int_tx.send(cmd);
+            }
+            Lane::Supervisor => {
+                let _ = sup_tx.send(cmd);
+            }
+            Lane::Observer => {
+                let _ = obs_tx.send(cmd);
+            }
+        }
+    }
+}
+
+fn observer_loop(rx: Receiver<Command>, tx: Sender<Event>) {
+    // Topology observation only — never mutates the graph / ENGINE mute path.
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Command::Shutdown => break,
+            Command::Refresh => {
+                let t0 = Instant::now();
+                let snap = graph::refresh_snapshot();
+                graph::publish_observer_snapshot(snap.clone());
+                let ms = t0.elapsed().as_millis();
+                if matches!(
+                    std::env::var("BUSCHAIN_CONTROL_LAT_TRACE").as_deref(),
+                    Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+                ) {
+                    eprintln!("[lat] C observer_snapshot {ms}ms");
+                }
+                let _ = tx.send(Event::Snapshot(snap));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collapse queued updates into Class A → B → C lanes.
+/// Class A (mute/fader/Props) always drains before Capture/PlaceApp and Route.
 fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
     if cmds.iter().any(|c| matches!(c, Command::Shutdown)) {
         return vec![Command::Shutdown];
@@ -464,13 +581,14 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
     let mut full_levels: Option<Session> = None;
     let mut fx_params: HashMap<uuid::Uuid, Session> = HashMap::new();
     let mut fx_controls: HashMap<String, Vec<buschain_engine::InsertSlot>> = HashMap::new();
+    let mut capture: HashMap<uuid::Uuid, Session> = HashMap::new();
     // Latest RewireTrackFx per track — rapid reorder must not stack ForceRespawns.
     let mut rewire_fx: HashMap<uuid::Uuid, Session> = HashMap::new();
     let mut session_routes: Option<Session> = None;
-    let mut fast = Vec::new();
+    let mut class_a = Vec::new();
+    let mut class_b = Vec::new();
     let mut ensure = Vec::new();
-    let mut place = Vec::new();
-    let mut heavy = Vec::new();
+    let mut class_c = Vec::new();
 
     for cmd in cmds.drain(..) {
         match cmd {
@@ -492,13 +610,31 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
             Command::PushFxControls { bus, inserts } => {
                 fx_controls.insert(bus, inserts);
             }
+            Command::SyncCaptureDelta { session, track_id } => {
+                capture.insert(track_id, session);
+            }
             m @ (Command::EnsureTrack { .. }
                 | Command::VirtualInput { .. }
                 | Command::PruneTrack { .. }) => {
                 ensure.push(m);
             }
-            m @ Command::PlaceApp { .. } => {
-                place.push(m);
+            Command::PlaceApp {
+                session,
+                app_key,
+                sink,
+            } => {
+                class_b.retain(|c| {
+                    !matches!(c, Command::PlaceApp { app_key: k, .. } if k == &app_key)
+                });
+                class_b.push(Command::PlaceApp {
+                    session,
+                    app_key,
+                    sink,
+                });
+            }
+            Command::SyncPlayback(s) => {
+                class_b.retain(|c| !matches!(c, Command::SyncPlayback(_)));
+                class_b.push(Command::SyncPlayback(s));
             }
             m @ (Command::MoveSinkInput { .. }
             | Command::SetDefaultSink(_)
@@ -514,9 +650,8 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
             | Command::Refresh
             | Command::RefreshMidi
             | Command::Midi(_)) => {
-                fast.push(m);
+                class_a.push(m);
             }
-            // Route / FX rewires are heavy — never ahead of Props/levels (knob HOL).
             Command::RewireSessionRoutes(s) | Command::HotplugSession(s) => {
                 session_routes = Some(s);
             }
@@ -530,15 +665,15 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
             } => {
                 rewire_fx.insert(track_id, session);
             }
-            other => heavy.push(other),
+            other => class_c.push(other),
         }
     }
 
     if let Some(s) = full_levels {
-        fast.push(Command::ApplyLevels(s));
+        class_a.push(Command::ApplyLevels(s));
     } else {
         for (sink, (gain_db, muted)) in levels {
-            fast.push(Command::SetTrackLevel {
+            class_a.push(Command::SetTrackLevel {
                 sink,
                 gain_db,
                 muted,
@@ -546,36 +681,37 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
         }
     }
     for (bus, inserts) in fx_controls {
-        fast.push(Command::PushFxControls { bus, inserts });
+        class_a.push(Command::PushFxControls { bus, inserts });
     }
     for (track_id, session) in fx_params {
-        // Prefer controls extracted from session so we don't ship the blob twice.
         if let Some((bus, inserts)) =
             crate::audio::insert_map::ladspa_slots_for(&session, track_id)
         {
-            if !fast.iter().any(|c| {
+            if !class_a.iter().any(|c| {
                 matches!(c, Command::PushFxControls { bus: b, .. } if b == &bus)
             }) {
-                fast.push(Command::PushFxControls { bus, inserts });
+                class_a.push(Command::PushFxControls { bus, inserts });
             }
         } else {
-            fast.push(Command::PushFxParams { session, track_id });
+            class_a.push(Command::PushFxParams { session, track_id });
         }
     }
-    // Buses before PlaceApp; FX/ApplySession after so assign isn't starved by rewire.
-    fast.append(&mut ensure);
-    fast.append(&mut place);
-    // Union: routes and per-track FX both keep — routes must not discard FX rewires.
+    for (track_id, session) in capture {
+        class_b.insert(0, Command::SyncCaptureDelta { session, track_id });
+    }
+    // Buses / prune before PlaceApp (cold bus → place fail).
+    let mut out = class_a;
+    out.append(&mut ensure);
+    out.append(&mut class_b);
     for (track_id, session) in rewire_fx {
-        heavy.push(Command::RewireTrackFx { session, track_id });
+        class_c.push(Command::RewireTrackFx { session, track_id });
     }
     if let Some(s) = session_routes {
-        heavy.push(Command::RewireSessionRoutes(s));
+        class_c.push(Command::RewireSessionRoutes(s));
     }
-    crate::audio::adaptive::AdaptivePolicy::global()
-        .set_queue_depth(fast.len() + ensure.len() + place.len() + heavy.len());
-    fast.append(&mut heavy);
-    fast
+    crate::audio::adaptive::AdaptivePolicy::global().set_queue_depth(out.len() + class_c.len());
+    out.append(&mut class_c);
+    out
 }
 
 fn sync_engine_clock(session: &Session) {
@@ -668,7 +804,11 @@ fn flush_place_retries(
                     "Placed {n} stream(s) → {}",
                     retry.sink
                 )));
-                let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                if n > 0 {
+                    if let Ok(inputs) = graph::refresh_sink_inputs_only() {
+                        let _ = tx.send(Event::SinkInputs(inputs));
+                    }
+                }
             }
             Err(e) if retry.attempts < 6 => {
                 place_retry.insert(
@@ -692,9 +832,19 @@ fn flush_place_retries(
     }
 }
 
-fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
+fn publish_shared_session(shared: &Arc<Mutex<Option<Session>>>, session: &Option<Session>) {
+    if let Ok(mut g) = shared.lock() {
+        *g = session.clone();
+    }
+}
+
+fn interactive_loop(
+    rx: Receiver<Command>,
+    tx: Sender<Event>,
+    shared_session: Arc<Mutex<Option<Session>>>,
+) {
+    // Interactive: Class A/B only (mute/fader/Props/Capture/PlaceApp).
     let mut fx = FilterChainRuntime::new();
-    // Last session seen by the worker — used for idle GraphSupervisor ticks.
     let mut last_session: Option<Session> = None;
     let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
     let midi_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
@@ -727,17 +877,12 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                 .map(|t| t.expected_sink_name())
         });
     buschain_engine::midi::ensure_runtime(track_sink, track_bus);
-    let mut idle_ticks: u32 = 0;
-    // When Props/fast cmds last ran — skip Idempotent FX respawn briefly after.
-    let mut last_cmd_at = Instant::now();
     // Buses currently mixer-muted — volume drags skip the heavy gate path.
     let mut muted_buses: HashMap<String, bool> = HashMap::new();
     let mut props_retry: HashMap<String, PropsRetry> = HashMap::new();
+    // Interactive never ForceRespawns — blackhole FX job channel.
     let (fx_job_tx, fx_job_rx) = mpsc::channel::<FxEnsureJob>();
-    let (fx_done_tx, fx_done_rx) = mpsc::channel::<FxEnsureDone>();
-    spawn_fx_ensure_thread(fx_job_rx, fx_done_tx);
-    // At most one auto-retry per track after a failed ensure (no spin loops).
-    let mut fx_auto_retried: HashSet<uuid::Uuid> = HashSet::new();
+    drop(fx_job_rx);
     // Do not tear down BusChain on launch — leave buses / FX running across UI restart.
     // Always sweep pre-rebrand Shadow Audio leftovers (wrong media.name escaped teardown).
     match graph::teardown_legacy_shadow_graph() {
@@ -750,9 +895,14 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
         _ => {}
     }
     let _ = tx.send(Event::Status(
-        "Worker ready — buschain-engine supervisor online".into(),
+        "Worker ready — interactive lane online".into(),
     ));
-    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+    // Initial topology via Observer-style publish (not on mute path).
+    {
+        let snap = graph::refresh_snapshot();
+        graph::publish_observer_snapshot(snap.clone());
+        let _ = tx.send(Event::Snapshot(snap));
+    }
 
     loop {
         flush_props_retries(&mut props_retry);
@@ -760,60 +910,97 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
         if let Ok(mut g) = midi_session.lock() {
             *g = last_session.clone();
         }
+        publish_shared_session(&shared_session, &last_session);
         poll_midi_actions(&tx, &last_session, &mut muted_buses);
-        // Drain completed async FX ensures (Props kept running while they worked).
-        while let Ok(done) = fx_done_rx.try_recv() {
-            let total = done.queued_at.elapsed().as_millis();
-            buschain_engine::fx_trace::log(
-                "FxEnsureDone",
-                &format!("track={} total_ms", done.track_id),
-                total,
-            );
-            if total > 2000 {
-                let _ = tx.send(Event::Status(format!(
-                    "FX ensure took {total}ms (track {})",
-                    done.track_id
-                )));
+
+        let first = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(c) => c,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Props priority: never start idle work if a cmd is already waiting.
+                if let Ok(c) = rx.try_recv() {
+                    let mut batch = vec![c];
+                    while let Ok(more) = rx.try_recv() {
+                        batch.push(more);
+                    }
+                    let batch = coalesce_commands(batch);
+                    crate::audio::engine_handle::note_class_a();
+                    if process_command_batch(
+                        batch,
+                        &mut fx,
+                        &mut last_session,
+                        &mut muted_buses,
+                        &mut props_retry,
+                        &mut place_retry,
+                        &tx,
+                        &fx_job_tx,
+                        true,
+                    ) {
+                        publish_shared_session(&shared_session, &last_session);
+                        return;
+                    }
+                    publish_shared_session(&shared_session, &last_session);
+                    continue;
+                }
+                // Interactive idle: retries only. Supervisor = reconcile; Observer = snapshot.
+                continue;
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let mut batch = vec![first];
+        while let Ok(c) = rx.try_recv() {
+            batch.push(c);
+        }
+        let batch = coalesce_commands(batch);
+        crate::audio::engine_handle::note_class_a();
+        if process_command_batch(
+            batch,
+            &mut fx,
+            &mut last_session,
+            &mut muted_buses,
+            &mut props_retry,
+            &mut place_retry,
+            &tx,
+            &fx_job_tx,
+            true,
+        ) {
+            publish_shared_session(&shared_session, &last_session);
+            return;
+        }
+        publish_shared_session(&shared_session, &last_session);
+    }
+}
+
+fn supervisor_loop(
+    rx: Receiver<Command>,
+    tx: Sender<Event>,
+    shared_session: Arc<Mutex<Option<Session>>>,
+) {
+    let mut fx = FilterChainRuntime::new();
+    let mut last_session: Option<Session> = None;
+    let mut muted_buses: HashMap<String, bool> = HashMap::new();
+    let mut props_retry: HashMap<String, PropsRetry> = HashMap::new();
+    let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
+    let (fx_job_tx, fx_job_rx) = mpsc::channel::<FxEnsureJob>();
+    let (fx_done_tx, fx_done_rx) = mpsc::channel::<FxEnsureDone>();
+    spawn_fx_ensure_thread(fx_job_rx, fx_done_tx);
+    let mut idle_ticks: u32 = 0;
+    let mut last_cmd_at = Instant::now();
+    let _ = tx.send(Event::Status(
+        "Worker ready — supervisor lane online".into(),
+    ));
+
+    loop {
+        if let Ok(g) = shared_session.lock() {
+            if g.is_some() {
+                last_session = g.clone();
+            }
+        }
+        while let Ok(done) = fx_done_rx.try_recv() {
             match done.result {
                 Ok(message) => {
-                    fx_auto_retried.remove(&done.track_id);
-                    // Adopt Done topology for this track, keep fresher knobs/power
-                    // already patched into last_session during the ensure window.
-                    // Wholesale replace used to revive stale Bypass/knobs (and wipe
-                    // other tracks' in-flight Props).
-                    merge_ensure_track(
-                        &mut last_session,
-                        &done.session,
-                        done.track_id,
-                    );
-                    let push_ok = if let Some(cur) = last_session.as_ref() {
-                        crate::audio::insert_map::push_track_controls(cur, done.track_id)
-                    } else {
-                        crate::audio::insert_map::push_track_controls(
-                            &done.session,
-                            done.track_id,
-                        )
-                    };
-                    if push_ok.is_ok() {
-                        if let Some(t) = done.session.tracks.iter().find(|t| t.id == done.track_id)
-                        {
-                            props_retry.remove(&t.expected_sink_name());
-                        }
-                    } else if let Some((bus, inserts)) = last_session
-                        .as_ref()
-                        .and_then(|s| {
-                            crate::audio::insert_map::ladspa_slots_for(s, done.track_id)
-                        })
-                        .or_else(|| {
-                            crate::audio::insert_map::ladspa_slots_for(
-                                &done.session,
-                                done.track_id,
-                            )
-                        })
-                    {
-                        schedule_props_retry(&mut props_retry, bus, inserts);
-                    }
+                    merge_ensure_track(&mut last_session, &done.session, done.track_id);
+                    publish_shared_session(&shared_session, &last_session);
                     let bus = done
                         .session
                         .tracks
@@ -833,16 +1020,6 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                 }
                 Err(e) => {
                     let _ = tx.send(Event::Error(format!("FX rewire: {e}")));
-                    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
-                    // One automatic retry — false-neg restore_dry used to leave Master dry.
-                    if fx_auto_retried.insert(done.track_id) {
-                        last_session = Some(done.session.clone());
-                        let _ = fx_job_tx.send(FxEnsureJob {
-                            session: done.session,
-                            track_id: done.track_id,
-                            queued_at: Instant::now(),
-                        });
-                    }
                 }
             }
             last_cmd_at = Instant::now();
@@ -851,7 +1028,6 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
         let first = match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(c) => c,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Props priority: never start idle work if a cmd is already waiting.
                 if let Ok(c) = rx.try_recv() {
                     let mut batch = vec![c];
                     while let Ok(more) = rx.try_recv() {
@@ -868,34 +1044,21 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                         &mut place_retry,
                         &tx,
                         &fx_job_tx,
+                        false,
                     ) {
                         return;
                     }
+                    publish_shared_session(&shared_session, &last_session);
                     continue;
                 }
                 idle_ticks = idle_ticks.wrapping_add(1);
-                // Any recent knob/level/cmd: skip ALL idle graph work. Even
-                // reconcile_light_no_fx probes wetness (pactl/pw-link) and can
-                // block Props for hundreds of ms–seconds between sparse drags.
-                let recent_cmds = last_cmd_at.elapsed() < Duration::from_secs(2);
-                if recent_cmds {
+                if last_cmd_at.elapsed() < Duration::from_secs(2)
+                    || crate::audio::engine_handle::class_a_is_recent()
+                {
                     continue;
                 }
-                if let Some(ref mut session) = last_session {
-                    // Light reconcile ~every 4s when fully idle (Master egress repair).
-                    if idle_ticks % 16 == 0 {
-                        if let Ok(c) = rx.try_recv() {
-                            let mut batch = vec![c];
-                            while let Ok(more) = rx.try_recv() {
-                                batch.push(more);
-                            }
-                            let batch = coalesce_commands(batch);
-                            last_cmd_at = Instant::now();
-                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
-                                return;
-                            }
-                            continue;
-                        }
+                if let Some(ref session) = last_session {
+                    if idle_ticks % 16 == 0 && rx.try_recv().is_err() {
                         sync_engine_clock(session);
                         let hw = session
                             .master_output
@@ -903,66 +1066,24 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                             .filter(|n| !n.is_empty() && !n.starts_with("buschain_"))
                             .or_else(|| graph::resolve_hardware_output(session).ok());
                         if let Some(hw) = hw {
-                            if let Ok(c) = rx.try_recv() {
-                                let mut batch = vec![c];
-                                while let Ok(more) = rx.try_recv() {
-                                    batch.push(more);
-                                }
-                                let batch = coalesce_commands(batch);
-                                last_cmd_at = Instant::now();
-                                if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx)
-                                {
-                                    return;
-                                }
-                                continue;
-                            }
-                            crate::audio::engine_handle::sync_desired_from_session(session, &hw);
-                            crate::audio::engine_handle::with_engine(|eng| {
+                            let _ = crate::audio::engine_handle::with_engine_supervisor(|eng| {
+                                eng.set_profile(&session.performance);
+                                eng.remember_master_hw(&hw);
                                 let _ = eng.reconcile_light();
                             });
                         }
                     }
-                    // Placements ~every 30s and only when channel empty.
-                    if idle_ticks % 120 == 0 {
-                        if let Ok(c) = rx.try_recv() {
-                            let mut batch = vec![c];
-                            while let Ok(more) = rx.try_recv() {
-                                batch.push(more);
-                            }
-                            let batch = coalesce_commands(batch);
-                            last_cmd_at = Instant::now();
-                            if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
-                                return;
-                            }
-                            continue;
-                        }
-                        if let Ok(n) = graph::enforce_playback_placements(session) {
-                            if n > 0 {
-                                let _ = tx.send(Event::Status(format!(
-                                    "Placed {n} stream(s) onto session buses"
-                                )));
-                                if rx.try_recv().is_err() {
-                                    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                    if idle_ticks % 120 == 0 && rx.try_recv().is_err() {
+                        match crate::audio::engine_handle::sync_playback(session) {
+                            Ok(msg) if msg.contains("placed") => {
+                                let _ = tx.send(Event::Status(msg));
+                                if let Ok(inputs) = graph::refresh_sink_inputs_only() {
+                                    let _ = tx.send(Event::SinkInputs(inputs));
                                 }
                             }
+                            _ => {}
                         }
                     }
-                }
-                // Full snapshot ~every 30s when idle (never starve Props).
-                if idle_ticks % 120 == 0 {
-                    if let Ok(c) = rx.try_recv() {
-                        let mut batch = vec![c];
-                        while let Ok(more) = rx.try_recv() {
-                            batch.push(more);
-                        }
-                        let batch = coalesce_commands(batch);
-                        last_cmd_at = Instant::now();
-                        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
-                            return;
-                        }
-                        continue;
-                    }
-                    let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                 }
                 continue;
             }
@@ -975,9 +1096,20 @@ fn worker_loop(rx: Receiver<Command>, tx: Sender<Event>) {
         }
         let batch = coalesce_commands(batch);
         last_cmd_at = Instant::now();
-        if process_command_batch(batch, &mut fx, &mut last_session, &mut muted_buses, &mut props_retry, &mut place_retry, &tx, &fx_job_tx) {
+        if process_command_batch(
+            batch,
+            &mut fx,
+            &mut last_session,
+            &mut muted_buses,
+            &mut props_retry,
+            &mut place_retry,
+            &tx,
+            &fx_job_tx,
+            false,
+        ) {
             return;
         }
+        publish_shared_session(&shared_session, &last_session);
     }
 }
 
@@ -991,11 +1123,22 @@ fn process_command_batch(
     place_retry: &mut HashMap<String, PlaceRetry>,
     tx: &Sender<Event>,
     fx_job_tx: &Sender<FxEnsureJob>,
+    restore_on_shutdown: bool,
 ) -> bool {
         for cmd in batch {
             match cmd {
                 Command::Shutdown => {
                     fx.stop_all();
+                    if restore_on_shutdown {
+                        // Quit must not leave WirePlumber on a dead buschain_* default or a
+                        // muted Master HW — that silences YouTube / the whole desktop.
+                        let hw = last_session
+                            .as_ref()
+                            .and_then(|s| s.master_output.clone());
+                        if let Err(e) = graph::restore_system_audio(hw.as_deref()) {
+                            let _ = tx.send(Event::Error(format!("restore audio on quit: {e:#}")));
+                        }
+                    }
                     return true;
                 }
                 Command::Refresh => {
@@ -1003,10 +1146,11 @@ fn process_command_batch(
                 }
                 Command::Teardown => {
                     fx.stop_all();
-                    // Clear DesiredState + speakers_armed so the next ApplySession
-                    // re-runs ArmSession instead of idle-disarming Master→HW forever.
-                    let _ = crate::audio::engine_handle::engine_teardown();
-                    match graph::teardown_buschain_graph() {
+                    // Full reset: hand audio back to HW + destroy linger nodes.
+                    let hw = last_session
+                        .as_ref()
+                        .and_then(|s| s.master_output.clone());
+                    match graph::restore_system_audio(hw.as_deref()) {
                         Ok(msg) => {
                             let _ = tx.send(Event::Status(msg));
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
@@ -1118,13 +1262,27 @@ fn process_command_batch(
                 Command::RewireSessionRoutes(mut session)
                 | Command::HotplugSession(mut session) => {
                     sync_engine_clock(&session);
-                    crate::audio::engine_handle::teardown_rate_bridges();
-                    match graph::apply_session(
-                        &mut session,
-                        &mut fx,
-                        graph::ApplyKind::Hotplug,
-                    ) {
+                    session.normalize();
+                    // One-shot capture + egress — never Hotplug N× rewire_track_route.
+                    let hw = graph::resolve_hardware_output(&session)
+                        .unwrap_or_else(|_| session.master_output.clone().unwrap_or_default());
+                    for track in &session.tracks {
+                        if crate::audio::graph::track_has_live_fx(track) {
+                            let _ = crate::audio::insert_map::push_track_controls(
+                                &session,
+                                track.id,
+                            );
+                        }
+                    }
+                    match crate::audio::engine_handle::rewire_session_routes(&session, &hw) {
                         Ok(message) => {
+                            // Volumes only — never N× gate_track_mute/arm after Route.
+                            // (apply_track_levels re-armed every bus ~800ms each and
+                            // made Add In / In-mute wait minutes behind the worker.)
+                            for track in &session.tracks {
+                                let sink = track.expected_sink_name();
+                                let _ = graph::apply_one_track_volume(&sink, track.gain_db);
+                            }
                             *last_session = Some(session.clone());
                             let _ = tx.send(Event::SessionApplied {
                                 session,
@@ -1255,21 +1413,17 @@ fn process_command_batch(
                     track_id,
                 } => {
                     sync_engine_clock(&session);
+                    // ensure_live_track syncs Desired + native-arms egress (no Pulse loopback).
                     match graph::ensure_live_track(&mut session, track_id) {
                         Ok(message) => {
-                            if let Ok(hw) = graph::resolve_hardware_output(&session) {
-                                crate::audio::engine_handle::sync_desired_from_session(
-                                    &session, &hw,
-                                );
-                            }
-                            // Place assigned apps now that the bus exists (PlaceApp in
-                            // the same batch may have been ordered after us; also covers
-                            // +Track then assign races).
-                            if let Ok(n) = graph::enforce_playback_placements(&session) {
-                                if n > 0 {
-                                    let _ = tx.send(Event::Status(format!(
-                                        "Placed {n} stream(s) onto new track bus"
-                                    )));
+                            // One-shot SyncPlayback now that the bus exists.
+                            match crate::audio::engine_handle::sync_playback(&session) {
+                                Ok(msg) if msg.contains("placed") => {
+                                    let _ = tx.send(Event::Status(msg));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let _ = tx.send(Event::Error(format!("place streams: {e:#}")));
                                 }
                             }
                             *last_session = Some(session.clone());
@@ -1308,10 +1462,11 @@ fn process_command_batch(
                     }
                 }
                 Command::PruneTrack {
-                    session,
+                    mut session,
                     removed_bus,
-                } => match graph::prune_removed_track(&session, &mut fx, &removed_bus) {
+                } => match graph::prune_removed_track(&mut session, &mut fx, &removed_bus) {
                     Ok(message) => {
+                        *last_session = Some(session.clone());
                         let _ = tx.send(Event::SessionApplied {
                             session,
                             message,
@@ -1328,8 +1483,25 @@ fn process_command_batch(
                     if let Ok(hw) = graph::resolve_hardware_output(&session) {
                         crate::audio::engine_handle::sync_desired_from_session(&session, &hw);
                     }
-                    if let Err(e) = graph::apply_track_levels(&session) {
-                        let _ = tx.send(Event::Error(format!("levels: {e:#}")));
+                    // Mute transition only — never re-arm every unmuted bus.
+                    let any_solo = session
+                        .tracks
+                        .iter()
+                        .any(|t| t.solo && !t.kind.is_master());
+                    for track in &session.tracks {
+                        let sink = track.expected_sink_name();
+                        let muted = track.mute
+                            || (any_solo && !track.solo && !track.kind.is_master());
+                        let was = muted_buses.get(&sink).copied().unwrap_or(false);
+                        muted_buses.insert(sink.clone(), muted);
+                        let result = if muted != was {
+                            graph::apply_one_track_mute_gate(&sink, muted, track.gain_db)
+                        } else {
+                            graph::apply_one_track_volume(&sink, track.gain_db)
+                        };
+                        if let Err(e) = result {
+                            let _ = tx.send(Event::Error(format!("levels: {e:#}")));
+                        }
                     }
                 }
                 Command::SetTrackLevel {
@@ -1429,29 +1601,51 @@ fn process_command_batch(
                         }
                     }
                 }
-                Command::PlaceApp { app_key, sink } => {
-                    // Assignment truth lives in ApplyLevels(session). On unpin
-                    // (place onto Master / HW / preferred), clear any leftover pins
-                    // so idle enforce won't steal the stream back onto a track.
-                    if !sink.starts_with("buschain_track_") {
-                        if let Some(ref mut s) = last_session {
-                            for t in &mut s.tracks {
-                                t.assigned_playback.retain(|a| a != &app_key);
-                            }
+                Command::SyncCaptureDelta { session, track_id } => {
+                    *last_session = Some(session.clone());
+                    match crate::audio::engine_handle::sync_capture_delta(&session, track_id) {
+                        Ok(msg) => {
+                            let _ = tx.send(Event::Status(if msg.is_empty() {
+                                "Capture updated".into()
+                            } else {
+                                msg
+                            }));
+                            // Never refresh_snapshot on Capture — Class B budget.
                         }
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!("capture: {e:#}")));
+                        }
+                    }
+                }
+                Command::PlaceApp {
+                    session,
+                    app_key,
+                    sink,
+                } => {
+                    // Patch bus_playback only — never full Desired rebuild.
+                    *last_session = Some(session.clone());
+                    if let Some(tid) = session
+                        .tracks
+                        .iter()
+                        .find(|t| t.expected_sink_name() == sink)
+                        .map(|t| t.id)
+                    {
+                        crate::audio::engine_handle::patch_bus_playback(&session, tid);
                     }
                     match graph::place_app_on_sink(&app_key, &sink) {
                         Ok(0) => {
                             let _ = tx.send(Event::Status(format!(
                                 "App {app_key} — no live streams to move (play something)"
                             )));
-                            let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                            // Skip full snapshot — idle tick will refresh.
                         }
                         Ok(n) => {
                             let _ = tx.send(Event::Status(format!(
                                 "Placed {n} stream(s) → {sink}"
                             )));
-                            let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                            if let Ok(inputs) = graph::refresh_sink_inputs_only() {
+                                let _ = tx.send(Event::SinkInputs(inputs));
+                            }
                         }
                         Err(e) => {
                             // Defer retry — never sleep on the Props/levels thread.
@@ -1464,6 +1658,20 @@ fn process_command_batch(
                                     last_err: format!("{e:#}"),
                                 },
                             );
+                        }
+                    }
+                }
+                Command::SyncPlayback(session) => {
+                    *last_session = Some(session.clone());
+                    match crate::audio::engine_handle::sync_playback(&session) {
+                        Ok(msg) => {
+                            let _ = tx.send(Event::Status(msg));
+                            if let Ok(inputs) = graph::refresh_sink_inputs_only() {
+                                let _ = tx.send(Event::SinkInputs(inputs));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!("sync playback: {e:#}")));
                         }
                     }
                 }
@@ -1490,16 +1698,14 @@ fn process_command_batch(
                     }
                     // Immediate reclaim so apps leave HW/legacy sinks when default is BusChain.
                     if let Some(session) = last_session.as_ref() {
-                        match graph::enforce_playback_placements(session) {
-                            Ok(n) if n > 0 => {
-                                let _ = tx.send(Event::Status(format!(
-                                    "Placed {n} stream(s) → system default"
-                                )));
+                        match crate::audio::engine_handle::sync_playback(session) {
+                            Ok(msg) if msg.contains("placed") => {
+                                let _ = tx.send(Event::Status(msg));
                             }
+                            Ok(_) => {}
                             Err(e) => {
                                 let _ = tx.send(Event::Error(format!("place streams: {e:#}")));
                             }
-                            _ => {}
                         }
                     }
                     // Kick Master→HW repair so BusChain default is audible.

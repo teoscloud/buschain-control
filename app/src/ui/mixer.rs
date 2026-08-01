@@ -574,19 +574,25 @@ fn draw_strip(
             );
             ui.add_space(6.0);
 
-            // ON LED only — delete via right-click on the strip header.
+            // ON LED — one SetTrackLevel (never Levels N× fan-out).
             let mut live = !state.session.tracks[track_idx].mute;
             let has_sink = state.session.tracks[track_idx].sink_name.is_some();
             if design::track_on_led(ui, &theme, &mut live).changed() {
-                state.session.tracks[track_idx].mute = !live;
+                let mute = !live;
+                state.session.tracks[track_idx].mute = mute;
                 state.selected_track = Some(track_id);
                 state.dirty = true;
-                if has_sink {
-                    state.schedule_levels();
-                } else {
+                let gain_db = state.session.tracks[track_idx].gain_db;
+                let sink = state.session.tracks[track_idx].expected_sink_name();
+                crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
+                if !has_sink {
                     state.commit(crate::audio::LiveChange::EnsureTrack { track_id });
-                    state.schedule_levels();
                 }
+                state.worker.send(Command::SetTrackLevel {
+                    sink,
+                    gain_db,
+                    muted: mute,
+                });
             }
         });
     });
@@ -678,8 +684,11 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
         draw_virtual_output_section(ui, state, track_idx);
     }
 
-    ui.add_space(10.0);
-    draw_io_strip(ui, state, track_idx, is_master);
+    // Master has no HW capture rack — hide the In strip entirely.
+    if !is_master {
+        ui.add_space(10.0);
+        draw_io_strip(ui, state, track_idx, is_master);
+    }
 
     ui.add_space(12.0);
     design::section_label(ui, &theme, "APPS");
@@ -737,7 +746,7 @@ fn draw_virtual_output_section(ui: &mut egui::Ui, state: &mut AppState, track_id
         });
 }
 
-/// Hardware input + Listen (same row), separate from virtual system output.
+/// Hardware input rack + Listen, separate from virtual system output.
 fn draw_io_strip(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, is_master: bool) {
     let theme = state.theme;
     egui::Frame::NONE
@@ -755,22 +764,25 @@ fn draw_io_strip(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, is_m
                         .color(theme.text_dim()),
                 );
                 ui.add_space(6.0);
-
-                let listen_reserve = if is_master { 0.0 } else { 64.0 };
-                let dd_w = (ui.available_width() - listen_reserve).max(100.0);
-                draw_input_dropdown(ui, state, track_idx, dd_w);
-
+                ui.label(
+                    RichText::new("shared capture")
+                        .size(10.0)
+                        .color(theme.text_muted()),
+                );
                 if !is_master {
-                    ui.add_space(6.0);
-                    let mut listen = state.session.tracks[track_idx].listen;
-                    if design::toggle_chip(ui, &theme, "Listen", &mut listen, theme.accent())
-                        .changed()
-                    {
-                        state.session.tracks[track_idx].listen = listen;
-                        state.mark_routing_dirty();
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut listen = state.session.tracks[track_idx].listen;
+                        if design::toggle_chip(ui, &theme, "Listen", &mut listen, theme.accent())
+                            .changed()
+                        {
+                            state.session.tracks[track_idx].listen = listen;
+                            state.mark_routing_dirty();
+                        }
+                    });
                 }
             });
+            ui.add_space(6.0);
+            draw_inputs_rack(ui, state, track_idx, is_master);
         });
 }
 
@@ -1001,77 +1013,179 @@ fn input_device_title(name: &str, desc: &str) -> String {
     }
 }
 
-fn draw_input_dropdown(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, width: f32) {
-    let current = state.session.tracks[track_idx]
-        .input_source
-        .clone()
-        .unwrap_or_else(|| "(none)".into());
-    let current_title = if current == "(none)" {
-        "(none)".to_string()
-    } else if let Some(desc) = state
-        .session
-        .tracks[track_idx]
-        .input_source_desc
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        desc.to_string()
-    } else if let Some(src) = state.snapshot.sources.iter().find(|s| s.name == current) {
-        input_device_title(&src.name, &src.description)
-    } else {
-        short_device_title(&current)
-    };
+/// Multi-source capture rack (shared with desktop / other tracks).
+fn draw_inputs_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, is_master: bool) {
+    let theme = state.theme;
+    let content_w = ui.available_width();
+    ui.set_max_width(content_w);
+
+    if is_master {
+        ui.label(
+            RichText::new("Master has no hardware capture inputs")
+                .size(11.0)
+                .color(theme.text_muted()),
+        );
+        return;
+    }
 
     let own_vin = state.session.tracks[track_idx].expected_virtual_input_name();
-    let sources: Vec<(String, String)> = std::iter::once(("(none)".into(), "(none)".into()))
-        .chain(state.snapshot.sources.iter().filter_map(|s| {
-            // Hide graph helpers + this track's own virtual mic (feedback).
+    let mut remove_idx: Option<usize> = None;
+    let mut mute_toggle: Option<(usize, bool)> = None;
+    let row_count = state.session.tracks[track_idx].inputs.len();
+    for i in 0..row_count {
+        let (src, desc, muted) = {
+            let inp = &state.session.tracks[track_idx].inputs[i];
+            (
+                inp.source.clone(),
+                inp.source_desc.clone(),
+                inp.mute,
+            )
+        };
+        let title = if let Some(d) = desc.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            d.to_string()
+        } else if let Some(s) = state.snapshot.sources.iter().find(|s| s.name == src) {
+            input_device_title(&s.name, &s.description)
+        } else {
+            short_device_title(&src)
+        };
+        mini_rack_row(ui, &theme, content_w, |ui| {
+            ui.label(
+                RichText::new(&title)
+                    .size(12.0)
+                    .strong()
+                    .color(if muted {
+                        theme.text_muted()
+                    } else {
+                        theme.text()
+                    }),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if design::text_tool_button(ui, &theme, "×")
+                    .on_hover_text("Remove input")
+                    .clicked()
+                {
+                    remove_idx = Some(i);
+                }
+                let mut m = muted;
+                if design::toggle_chip(ui, &theme, "M", &mut m, theme.danger())
+                    .on_hover_text("Mute this capture hop (keep in rack)")
+                    .changed()
+                {
+                    mute_toggle = Some((i, m));
+                }
+            });
+        });
+        ui.add_space(3.0);
+    }
+
+    if let Some(i) = remove_idx {
+        let tid = state.session.tracks[track_idx].id;
+        state.session.tracks[track_idx].inputs.remove(i);
+        state.session.tracks[track_idx].sync_legacy_input_fields();
+        state.mark_capture_dirty(tid);
+    }
+    if let Some((i, m)) = mute_toggle {
+        let tid = state.session.tracks[track_idx].id;
+        if let Some(inp) = state.session.tracks[track_idx].inputs.get_mut(i) {
+            inp.mute = m;
+        }
+        state.session.tracks[track_idx].sync_legacy_input_fields();
+        state.mark_capture_dirty(tid);
+    }
+
+    let assigned: std::collections::HashSet<String> = state.session.tracks[track_idx]
+        .inputs
+        .iter()
+        .map(|i| i.source.clone())
+        .collect();
+    let choices: Vec<(String, String)> = state
+        .snapshot
+        .sources
+        .iter()
+        .filter_map(|s| {
             if s.name.contains(".monitor")
                 || s.name.starts_with("buschain_vinf_")
                 || s.name.starts_with("buschain_post_")
                 || s.name.starts_with("buschain_hold")
                 || s.name == own_vin
+                || assigned.contains(&s.name)
             {
                 return None;
             }
             Some((s.name.clone(), input_device_title(&s.name, &s.description)))
-        }))
+        })
         .collect();
 
-    let input_salt = state.session.tracks[track_idx].id;
-    egui::ComboBox::from_id_salt(format!("input_{input_salt}"))
-        .selected_text(RichText::new(&current_title).size(11.0))
-        .width(width)
-        .show_ui(ui, |ui| {
-            for (name, title) in &sources {
-                if ui
-                    .selectable_label(current == *name, RichText::new(title).size(11.0))
-                    .clicked()
-                {
-                    if name == "(none)" {
-                        state.session.tracks[track_idx].input_source = None;
-                        state.session.tracks[track_idx].input_source_desc = None;
-                    } else {
-                        let desc = state
-                            .snapshot
-                            .sources
-                            .iter()
-                            .find(|s| s.name == *name)
-                            .map(|s| s.description.clone())
-                            .unwrap_or_default();
-                        state.session.tracks[track_idx].input_source = Some(name.clone());
-                        state.session.tracks[track_idx].input_source_desc =
-                            Some(if desc.trim().is_empty() {
-                                title.clone()
-                            } else {
-                                desc
-                            });
-                    }
-                    state.mark_routing_dirty();
-                }
+    let track_id_salt = state.session.tracks[track_idx].id;
+    let popup_id = ui.make_persistent_id(("input_assign_popup", track_id_salt));
+    let trigger = ui.add(
+        egui::Button::new(
+            RichText::new(format!("{}  Add", egui_phosphor::regular::PLUS))
+                .size(12.0)
+                .strong()
+                .color(theme.text()),
+        )
+        .fill(theme.bg_elevated())
+        .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+        .corner_radius(theme.rounding())
+        .min_size(Vec2::new(88.0, 26.0)),
+    );
+    if trigger.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    let mut pick: Option<(String, String)> = None;
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &trigger,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(220.0);
+            ui.set_max_height(280.0);
+            if choices.is_empty() {
+                ui.label(
+                    RichText::new("No sources available")
+                        .size(11.0)
+                        .color(theme.text_muted()),
+                );
+                return;
             }
-        });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (name, title) in &choices {
+                    if ui
+                        .selectable_label(false, RichText::new(title).size(11.0))
+                        .clicked()
+                    {
+                        pick = Some((name.clone(), title.clone()));
+                    }
+                }
+            });
+        },
+    );
+    if let Some((name, title)) = pick {
+        let desc = state
+            .snapshot
+            .sources
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.description.clone())
+            .unwrap_or_default();
+        let tid = state.session.tracks[track_idx].id;
+        state.session.tracks[track_idx]
+            .inputs
+            .push(crate::session::TrackInput {
+                source: name,
+                source_desc: Some(if desc.trim().is_empty() {
+                    title
+                } else {
+                    desc
+                }),
+                mute: false,
+            });
+        state.session.tracks[track_idx].sync_legacy_input_fields();
+        state.mark_capture_dirty(tid);
+    }
 }
 
 /// APPS mini-rack — insert-style rows for assigned playback apps.
@@ -1131,11 +1245,7 @@ fn draw_apps_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
             .assigned_playback
             .retain(|a| a != &key && !keys_same_app(a, &key));
         state.dirty = true;
-        state
-            .worker
-            .send(crate::audio::worker::Command::ApplyLevels(
-                state.session.clone(),
-            ));
+        let _ = state.session.save();
         let fallback = state
             .session
             .preferred_default_sink
@@ -1144,9 +1254,13 @@ fn draw_apps_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
             .or_else(|| Some("buschain_master".into()));
         if let Some(dest) = fallback {
             state.worker.send(crate::audio::worker::Command::PlaceApp {
+                session: state.session.clone(),
                 app_key: key,
                 sink: dest,
             });
+        } else {
+            let tid = state.session.tracks[track_idx].id;
+            state.commit(crate::audio::LiveChange::PlaceApp { track_id: tid });
         }
     }
 
@@ -1236,15 +1350,12 @@ fn draw_apps_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
             track.sink_name = Some(sink.clone());
         }
         state.dirty = true;
-        state
-            .worker
-            .send(crate::audio::worker::Command::ApplyLevels(
-                state.session.clone(),
-            ));
+        let _ = state.session.save();
         if !state.snapshot.sinks.iter().any(|s| s.name == sink) {
             state.ensure_new_track(tid);
         }
         state.worker.send(crate::audio::worker::Command::PlaceApp {
+            session: state.session.clone(),
             app_key: key,
             sink,
         });

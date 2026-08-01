@@ -80,8 +80,9 @@ pub fn ladspa_search_path() -> String {
 }
 
 pub fn sink_exists(name: &str) -> bool {
-    if super::native::native_ready() && super::native::native_sink_exists(name) {
-        return true;
+    // Native registry ready ⇒ false is final (no Pulse short-sinks fallthrough).
+    if super::native::native_ready() {
+        return super::native::native_sink_exists(name);
     }
     sink_index(name).is_some()
 }

@@ -15,6 +15,10 @@ fn is_monitor_source(source: &str) -> bool {
 
 fn channel_is_fl(ch: &str, name: &str) -> bool {
     let pl = format!("{ch}:{name}").to_lowercase();
+    // Don't treat MONO as FL (substring "mo" / channel noise).
+    if pl.contains("mono") {
+        return false;
+    }
     pl.contains("fl")
         || pl.contains("front-left")
         || pl.contains("_0")
@@ -24,6 +28,9 @@ fn channel_is_fl(ch: &str, name: &str) -> bool {
 
 fn channel_is_fr(ch: &str, name: &str) -> bool {
     let pl = format!("{ch}:{name}").to_lowercase();
+    if pl.contains("mono") {
+        return false;
+    }
     pl.contains("fr")
         || pl.contains("front-right")
         || pl.contains("_1")
@@ -31,9 +38,13 @@ fn channel_is_fr(ch: &str, name: &str) -> bool {
         || ch.eq_ignore_ascii_case("FR")
 }
 
+fn channel_is_mono(ch: &str, name: &str) -> bool {
+    let pl = format!("{ch}:{name}").to_lowercase();
+    pl.contains("mono") || ch.eq_ignore_ascii_case("MONO") || ch.eq_ignore_ascii_case("FC")
+}
+
 fn pick_lr<'a>(ports: &[&'a PortRec], prefer_monitor: bool) -> Option<(&'a PortRec, &'a PortRec)> {
-    let mut fl = None;
-    let mut fr = None;
+    let mut candidates: Vec<&PortRec> = Vec::new();
     for p in ports {
         let pl = p.name.to_lowercase();
         if prefer_monitor && !pl.contains("monitor") && (pl.contains("playback") || pl.contains("input"))
@@ -43,6 +54,26 @@ fn pick_lr<'a>(ports: &[&'a PortRec], prefer_monitor: bool) -> Option<(&'a PortR
         if !prefer_monitor && pl.contains("monitor") {
             continue;
         }
+        candidates.push(*p);
+    }
+    if candidates.is_empty() {
+        candidates = ports.to_vec();
+    }
+
+    // Scarlett Mic1/Mic2 etc.: single capture_MONO → both stereo bus inputs.
+    if let Some(mono) = candidates
+        .iter()
+        .find(|p| channel_is_mono(&p.channel, &p.name))
+    {
+        return Some((*mono, *mono));
+    }
+    if candidates.len() == 1 {
+        return Some((candidates[0], candidates[0]));
+    }
+
+    let mut fl = None;
+    let mut fr = None;
+    for p in &candidates {
         if channel_is_fl(&p.channel, &p.name) && fl.is_none() {
             fl = Some(*p);
         } else if channel_is_fr(&p.channel, &p.name) && fr.is_none() {
@@ -50,8 +81,8 @@ fn pick_lr<'a>(ports: &[&'a PortRec], prefer_monitor: bool) -> Option<(&'a PortR
         }
     }
     if fl.is_none() || fr.is_none() {
-        if ports.len() >= 2 {
-            return Some((ports[0], ports[1]));
+        if candidates.len() >= 2 {
+            return Some((candidates[0], candidates[1]));
         }
         return None;
     }
@@ -87,14 +118,29 @@ pub fn port_id_pairs(view: &GraphView, source: &str, sink: &str) -> Result<Vec<(
         return Err(anyhow!("no PW input ports for node `{dst_name}`"));
     }
 
-    let prefer_src_monitor =
-        is_monitor_source(source) || src_ports.iter().any(|p| p.name.contains("monitor"));
+    // Only prefer monitor_* when the Pulse endpoint is explicitly `.monitor`.
+    // HW capture nodes must use capture_* / capture_MONO — never skip them because
+    // a sibling port name happens to contain "monitor".
+    let prefer_src_monitor = is_monitor_source(source);
     let (s_fl, s_fr) = pick_lr(&src_ports, prefer_src_monitor)
         .ok_or_else(|| anyhow!("could not pick L/R outputs on `{src_name}`"))?;
     let (d_fl, d_fr) = pick_lr(&dst_ports, false)
         .ok_or_else(|| anyhow!("could not pick L/R inputs on `{dst_name}`"))?;
 
-    Ok(vec![(s_fl.id, d_fl.id), (s_fr.id, d_fr.id)])
+    // Mono→stereo: same out port may map to both playback_FL and playback_FR.
+    let mut pairs = vec![(s_fl.id, d_fl.id)];
+    if s_fl.id != s_fr.id || d_fl.id != d_fr.id {
+        let second = (s_fr.id, d_fr.id);
+        if second != pairs[0] {
+            pairs.push(second);
+        }
+    } else {
+        // Identical mono pair — still link both dest channels when distinct.
+        if d_fl.id != d_fr.id {
+            pairs.push((s_fl.id, d_fr.id));
+        }
+    }
+    Ok(pairs)
 }
 
 pub fn link_is_live(view: &GraphView, source: &str, sink: &str) -> bool {
@@ -171,5 +217,33 @@ mod tests {
             in_port: 23,
         });
         assert!(link_is_live(&g, "buschain_track_a.monitor", "buschain_fx_a"));
+    }
+
+    #[test]
+    fn scarlett_mono_mic_maps_to_stereo_bus() {
+        let mut g = GraphView::default();
+        g.insert_node(NodeRec {
+            id: 1,
+            name: "alsa_input.usb-Focusrite_Scarlett_2i4_USB-00.HiFi__Mic1__source".into(),
+            media_class: "Audio/Source".into(),
+            description: String::new(),
+            rate: None,
+        });
+        g.insert_port(PortRec {
+            id: 11,
+            node_id: 1,
+            name: "capture_MONO".into(),
+            direction: PortDir::Out,
+            channel: "MONO".into(),
+        });
+        stereo_bus(&mut g, 2, "buschain_track_dualmic");
+        let pairs = port_id_pairs(
+            &g,
+            "alsa_input.usb-Focusrite_Scarlett_2i4_USB-00.HiFi__Mic1__source",
+            "buschain_track_dualmic",
+        )
+        .unwrap();
+        // Mono capture → both playback_FL and playback_FR.
+        assert_eq!(pairs, vec![(11, 22), (11, 23)]);
     }
 }

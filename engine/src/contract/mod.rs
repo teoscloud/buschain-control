@@ -58,6 +58,21 @@ pub enum Intent {
         soft_quantum: bool,
         bind_buschain: bool,
     },
+    /// Apply Desired `bus_inputs` onto the live graph (shared capture hops).
+    /// Caller must sync Desired first — this never ForceRespawns FX.
+    /// Cold / hotplug / Reconcile only — interactive In edits use [`SyncCaptureDelta`].
+    SyncCapture,
+    /// Surgical capture: remove and/or add specific sources on one track bus.
+    /// Force-recreates adds; updates `last_applied` only after native verified-live.
+    /// Never ForceRespawns FX; never relinks egress.
+    SyncCaptureDelta {
+        bus: String,
+        remove: Vec<String>,
+        add: Vec<String>,
+    },
+    /// Apply Desired `bus_playback` pins (move sink-inputs onto session buses).
+    /// Caller must sync Desired first — never Full Apply / ForceRespawn.
+    SyncPlayback,
 }
 
 /// Result fragment for UI status lines.

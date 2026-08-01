@@ -244,13 +244,14 @@ impl AppState {
     }
 
     pub fn graph_is_live(&self) -> bool {
-        // Session reattach alone is not enough — PipeWire must still have Master.
-        let has_master = self
-            .snapshot
+        // Master null-sink present ⇒ graph is up. Do not require session
+        // `sink_name` — that field can lag / stay None while audio is playing,
+        // and treating that as "cold" made +Track escalate to Full Apply which
+        // cold-disarmed Master→HW (silence).
+        self.snapshot
             .sinks
             .iter()
-            .any(|s| s.name == "buschain_master");
-        has_master && self.session.tracks.iter().any(|t| t.sink_name.is_some())
+            .any(|s| s.name == "buschain_master")
     }
 
     /// Idle reconcile / recovery. Normal edits use [`Self::commit`] and stay live.
@@ -280,8 +281,13 @@ impl AppState {
     pub fn commit(&mut self, change: LiveChange) {
         self.dirty = true;
 
-        // Cold graph: bring buses/FX up instead of asking the user to Apply.
-        if change.needs_graph() && !self.graph_is_live() {
+        // Cold graph: only explicit Reconcile may Full Apply / ArmSession.
+        // EnsureTrack / Route / VirtualInput / FxRewire stay surgical — escalating
+        // them used to cold-disarm Master→HW (silence on +Track / mic assign).
+        if change.needs_graph()
+            && !self.graph_is_live()
+            && matches!(change, LiveChange::Reconcile)
+        {
             self.hotplug_deadline = None;
             self.fx_dirty_tracks.clear();
             self.params_deadline = None;
@@ -339,12 +345,40 @@ impl AppState {
                 });
                 self.status = "Live virtual input…".into();
             }
+            LiveChange::Capture { track_id } => {
+                self.worker.send(Command::SyncCaptureDelta {
+                    session: self.session.clone(),
+                    track_id,
+                });
+                self.status = "Live capture — In hops…".into();
+            }
+            LiveChange::PlaceApp { track_id } => {
+                // PlaceApp-only hot path (never SyncPlayback after every Add).
+                // Unpin-all / EnsureTrack / idle reclaim still use SyncPlayback.
+                if let Some(track) = self.session.tracks.iter().find(|t| t.id == track_id) {
+                    let sink = track
+                        .sink_name
+                        .clone()
+                        .unwrap_or_else(|| track.expected_sink_name());
+                    if let Some(app_key) = track.assigned_playback.last().cloned() {
+                        self.worker.send(Command::PlaceApp {
+                            session: self.session.clone(),
+                            app_key,
+                            sink,
+                        });
+                    } else {
+                        self.worker
+                            .send(Command::SyncPlayback(self.session.clone()));
+                    }
+                }
+                self.status = "Placing app streams…".into();
+            }
             LiveChange::Route => {
-                // Links only — never clear pending Props (Route must not starve knobs).
+                // Egress + listen + Master HW only — never capture purge.
                 self.worker.send(Command::RewireSessionRoutes(
                     self.session.clone(),
                 ));
-                self.status = "Live routing — links only…".into();
+                self.status = "Live routing — egress only…".into();
             }
             LiveChange::Reconcile => {
                 self.hotplug_deadline = None;
@@ -1062,12 +1096,22 @@ impl AppState {
         if self.levels_pending_full {
             self.levels_pending_full = false;
             self.pending_level_track = None;
-            // Keep embedded IPC session (get_mixer) aligned with UI mute/solo recount.
+            // Per-track SetTrackLevel (native gate) — never ApplyLevels N× list_sinks.
+            let any_solo = self
+                .session
+                .tracks
+                .iter()
+                .any(|t| t.solo && !t.kind.is_master());
             for t in &self.session.tracks {
                 crate::daemon::push_track_mixer_to_daemon(t.id, t.gain_db, t.mute);
+                let muted =
+                    t.mute || (any_solo && !t.solo && !t.kind.is_master());
+                self.worker.send(Command::SetTrackLevel {
+                    sink: t.expected_sink_name(),
+                    gain_db: t.gain_db,
+                    muted,
+                });
             }
-            self.worker
-                .send(Command::ApplyLevels(self.session.clone()));
             return;
         }
 
@@ -1149,6 +1193,11 @@ impl AppState {
 
     pub fn mark_routing_dirty(&mut self) {
         self.commit(LiveChange::Route);
+    }
+
+    /// In-rack add / mute-row / remove — capture hops only (never Route).
+    pub fn mark_capture_dirty(&mut self, track_id: Uuid) {
+        self.commit(LiveChange::Capture { track_id });
     }
 
     fn adopt_session(&mut self, session: Session) {
@@ -1462,6 +1511,9 @@ impl AppState {
                     self.snapshot = s;
                     self.sync_bus_names_from_snapshot();
                     self.try_reattach_from_snapshot();
+                }
+                Event::SinkInputs(inputs) => {
+                    self.snapshot.sink_inputs = inputs;
                 }
                 Event::Status(s) => {
                     let skipped = s.starts_with("Live params skipped");

@@ -16,9 +16,115 @@ fn usage() -> ! {
            buschain-ctl source vol <name> <pct>|mute <name> on|off\n\
            buschain-ctl session list|load <slug>|save|save-as <name>|delete <slug>\n\
            buschain-ctl popup playback\n\
-           buschain-ctl apply|shutdown\n"
+           buschain-ctl apply|shutdown\n\
+           buschain-ctl recover-audio   (restore HW default/unmute; no tray required)\n"
     );
     std::process::exit(2);
+}
+
+/// Standalone recovery when Quit/crash left a hollow PipeWire session.
+/// Does not require buschain-control to be running.
+fn recover_desktop_audio() -> i32 {
+    use std::process::Command;
+
+    let sinks = Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let sources = Command::new("pactl")
+        .args(["list", "short", "sources"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let hw_sink = sinks
+        .lines()
+        .filter_map(|l| l.split('\t').nth(1))
+        .find(|n| !n.starts_with("buschain_") && !n.starts_with("shadow_"))
+        .unwrap_or("")
+        .to_string();
+    let hw_src = sources
+        .lines()
+        .filter_map(|l| l.split('\t').nth(1))
+        .find(|n| {
+            !n.starts_with("buschain_")
+                && !n.starts_with("shadow_")
+                && !n.ends_with(".monitor")
+        })
+        .unwrap_or("")
+        .to_string();
+
+    if hw_sink.is_empty() {
+        eprintln!("recover-audio: no non-buschain sink found");
+        return 1;
+    }
+
+    let _ = Command::new("pactl")
+        .args(["set-default-sink", &hw_sink])
+        .status();
+    let _ = Command::new("pactl")
+        .args(["set-sink-mute", &hw_sink, "0"])
+        .status();
+    if !hw_src.is_empty() {
+        let _ = Command::new("pactl")
+            .args(["set-default-source", &hw_src])
+            .status();
+        let _ = Command::new("pactl")
+            .args(["set-source-mute", &hw_src, "0"])
+            .status();
+    }
+
+    // Move streams off buschain_* onto HW.
+    if let Ok(out) = Command::new("pactl")
+        .args(["list", "short", "sink-inputs"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let mut parts = line.split('\t');
+            let Some(idx) = parts.next() else { continue };
+            let _ = Command::new("pactl")
+                .args(["move-sink-input", idx, &hw_sink])
+                .status();
+        }
+    }
+
+    // Best-effort unload Pulse modules that still name buschain_*.
+    if let Ok(out) = Command::new("pactl")
+        .args(["list", "modules", "short"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let mut parts = line.splitn(3, '\t');
+            let Some(idx) = parts.next() else { continue };
+            let Some(name) = parts.next() else { continue };
+            let args = parts.next().unwrap_or("");
+            let buschain = args.contains("buschain_") || args.contains("shadow_");
+            let kind = matches!(
+                name,
+                "module-null-sink" | "module-loopback" | "module-remap-source" | "module-ladspa-sink"
+            );
+            if buschain && kind {
+                let _ = Command::new("pactl")
+                    .args(["unload-module", idx])
+                    .status();
+            }
+        }
+    }
+
+    println!("recover-audio: default sink → {hw_sink} (unmuted)");
+    if !hw_src.is_empty() {
+        println!("recover-audio: default source → {hw_src} (unmuted)");
+    }
+    println!(
+        "If still silent: systemctl --user restart wireplumber\n\
+         (NixOS rebuild that restarts wireplumber.service has cleared hollow state.)"
+    );
+    0
 }
 
 fn print_status_waybar(st: &buschain_control::ipc::Status) {
@@ -68,6 +174,9 @@ fn main() {
         usage();
     }
     let cmd = args.remove(0);
+    if cmd == "recover-audio" {
+        std::process::exit(recover_desktop_audio());
+    }
     let req = match cmd.as_str() {
         "ping" => Request::Ping,
         "status" => Request::GetStatus,

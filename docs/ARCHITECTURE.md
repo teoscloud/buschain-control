@@ -18,7 +18,9 @@
 **Process model:** one `buschain-control` process owns the graph
 (in-process worker + coalesce). On startup it binds
 `$XDG_RUNTIME_DIR/buschain-control/daemon.sock` and forwards ctl/waybar/egui mixer
-commands into the same worker. Close hides to tray; Quit tears the graph down.
+commands into the same worker. Close hides to tray; Quit tears the graph down
+**and must restore desktop audio** (HW default + unmute + destroy linger nodes) —
+see TECHNICAL.md pin *quit leaves system audio broken*. Hide-to-tray must not.
 Hyprland: `exec-once = buschain-control --hidden`. Do **not** run a separate
 `buschain-daemon` unit — that forces a laggy thin-client hop.
 `--daemon-client` remains a debug escape hatch only.
@@ -43,11 +45,15 @@ Master HW (DeviceCaps)
         │
         ├── buschain_track_* / buschain_master / buschain_post_* / buschain_hold / buschain_fx_*
         │
-External 48 kHz mic ──► buschain_rs_* (rate bridge) ──► track bus @ GraphClock
+External mic(s) ──shared──► [buschain_rs_* if rate ≠ GraphClock] ──► track bus(es)
+     │
+     └── desktop capture (Zoom/Discord) keeps its own links — never exclusive-stolen
 ```
 
 - Config → **Apply audio settings** → `Command::BindMasterClock` → engine `Intent::BindMasterClock` then route rewire.
 - Mismatched external endpoints get an owned `buschain_rs_*` null-sink at GraphClock; only that hop converts.
+- Track capture is an **input rack** (`Track.inputs`): multiple HW sources per track, same source on many tracks; Desired `bus_inputs` reconciles shared hops via one-shot `Intent::SyncCapture` (Route never N× rebuilds capture).
+- Apps rack pins use Desired `bus_playback` + one-shot `Intent::SyncPlayback` (never ApplyLevels / Route).
 
 ## PipeWire mixer graph
 
@@ -58,7 +64,7 @@ libpipewire MainLoop + registry cache for links / null-sinks / node lookup / lev
 
 ```
 Apps ──assign──► Track null sinks ──► buschain_fx_* (in-process host) ──► post ──► Master ──► HW
-Inputs ─assign─► (optional rate-bridge) ──► Track bus
+HW mics ─shared rack─► (optional rate-bridge) ──► Track bus(es)   [coexists with system default]
 ```
 
 - Master UI column is always leftmost (`Session::tracks_ui_order`).

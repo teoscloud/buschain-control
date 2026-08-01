@@ -6,7 +6,9 @@
 //! lock-free cache updated only by the worker after FX ensure/teardown/probe.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use buschain_engine::{
     BusLevel, ChainEnsureMode, ChainSpec, ChainState,
@@ -18,6 +20,13 @@ use crate::session::Session;
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
 /// Bus → wet. Read from UI; written from worker after FX ops.
 static WET_CACHE: OnceLock<RwLock<HashMap<String, bool>>> = OnceLock::new();
+/// Monotonic ms since process start of last Interactive Class A engine touch.
+static LAST_CLASS_A_MS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+fn process_start() -> Instant {
+    *PROCESS_START.get_or_init(Instant::now)
+}
 
 fn engine_mutex() -> &'static Mutex<Engine> {
     ENGINE.get_or_init(|| Mutex::new(Engine::new()))
@@ -25,6 +34,26 @@ fn engine_mutex() -> &'static Mutex<Engine> {
 
 fn wet_cache() -> &'static RwLock<HashMap<String, bool>> {
     WET_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Mark Interactive Class A activity (mute/fader/Props) for Supervisor backoff.
+pub fn note_class_a() {
+    let ms = process_start().elapsed().as_millis() as u64;
+    LAST_CLASS_A_MS.store(ms, Ordering::Release);
+}
+
+fn class_a_recent(within: Duration) -> bool {
+    let last = LAST_CLASS_A_MS.load(Ordering::Acquire);
+    if last == 0 {
+        return false;
+    }
+    let now = process_start().elapsed().as_millis() as u64;
+    now.saturating_sub(last) < within.as_millis() as u64
+}
+
+/// Supervisor idle: true when Interactive touched ENGINE in the last 100ms.
+pub fn class_a_is_recent() -> bool {
+    class_a_recent(Duration::from_millis(100))
 }
 
 fn set_wet_cached(bus: &str, wet: bool) {
@@ -58,6 +87,28 @@ pub fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
     f(&mut g)
 }
 
+/// Supervisor path: backoff while Interactive Class A is hot (&lt;100ms).
+pub fn with_engine_supervisor<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
+    for _ in 0..32 {
+        if class_a_recent(Duration::from_millis(100)) {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        match engine_mutex().try_lock() {
+            Ok(mut g) => return Some(f(&mut g)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut g = p.into_inner();
+                return Some(f(&mut g));
+            }
+        }
+    }
+    // Last resort — Interactive quiet enough or we waited out.
+    Some(with_engine(f))
+}
+
 /// Sync session performance into the engine before graph mutations.
 pub fn sync_profile(profile: &PerformanceProfile) {
     with_engine(|eng| eng.set_profile(profile));
@@ -85,6 +136,8 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
         eng.desired_mut().fx_chains.clear();
         eng.desired_mut().bus_egress.clear();
         eng.desired_mut().virtual_inputs.clear();
+        eng.desired_mut().bus_inputs.clear();
+        eng.desired_mut().bus_playback.clear();
 
         for track in &session.tracks {
             let bus = track.expected_sink_name();
@@ -160,6 +213,29 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                 }
             }
             eng.desired_mut().set_bus_egress(&bus, dests.clone());
+
+            // Shared capture rack (unmuted rows only). Soft-bind happens in session store.
+            if !track.kind.is_master() {
+                let sources: Vec<String> = track
+                    .inputs
+                    .iter()
+                    .filter(|i| !i.mute)
+                    .map(|i| i.source.clone())
+                    .filter(|s| {
+                        !s.is_empty()
+                            && s != "(none)"
+                            && !s.starts_with("buschain_")
+                            && s != &track.expected_virtual_input_name()
+                    })
+                    .collect();
+                eng.desired_mut().set_bus_inputs(&bus, sources);
+            }
+
+            // Session-pinned playback apps (Apps rack).
+            if !track.assigned_playback.is_empty() {
+                eng.desired_mut()
+                    .set_bus_playback(&bus, track.assigned_playback.clone());
+            }
 
             if let Some(mut spec) = crate::audio::insert_map::chain_spec_for_track(
                 session,
@@ -333,6 +409,150 @@ pub fn relink_routes(session: &Session, hw_sink: &str) -> anyhow::Result<String>
     Ok(msg)
 }
 
+/// Route / Hotplug egress path: sync Desired → `relink_routes` only.
+/// Capture is `sync_capture_delta` / cold `SyncCapture` — never bundled here.
+pub fn rewire_session_routes(session: &Session, hw_sink: &str) -> anyhow::Result<String> {
+    sync_desired_from_session(session, hw_sink);
+    let (msg, buses) = with_engine(|eng| {
+        let report = eng.relink_routes()?;
+        let buses: Vec<String> = eng.desired().buses.keys().cloned().collect();
+        Ok::<_, anyhow::Error>((report.join(), buses))
+    })?;
+    for bus in buses {
+        let wet = with_engine(|eng| eng.chain_is_wet(&bus));
+        set_wet_cached(&bus, wet);
+    }
+    Ok(msg)
+}
+
+/// Patch one track's Desired `bus_inputs` and apply `Intent::SyncCaptureDelta`.
+pub fn sync_capture_delta(session: &Session, track_id: uuid::Uuid) -> anyhow::Result<String> {
+    let track = session
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .ok_or_else(|| anyhow::anyhow!("track not found"))?;
+    if track.kind.is_master() {
+        return Ok("capture: master has no In rack".into());
+    }
+    let bus = track.expected_sink_name();
+    let want: Vec<String> = track
+        .inputs
+        .iter()
+        .filter(|i| !i.mute)
+        .map(|i| i.source.clone())
+        .filter(|s| {
+            !s.is_empty()
+                && s != "(none)"
+                && !s.starts_with("buschain_")
+                && s != &track.expected_virtual_input_name()
+        })
+        .collect();
+    // Keep Desired egress for this bus (Capture must not leave hold-only silence).
+    patch_bus_egress(session, track_id);
+    let unmuted = !track.mute;
+    let report = with_engine(|eng| {
+        let prev = eng
+            .last_applied_bus_inputs()
+            .get(&bus)
+            .cloned()
+            .unwrap_or_default();
+        // Force-recreate: new sources OR fingerprinted-but-dead (ghost In).
+        let (remove, add) = {
+            let desired = eng.desired();
+            buschain_engine::runtime::plan_capture_delta(&prev, &want, |s| {
+                buschain_engine::backend::capture_hop_verified(s, &bus, desired)
+            })
+        };
+        eng.desired_mut().set_bus_inputs(&bus, want);
+        let report = eng.apply(Intent::SyncCaptureDelta {
+            bus: bus.clone(),
+            remove,
+            add,
+        })?;
+        // Heal dry/wet egress if capture is live but track→Master was never armed
+        // (EnsureTrack used to rely on demoted Pulse loopback).
+        if unmuted && !eng.mixer_muted_public(&bus) {
+            let dests = eng.desired().egress_dests(&bus);
+            let wet = buschain_engine::any_gen_live(&bus);
+            if !dests.is_empty() && !eng.egress_to_dests_live(&bus, wet, &dests) {
+                let _ = eng.arm_track_egress(&bus, wet, &dests);
+                eng.mark_monitor_mute_applied(&bus, false);
+            }
+        }
+        Ok::<_, anyhow::Error>(report.join())
+    })?;
+    Ok(report)
+}
+
+/// Patch one track's Desired `bus_egress` from session output targets.
+pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
+    let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
+        return;
+    };
+    if track.kind.is_master() {
+        return;
+    }
+    let bus = track.expected_sink_name();
+    let master_id = session.master_id();
+    let mut dests = Vec::new();
+    let mut targets = track.output_targets.clone();
+    if targets.is_empty() || track.listen {
+        if let Some(mid) = master_id {
+            if !targets.contains(&mid) {
+                targets.push(mid);
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    for tid in targets {
+        if master_id == Some(tid) {
+            dests.push("buschain_master".into());
+        } else if let Some(t) = session.tracks.iter().find(|t| t.id == tid) {
+            let dest = t.expected_sink_name();
+            if dest != bus {
+                dests.push(dest);
+            }
+        }
+    }
+    if dests.is_empty() {
+        dests.push("buschain_master".into());
+    }
+    if track.virtual_input {
+        let feed = track.expected_virtual_input_feed_name();
+        if !dests.iter().any(|d| d == &feed) {
+            dests.push(feed);
+        }
+    }
+    with_engine(|eng| {
+        eng.desired_mut().set_bus_egress(&bus, dests);
+    });
+}
+
+/// PlaceApp: patch `bus_playback` only — never full Desired rebuild.
+pub fn patch_bus_playback(session: &Session, track_id: uuid::Uuid) {
+    let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
+        return;
+    };
+    let bus = track.expected_sink_name();
+    with_engine(|eng| {
+        eng.desired_mut()
+            .set_bus_playback(&bus, track.assigned_playback.clone());
+    });
+}
+
+/// One-shot Apps place: sync Desired → `Intent::SyncPlayback` (single list pass).
+pub fn sync_playback(session: &Session) -> anyhow::Result<String> {
+    let hw = crate::audio::graph::resolve_hardware_output(session)
+        .unwrap_or_else(|_| session.master_output.clone().unwrap_or_default());
+    sync_desired_from_session(session, &hw);
+    with_engine(|eng| {
+        let report = eng.apply(Intent::SyncPlayback)?;
+        Ok(report.join())
+    })
+}
+
 pub fn bind_master_clock(profile: &PerformanceProfile) -> anyhow::Result<String> {
     with_engine(|eng| {
         let report = eng.apply(Intent::BindMasterClock {
@@ -393,12 +613,12 @@ pub fn ensure_bus(name: &str, description: &str) -> anyhow::Result<()> {
     })
 }
 
-/// Mic→bus (and similar) are exclusive so we never dual-path with a rate-bridge.
-/// Keepalive `{bus}.monitor → buschain_hold` must NOT be exclusive — that would
-/// strip bus→fx / bus→dest and silence the mix.
+/// Shared capture by default — exclusive `unlink_from_source_except` steals the
+/// HW mic from desktop apps and from other tracks. Rate-bridge dual-path is
+/// avoided by sink-side cleanup in the graph shim, not source-side exclusivity.
+/// Keepalive `{bus}.monitor → buschain_hold` must also stay non-exclusive.
 pub fn ensure_route(source: &str, sink: &str) -> anyhow::Result<()> {
-    let exclusive = sink != "buschain_hold";
-    with_engine(|eng| eng.ensure_route(source, sink, exclusive))
+    with_engine(|eng| eng.ensure_route(source, sink, false))
 }
 
 pub fn ensure_link_raw(source: &str, sink: &str) -> anyhow::Result<()> {
@@ -419,6 +639,11 @@ pub fn unlink_raw(source: &str, sink: &str) -> anyhow::Result<()> {
 
 pub fn teardown_links() {
     with_engine(|eng| eng.teardown_links());
+}
+
+/// Destroy a BusChain null-sink / helper (native linger first, Pulse fallback).
+pub fn destroy_node(name: &str) -> anyhow::Result<()> {
+    with_engine(|eng| eng.destroy_node(name))
 }
 
 /// Full engine teardown (clears DesiredState + `speakers_armed`).
@@ -492,6 +717,7 @@ pub fn remember_master_hw(hw: &str) {
 
 /// Native-preferring sink/source levels (db + mute).
 pub fn set_levels(sink: &str, gain_db: f32, muted: bool) -> anyhow::Result<()> {
+    note_class_a();
     with_engine(|eng| {
         eng.apply(Intent::SetLevels {
             sink: sink.to_string(),
@@ -518,6 +744,12 @@ pub fn set_mute(sink: &str, muted: bool) -> anyhow::Result<()> {
         })?;
         Ok(())
     })
+}
+
+/// Instant mixer mute — disarm/arm egress + pactl monitor mute (never cork app sink).
+pub fn gate_track_mute(bus: &str, muted: bool) -> anyhow::Result<()> {
+    note_class_a();
+    with_engine(|eng| eng.gate_track_mute(bus, muted))
 }
 
 pub fn set_default_sink(name: &str) -> anyhow::Result<bool> {

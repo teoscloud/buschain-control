@@ -383,6 +383,9 @@ impl DaemonState {
                     self.apply_hw_cache_to_snapshot();
                     self.soft_bind();
                 }
+                Event::SinkInputs(inputs) => {
+                    self.snapshot.sink_inputs = inputs;
+                }
                 Event::Status(s) | Event::Error(s) => self.status_msg = s,
                 Event::MidiSnapshot(_) | Event::MidiLearnBound { .. } => {}
                 Event::FxReady { .. } => {}
@@ -693,8 +696,12 @@ impl DaemonState {
                     | Command::PushFxParams { session, .. }
                     | Command::EnsureTrack { session, .. }
                     | Command::VirtualInput { session, .. }
-                    | Command::PruneTrack { session, .. } => {
+                    | Command::PruneTrack { session, .. }
+                    | Command::PlaceApp { session, .. } => {
                         self.session = session.clone();
+                    }
+                    Command::SyncPlayback(s) => {
+                        self.session = s.clone();
                     }
                     _ => {}
                 }
@@ -1219,19 +1226,23 @@ fn serve_loop(state: Arc<Mutex<DaemonState>>, listener: std::os::unix::net::Unix
         if refresh && !refresh_busy.swap(true, Ordering::SeqCst) {
             let st = state.clone();
             let busy = refresh_busy.clone();
-            thread::spawn(move || {
-                let t0 = Instant::now();
-                let snap = graph::refresh_snapshot();
-                let ms = t0.elapsed().as_millis();
-                lat_trace(&format!("refresh_snapshot {ms}ms"));
-                let mut g = st.lock().unwrap();
-                g.snapshot = snap;
-                // Keep Master HW optimistic cache aligned with status/waybar/GTK.
-                g.apply_hw_cache_to_snapshot();
-                // Embedded: UI owns the live session (commands update it).
-                g.soft_bind();
-                busy.store(false, Ordering::SeqCst);
-            });
+            thread::Builder::new()
+                .name("buschain-observer".into())
+                .spawn(move || {
+                    let t0 = Instant::now();
+                    let snap = graph::refresh_snapshot();
+                    graph::publish_observer_snapshot(snap.clone());
+                    let ms = t0.elapsed().as_millis();
+                    lat_trace(&format!("refresh_snapshot {ms}ms"));
+                    let mut g = st.lock().unwrap();
+                    g.snapshot = snap;
+                    // Keep Master HW optimistic cache aligned with status/waybar/GTK.
+                    g.apply_hw_cache_to_snapshot();
+                    // Embedded: UI owns the live session (commands update it).
+                    g.soft_bind();
+                    busy.store(false, Ordering::SeqCst);
+                })
+                .expect("spawn daemon observer");
         }
 
         match listener.accept() {

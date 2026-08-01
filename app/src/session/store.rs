@@ -300,21 +300,41 @@ pub fn resolve_devices(
         }
     }
 
-    // Track inputs
+    // Track input rack (and legacy single-input fields)
     for t in &mut session.tracks {
-        if let Some(src) = t.input_source.clone() {
-            if !source_names.iter().any(|(n, _)| n == &src) {
-                let desc = t.input_source_desc.clone().unwrap_or_default();
-                if let Some((n, d)) = find_by_desc(source_names, &desc) {
-                    report.push(format!("input rebound on {}: {src} → {d}", t.name));
-                    t.input_source = Some(n);
-                    t.input_source_desc = Some(d);
-                } else {
-                    report.push(format!("input missing on {} ({src}) — cleared", t.name));
-                    t.input_source = None;
-                }
+        // Prefer rack; migrate legacy first if rack empty.
+        if t.inputs.is_empty() {
+            if let Some(src) = t.input_source.clone().filter(|s| !s.is_empty()) {
+                t.inputs.push(crate::session::TrackInput {
+                    source: src,
+                    source_desc: t.input_source_desc.clone(),
+                    mute: false,
+                });
             }
         }
+        let mut kept = Vec::new();
+        for inp in t.inputs.drain(..) {
+            if source_names.iter().any(|(n, _)| n == &inp.source) {
+                kept.push(inp);
+                continue;
+            }
+            let desc = inp.source_desc.clone().unwrap_or_default();
+            if let Some((n, d)) = find_by_desc(source_names, &desc) {
+                report.push(format!("input rebound on {}: {} → {d}", t.name, inp.source));
+                kept.push(crate::session::TrackInput {
+                    source: n,
+                    source_desc: Some(d),
+                    mute: inp.mute,
+                });
+            } else {
+                report.push(format!(
+                    "input missing on {} ({}) — dropped",
+                    t.name, inp.source
+                ));
+            }
+        }
+        t.inputs = kept;
+        t.sync_legacy_input_fields();
     }
 
     // device_clocks — drop absent keys

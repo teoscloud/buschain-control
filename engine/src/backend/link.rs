@@ -48,8 +48,7 @@ fn ports_for_node(listing: &str, node: &str) -> Vec<String> {
 }
 
 fn pick_lr(ports: &[String], prefer_monitor: bool) -> Option<(String, String)> {
-    let mut fl = None;
-    let mut fr = None;
+    let mut candidates: Vec<&String> = Vec::new();
     for p in ports {
         let pl = p.to_lowercase();
         // Prefer the right port class when both exist on a node.
@@ -58,6 +57,27 @@ fn pick_lr(ports: &[String], prefer_monitor: bool) -> Option<(String, String)> {
             continue;
         }
         if !prefer_monitor && pl.contains("monitor") {
+            continue;
+        }
+        candidates.push(p);
+    }
+    if candidates.is_empty() {
+        candidates = ports.iter().collect();
+    }
+
+    // Scarlett Mic1/Mic2: capture_MONO → both stereo destinations.
+    if let Some(mono) = candidates.iter().find(|p| p.to_lowercase().contains("mono")) {
+        return Some(((*mono).clone(), (*mono).clone()));
+    }
+    if candidates.len() == 1 {
+        return Some((candidates[0].clone(), candidates[0].clone()));
+    }
+
+    let mut fl = None;
+    let mut fr = None;
+    for p in &candidates {
+        let pl = p.to_lowercase();
+        if pl.contains("mono") {
             continue;
         }
         let is_fl = pl.contains("fl")
@@ -69,15 +89,15 @@ fn pick_lr(ports: &[String], prefer_monitor: bool) -> Option<(String, String)> {
             || pl.contains("_1")
             || pl.ends_with(":1");
         if is_fl && fl.is_none() {
-            fl = Some(p.clone());
+            fl = Some((*p).clone());
         } else if is_fr && fr.is_none() {
-            fr = Some(p.clone());
+            fr = Some((*p).clone());
         }
     }
     // Fallback: first two ports in order
     if fl.is_none() || fr.is_none() {
-        if ports.len() >= 2 {
-            return Some((ports[0].clone(), ports[1].clone()));
+        if candidates.len() >= 2 {
+            return Some((candidates[0].clone(), candidates[1].clone()));
         }
         return None;
     }
@@ -109,9 +129,9 @@ fn port_pairs(source: &str, sink: &str) -> Result<Vec<(String, String)>> {
         ));
     }
 
-    // bus.monitor → dest sink: monitor_* → playback_*
-    // hw capture → bus: capture/monitor_* → playback_*
-    let prefer_src_monitor = is_monitor_source(source) || src_ports.iter().any(|p| p.contains("monitor"));
+    // bus.monitor → dest: monitor_* → playback_*
+    // HW capture → bus: capture_* (never prefer "monitor" just because a port name matches).
+    let prefer_src_monitor = is_monitor_source(source);
     let (s_fl, s_fr) = pick_lr(&src_ports, prefer_src_monitor).ok_or_else(|| {
         anyhow!("could not pick L/R outputs on `{src_node}`")
     })?;
@@ -123,16 +143,15 @@ fn port_pairs(source: &str, sink: &str) -> Result<Vec<(String, String)>> {
 }
 
 pub fn link_is_live(source: &str, sink: &str) -> bool {
+    // Cold path only (caller uses this when native registry is down).
+    // Pulse module presence alone is never treated as live on the hot path —
+    // see `ensure_link` / `backend::link_is_live` (native-ready ⇒ native only).
     let Ok(pairs) = port_pairs(source, sink) else {
         return false;
     };
     let Some(links) = cli::pw_link_listing() else {
         return false;
     };
-    // Also treat a Pulse module-loopback as live (ensure_link fallback).
-    if pulse_loopback_exists(source, sink) {
-        return true;
-    }
     // Both FL and FR must appear as connected. `pw-link -l` often uses a tree:
     //   out_port
     //    |-> in_port
@@ -173,8 +192,212 @@ fn pair_linked_in_listing(links: &str, out_p: &str, in_p: &str) -> bool {
     false
 }
 
-/// Unload any legacy Pulse module-loopback for this pair.
+/// Unload HW/`alsa_*` → `buschain_rs_*` Pulse loopbacks whose source is not in
+/// any track's input rack (global allow list).
+pub fn unload_orphan_hw_to_rs_loopbacks(allow_sources: &std::collections::HashSet<String>) -> u32 {
+    let Ok(text) = run_capture("pactl", &["list", "short", "modules"]) else {
+        return 0;
+    };
+    let mut n = 0u32;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(idx) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let args = parts.next().unwrap_or("");
+        if name != "module-loopback" || !args.contains("sink=buschain_rs_") {
+            continue;
+        }
+        let src = args
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("source="))
+            .unwrap_or("");
+        // Prefix match — Pulse often uses `source=alsa_….monitor` while Desired
+        // stores the node name; exact-only matching killed live Mic→rs hops.
+        if src.is_empty()
+            || allow_sources.iter().any(|a| {
+                src == a || src.starts_with(&format!("{a}.")) || a.starts_with(&format!("{src}."))
+            })
+        {
+            continue;
+        }
+        if run_status("pactl", &["unload-module", idx]).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Unload Pulse `module-loopback` modules that target `sink`, except those whose
+/// `source=` is in `allow_sources`. Empty allow ⇒ unload every loopback into sink.
+/// (Leftover loopbacks after clearing the input rack were feeding mics into tracks.)
+pub fn unload_legacy_loopbacks_into_sink_except(sink: &str, allow_sources: &[String]) {
+    let snk = format!("sink={sink}");
+    let Ok(text) = run_capture("pactl", &["list", "short", "modules"]) else {
+        return;
+    };
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(idx) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let args = parts.next().unwrap_or("");
+        if name != "module-loopback" || !args.contains(&snk) {
+            continue;
+        }
+        if args.contains("sink=buschain_hold") {
+            continue;
+        }
+        let src = args
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("source="))
+            .unwrap_or("");
+        if !src.is_empty()
+            && allow_sources.iter().any(|a| {
+                a == src || src.starts_with(&format!("{a}.")) || a.starts_with(&format!("{src}."))
+            })
+        {
+            continue;
+        }
+        let _ = run_status("pactl", &["unload-module", idx]);
+    }
+}
+
+/// Drop live PipeWire links into `sink`'s playback ports from peers that are not
+/// allowed capture sources / internal mix. Keeps Desired `buschain_rs_*` peers
+/// listed in `allow_bridges`; orphan rate-bridges are stripped.
+pub fn unlink_capture_into_sink_except(sink: &str, allow_sources: &[String]) -> u32 {
+    unlink_capture_into_sink_except_with_bridges(sink, allow_sources, &[])
+}
+
+/// Like [`unlink_capture_into_sink_except`], but keeps rate-bridge peers in
+/// `allow_bridges` (node names without `.monitor`).
+pub fn unlink_capture_into_sink_except_with_bridges(
+    sink: &str,
+    allow_sources: &[String],
+    allow_bridges: &[String],
+) -> u32 {
+    let snk_node = pw_node(sink);
+    let Ok(links) = run_capture("pw-link", &["-l"]) else {
+        return 0;
+    };
+    let mut n = 0u32;
+    let mut current_port: Option<String> = None;
+    for line in links.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Tree form: `sink:playback_FL` then `  |<- peer:output_FL`
+        if let Some(rest) = t.strip_prefix("|<-") {
+            let out = rest.trim();
+            let Some(inn) = current_port.as_deref() else {
+                continue;
+            };
+            if !port_on_node(inn, &snk_node) {
+                continue;
+            }
+            if !(inn.contains(":playback_") || inn.contains(":input_")) {
+                continue;
+            }
+            let out_node = out.split(':').next().unwrap_or(out);
+            if capture_peer_allowed(out_node, allow_sources, allow_bridges) {
+                continue;
+            }
+            // Timed — unbounded `pw-link -d` hung capture reconcile for ~30s.
+            if run_status("pw-link", &["-d", out, inn]).is_ok() {
+                n += 1;
+            }
+            continue;
+        }
+        // Tree form: `peer:output_FL` then `  |-> sink:playback_FL`
+        if let Some(rest) = t.strip_prefix("|->") {
+            let inn = rest.trim();
+            let Some(out) = current_port.as_deref() else {
+                continue;
+            };
+            if !port_on_node(inn, &snk_node) {
+                continue;
+            }
+            if !(inn.contains(":playback_") || inn.contains(":input_")) {
+                continue;
+            }
+            let out_node = out.split(':').next().unwrap_or(out);
+            if capture_peer_allowed(out_node, allow_sources, allow_bridges) {
+                continue;
+            }
+            if run_status("pw-link", &["-d", out, inn]).is_ok() {
+                n += 1;
+            }
+            continue;
+        }
+        if t.starts_with('|') {
+            continue;
+        }
+        if t.contains(':') {
+            current_port = Some(t.to_string());
+        }
+    }
+    if n > 0 {
+        super::cli::invalidate_probe_caches();
+    }
+    n
+}
+
+fn capture_peer_allowed(
+    peer: &str,
+    allow_sources: &[String],
+    allow_bridges: &[String],
+) -> bool {
+    // Internal mix / FX / meters — never strip as "capture".
+    if peer.starts_with("buschain_track_")
+        || peer.starts_with("buschain_master")
+        || peer.starts_with("buschain_post_")
+        || peer.starts_with("buschain_fx_")
+        || peer == "buschain_hold"
+        || peer.starts_with("meter-")
+    {
+        return true;
+    }
+    // Pulse loopback helper nodes — removed via unload_legacy_loopbacks_into_sink_except.
+    if peer.starts_with("output.loopback") || peer.starts_with("input.loopback") {
+        return false;
+    }
+    // Desired rate bridges stay linked; orphans are stripped.
+    if peer.starts_with("buschain_rs_") || peer.starts_with("shadow_rs_") {
+        return allow_bridges
+            .iter()
+            .any(|b| peer == b || peer.starts_with(&format!("{b}.")));
+    }
+    allow_sources
+        .iter()
+        .any(|s| peer == s || peer.starts_with(&format!("{s}.")))
+}
+
+/// True when BusChain ownership table recorded this Pulse hop.
+pub fn pulse_loopback_owned(source: &str, sink: &str) -> bool {
+    OWNED
+        .lock()
+        .map(|g| g.contains(&(source.to_string(), sink.to_string())))
+        .unwrap_or(false)
+}
+
+/// Unload Pulse module-loopback for this pair only when we own it (or force).
 pub fn unload_legacy_loopback(source: &str, sink: &str) {
+    unload_legacy_loopback_inner(source, sink, false);
+}
+
+/// Force-unload Pulse loopback (capture force-recreate / teardown).
+pub fn unload_legacy_loopback_force(source: &str, sink: &str) {
+    unload_legacy_loopback_inner(source, sink, true);
+}
+
+fn unload_legacy_loopback_inner(source: &str, sink: &str, force: bool) {
+    if !force && !pulse_loopback_owned(source, sink) && !pulse_loopback_exists(source, sink) {
+        return;
+    }
+    // Prefer owned-only unload on hot path; force tears stale ghosts after mute/×.
+    if !force && !pulse_loopback_owned(source, sink) {
+        return;
+    }
     let src = format!("source={source}");
     let snk = format!("sink={sink}");
     let Ok(out) = Command::new("pactl")
@@ -195,6 +418,9 @@ pub fn unload_legacy_loopback(source: &str, sink: &str) {
                 .status();
         }
     }
+    if let Ok(mut g) = OWNED.lock() {
+        g.remove(&(source.to_string(), sink.to_string()));
+    }
 }
 
 fn try_link(source: &str, sink: &str) -> Result<()> {
@@ -210,18 +436,45 @@ fn try_link(source: &str, sink: &str) -> Result<()> {
 }
 
 /// Ensure a stereo PipeWire link from Pulse `source` → `sink`.
-/// Falls back to `module-loopback` only if PW port linking cannot resolve ports
-/// (keeps audio working; Tear down / Recover still cleans loopbacks).
+///
+/// When the native registry is ready, Pulse module presence alone is never success.
+/// Pulse fallback is cold-path only (`!native_ready`) or explicit escape hatch.
 pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
-    if link_is_live(source, sink) {
-        if let Ok(mut g) = OWNED.lock() {
-            g.insert((source.to_string(), sink.to_string()));
-        }
-        return Ok(());
-    }
+    ensure_link_inner(source, sink, false)
+}
 
-    // Prefer native links — remove any leftover Pulse loopback for this pair first.
-    unload_legacy_loopback(source, sink);
+/// Force-recreate: tear any stale hop first (Add In after mute/×).
+pub fn ensure_link_force(source: &str, sink: &str) -> Result<()> {
+    ensure_link_inner(source, sink, true)
+}
+
+fn ensure_link_inner(source: &str, sink: &str, force: bool) -> Result<()> {
+    let native_up = super::native::native_ready();
+    if force {
+        unload_legacy_loopback_force(source, sink);
+        let _ = unlink(source, sink);
+    } else if native_up {
+        // Native registry: only port-verified live skips recreate.
+        if super::native::native_link_is_live(source, sink) {
+            if let Ok(mut g) = OWNED.lock() {
+                g.insert((source.to_string(), sink.to_string()));
+            }
+            return Ok(());
+        }
+        // Stale Pulse ghost after teardown — never Ok on module alone.
+        if pulse_loopback_exists(source, sink) {
+            unload_legacy_loopback_force(source, sink);
+        }
+    } else {
+        // Cold path (registry down): Pulse or CLI listing may count as live.
+        if pulse_loopback_exists(source, sink) || link_is_live(source, sink) {
+            if let Ok(mut g) = OWNED.lock() {
+                g.insert((source.to_string(), sink.to_string()));
+            }
+            return Ok(());
+        }
+        unload_legacy_loopback_force(source, sink);
+    }
 
     // Two tries — 8× CLI_TIMEOUT under load made every ensure_link cost seconds.
     let mut last_err = None;
@@ -231,8 +484,20 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
                 if let Ok(mut g) = OWNED.lock() {
                     g.insert((source.to_string(), sink.to_string()));
                 }
-                // Next link_is_live / spine probe must see the new edge.
                 super::cli::invalidate_probe_caches();
+                // Verify port links when native is up — module create ≠ live.
+                if native_up && !super::native::native_link_is_live(source, sink) {
+                    // try_link used CLI ports; give registry a beat.
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    if !super::native::native_link_is_live(source, sink)
+                        && !link_is_live(source, sink)
+                    {
+                        last_err = Some(anyhow!(
+                            "pw-link reported ok but hop not live {source}→{sink}"
+                        ));
+                        continue;
+                    }
+                }
                 return Ok(());
             }
             Err(e) => last_err = Some(e),
@@ -240,8 +505,6 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
-    // Never Pulse-loopback onto in-process FX filters — they are Audio/Duplex
-    // DSP nodes, not Pulse sinks; the fallback burns ~600ms and cannot work.
     let dst = pw_node(sink);
     if dst.starts_with("buschain_fx_") || pw_node(source).starts_with("buschain_fx_") {
         return Err(last_err.unwrap_or_else(|| {
@@ -249,7 +512,23 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
         }));
     }
 
-    // Fallback: Pulse module-loopback (reliable with null-sinks).
+    // Pulse demoted: only when registry is down, or explicit escape hatch.
+    let allow_pulse = !native_up
+        || matches!(
+            std::env::var("BUSCHAIN_ALLOW_PULSE_CAPTURE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        );
+    if !allow_pulse {
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow!("native capture hop failed {source}→{sink} (Pulse demoted)")
+        }));
+    }
+
+    let pe = last_err
+        .as_ref()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_else(|| "pw-link failed".into());
+    eprintln!("[buschain] WARN: pulse module-loopback fallback {source}→{sink} ({pe})");
     match load_pulse_loopback(source, sink) {
         Ok(()) => {
             if let Ok(mut g) = OWNED.lock() {
@@ -261,6 +540,23 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
             .map(|pe| anyhow!("{pe}; pulse fallback: {e}"))
             .unwrap_or(e)),
     }
+}
+
+/// Wait until a sink node exposes playback ports (rate-bridge just created).
+pub fn wait_sink_playback_ports(sink: &str, budget: std::time::Duration) -> bool {
+    let node = pw_node(sink);
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        super::cli::invalidate_probe_caches();
+        if let Some(inns) = cli::pw_link_inputs() {
+            let ports = ports_for_node(&inns, &node);
+            if ports.iter().any(|p| p.contains("playback") || p.contains("input")) {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
 }
 
 fn load_pulse_loopback(source: &str, sink: &str) -> Result<()> {

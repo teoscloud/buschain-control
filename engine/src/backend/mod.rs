@@ -5,22 +5,33 @@ mod fx_chain;
 mod link;
 mod native;
 mod null_sink;
+mod playback;
 mod virtual_input;
 pub mod pulse_compat;
+
+pub use playback::enforce_desired_playback;
 
 pub use virtual_input::{
     ensure_virtual_input, is_virtual_input_feed, is_virtual_input_source, names_for_bus as virtual_input_names_for_bus,
     push_virtual_input_description, teardown_virtual_input,
 };
 
-pub use cli::{invalidate_probe_caches, pw_link_inputs, pw_link_outputs};
+pub use cli::{
+    invalidate_probe_caches, pactl_short_sinks, pw_link_inputs, pw_link_outputs,
+};
+pub use link::{
+    ensure_link_force, pulse_loopback_owned, unlink_capture_into_sink_except,
+    unlink_capture_into_sink_except_with_bridges, unload_legacy_loopback,
+    unload_legacy_loopback_force, unload_legacy_loopbacks_into_sink_except,
+    unload_orphan_hw_to_rs_loopbacks, wait_sink_playback_ports,
+};
 
 pub use fx_chain::{
     cache_node_id, find_node_id_by_name, ladspa_search_path, sink_exists, sink_has_input,
     FilterChainRuntime,
 };
 
-pub use native::{list_midi_nodes, PipewireNativeBackend};
+pub use native::{list_midi_nodes, native_ready, PipewireNativeBackend};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -31,15 +42,12 @@ use crate::domain::{
 };
 use crate::plan::DesiredState;
 
-/// Gate outbound `{bus}.monitor` without muting the app-facing sink (avoids cork).
-/// Free fn so ForceRespawn RAII can ungated without holding `AudioBackend`.
+/// Gate outbound Pulse `{bus}.monitor` source without muting the app-facing sink.
+///
+/// Never SPA `set_levels` on `*.monitor` — native bind strips `.monitor` and would
+/// mute/cork the sink node (broke mixer mute for tracks with In/Apps).
 pub fn gate_bus_monitor(bus: &str, gated: bool) -> Result<()> {
     let mon = format!("{bus}.monitor");
-    if native::native_ready() {
-        if native::native_set_levels(&mon, if gated { -120.0 } else { 0.0 }, gated).is_ok() {
-            return Ok(());
-        }
-    }
     if gated {
         let _ = run_ok("pactl", &["set-source-mute", &mon, "1"]);
         let _ = run_ok("pactl", &["set-source-volume", &mon, "0%"]);
@@ -50,21 +58,101 @@ pub fn gate_bus_monitor(bus: &str, gated: bool) -> Result<()> {
     Ok(())
 }
 
-/// Prefer native registry links; fall back to CLI `pw-link` / Pulse loopback.
+fn allow_pulse_capture_fallback() -> bool {
+    matches!(
+        std::env::var("BUSCHAIN_ALLOW_PULSE_CAPTURE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// Prefer native registry links; Pulse/CLI only when registry down or escape hatch.
 pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
     if native::native_ready() {
         match native::native_ensure_link(source, sink) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if native::native_link_is_live(source, sink) {
+                    return Ok(());
+                }
+                // Native RPC succeeded but registry doesn't see the hop yet — brief wait.
+                for _ in 0..4 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if native::native_link_is_live(source, sink) {
+                        return Ok(());
+                    }
+                }
+                if !allow_pulse_capture_fallback() {
+                    return Err(anyhow!(
+                        "native ensure ok but hop not live {source}→{sink}"
+                    ));
+                }
+            }
             Err(e) => {
                 let dst = sink.strip_suffix(".monitor").unwrap_or(sink);
                 let src = source.strip_suffix(".monitor").unwrap_or(source);
                 if dst.starts_with("buschain_fx_") || src.starts_with("buschain_fx_") {
                     return Err(e);
                 }
+                if !allow_pulse_capture_fallback() {
+                    return Err(e);
+                }
             }
         }
     }
     link::ensure_link(source, sink)
+}
+
+/// Force-recreate a hop (capture Add after mute/×).
+pub fn ensure_link_force_pair(source: &str, sink: &str) -> Result<()> {
+    let _ = unlink(source, sink);
+    if native::native_ready() {
+        match native::native_ensure_link(source, sink) {
+            Ok(()) if native::native_link_is_live(source, sink) => return Ok(()),
+            Ok(()) => {
+                for _ in 0..4 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if native::native_link_is_live(source, sink) {
+                        return Ok(());
+                    }
+                }
+                if !allow_pulse_capture_fallback() {
+                    return Err(anyhow!(
+                        "native force-ensure ok but hop not live {source}→{sink}"
+                    ));
+                }
+            }
+            Err(e) => {
+                let dst = sink.strip_suffix(".monitor").unwrap_or(sink);
+                let src = source.strip_suffix(".monitor").unwrap_or(source);
+                if dst.starts_with("buschain_fx_") || src.starts_with("buschain_fx_") {
+                    return Err(e);
+                }
+                if !allow_pulse_capture_fallback() {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    link::ensure_link_force(source, sink)
+}
+
+/// Capture hop verified-live: direct source→bus OR Mic→rs AND rs.monitor→bus.
+pub fn capture_hop_verified(source: &str, bus: &str, desired: &DesiredState) -> bool {
+    if link_is_live(source, bus) {
+        return true;
+    }
+    for (s, d) in &desired.routes {
+        if s != source {
+            continue;
+        }
+        if !(d.starts_with("buschain_rs_") || d.starts_with("shadow_rs_")) {
+            continue;
+        }
+        let mon = format!("{d}.monitor");
+        if link_is_live(source, d) && link_is_live(&mon, bus) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn unlink(source: &str, sink: &str) -> Result<()> {
@@ -75,8 +163,9 @@ pub fn unlink(source: &str, sink: &str) -> Result<()> {
 }
 
 pub fn link_is_live(source: &str, sink: &str) -> bool {
-    if native::native_ready() && native::native_link_is_live(source, sink) {
-        return true;
+    // Native registry ready ⇒ false is final (no CLI fallthrough on expected misses).
+    if native::native_ready() {
+        return native::native_link_is_live(source, sink);
     }
     link::link_is_live(source, sink)
 }
@@ -353,6 +442,30 @@ pub fn ensure_clocked_route(
     desired: &mut DesiredState,
     exclusive: bool,
 ) -> Result<()> {
+    ensure_clocked_route_inner(backend, source, sink, clock, desired, exclusive, false)
+}
+
+/// Force-recreate capture hop (Add / unmute-row after teardown).
+pub fn ensure_clocked_route_force(
+    backend: &mut dyn AudioBackend,
+    source: &str,
+    sink: &str,
+    clock: &GraphClock,
+    desired: &mut DesiredState,
+    exclusive: bool,
+) -> Result<()> {
+    ensure_clocked_route_inner(backend, source, sink, clock, desired, exclusive, true)
+}
+
+fn ensure_clocked_route_inner(
+    backend: &mut dyn AudioBackend,
+    source: &str,
+    sink: &str,
+    clock: &GraphClock,
+    desired: &mut DesiredState,
+    exclusive: bool,
+    force: bool,
+) -> Result<()> {
     let src_node = source.strip_suffix(".monitor").unwrap_or(source);
     let dst_node = sink.strip_suffix(".monitor").unwrap_or(sink);
     let src_name = NodeName::new(src_node.to_string());
@@ -369,10 +482,32 @@ pub fn ensure_clocked_route(
         && src_rate != dst_rate;
 
     if !want_bridge {
+        // Rates match (or unknown): drop leftover pair-specific rate-bridge hops.
+        let stale: Vec<String> = desired
+            .bridges
+            .keys()
+            .filter(|bridge| {
+                let mon = format!("{bridge}.monitor");
+                desired.routes.contains(&(source.to_string(), (*bridge).clone()))
+                    || desired.routes.contains(&(mon, sink.to_string()))
+            })
+            .cloned()
+            .collect();
+        for bridge in stale {
+            let mon = format!("{bridge}.monitor");
+            let _ = backend.unlink_raw(&mon, sink);
+            let _ = backend.unlink_raw(source, &bridge);
+            desired.routes.remove(&(source.to_string(), bridge.clone()));
+            desired.routes.remove(&(mon, sink.to_string()));
+        }
         if exclusive {
             let _ = backend.unlink_from_source_except(source, &[sink, "buschain_hold"]);
         }
-        backend.ensure_link_raw(source, sink)?;
+        if force {
+            ensure_link_force_pair(source, sink)?;
+        } else {
+            backend.ensure_link_raw(source, sink)?;
+        }
         desired.ensure_route(&LinkSpec {
             source: source.to_string(),
             sink: sink.to_string(),
@@ -384,6 +519,10 @@ pub fn ensure_clocked_route(
     // Bridge at GraphClock rate — only the inbound hop runs at the foreign rate.
     let bridge = DesiredState::bridge_name(src_rate, dst_rate, source, sink);
     let bridge_name = bridge.as_str().to_string();
+    // Sink-side dual-path prune: never leave dry source→sink beside source→rs→sink.
+    // Shared mics stay non-exclusive (no unlink_from_source_except).
+    let _ = backend.unlink_raw(source, sink);
+    desired.routes.remove(&(source.to_string(), sink.to_string()));
     if exclusive {
         // Do NOT keep a parallel direct source→sink (dual-path chorus).
         let _ = backend.unlink_from_source_except(
@@ -400,10 +539,22 @@ pub fn ensure_clocked_route(
     backend.ensure_node(&spec, clock)?;
     desired.ensure_bus(spec);
     desired.bridges.insert(bridge_name.clone(), (src_rate, dst_rate));
+    // Fresh null-sink ports lag registry/CLI caches — wait before Mic→rs ensure
+    // so we prefer native/pw-link over a Pulse fallback storm.
+    invalidate_probe_caches();
+    let _ = wait_sink_playback_ports(&bridge_name, std::time::Duration::from_millis(200));
 
-    backend.ensure_link_raw(source, &bridge_name)?;
     let mon = format!("{bridge_name}.monitor");
-    backend.ensure_link_raw(&mon, sink)?;
+    if force {
+        // Destroy ghost bridge hop first so Add cannot attach to a dead rs.
+        let _ = backend.unlink_raw(source, &bridge_name);
+        let _ = backend.unlink_raw(&mon, sink);
+        ensure_link_force_pair(source, &bridge_name)?;
+        ensure_link_force_pair(&mon, sink)?;
+    } else {
+        backend.ensure_link_raw(source, &bridge_name)?;
+        backend.ensure_link_raw(&mon, sink)?;
+    }
     desired.ensure_route(&LinkSpec {
         source: source.to_string(),
         sink: bridge_name.clone(),

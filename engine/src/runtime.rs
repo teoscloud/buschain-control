@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 
 use crate::backend::{
-    ensure_clocked_route, link_is_live, sink_exists, AudioBackend, FilterChainRuntime,
-    PipewireNativeBackend,
+    capture_hop_verified, ensure_clocked_route, ensure_clocked_route_force, link_is_live,
+    sink_exists, AudioBackend, FilterChainRuntime, PipewireNativeBackend,
 };
 use crate::clock::{
     probe_master_hw_from_sinks, probe_sink_running_rate, resolve_profile, set_graph_force_clock,
@@ -16,7 +16,7 @@ use crate::clock::{
 use crate::contract::{ApplyReport, ClockProps, Intent};
 use crate::domain::{
     post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertSlot,
-    LinkSpec, NodeRole, NodeSpec, Props,
+    LinkSpec, NodeName, NodeRole, NodeSpec, Props,
 };
 use crate::fx_gen::{any_gen_live, live_fx_name, live_post_name};
 use crate::plan::DesiredState;
@@ -33,8 +33,14 @@ pub struct Engine {
     last_default_assert: Option<Instant>,
     /// Last applied Pulse monitor mute per bus — avoid pactl spam every idle tick.
     applied_monitor_mute: HashMap<String, bool>,
+    /// Last applied Desired `bus_inputs` fingerprint (surgical SyncCapture / idle skip).
+    last_applied_bus_inputs: HashMap<String, Vec<String>>,
+    /// False until the first non-idle capture reconcile (forces full purge once).
+    capture_applied: bool,
     /// Idle FX reconcile cadence counter (worker bumps via reconcile_light).
     idle_fx_ticks: u32,
+    /// When wet Master is hold-only mid-build; fail-open dry after this age.
+    master_wet_hold_since: Option<Instant>,
 }
 
 impl Engine {
@@ -47,8 +53,24 @@ impl Engine {
             master_hw: None,
             last_default_assert: None,
             applied_monitor_mute: HashMap::new(),
+            last_applied_bus_inputs: HashMap::new(),
+            capture_applied: false,
             idle_fx_ticks: 0,
+            master_wet_hold_since: None,
         }
+    }
+
+    fn mixer_muted(&self, bus: &str) -> bool {
+        self.desired
+            .bus_levels
+            .get(bus)
+            .map(|l| l.mixer_mute)
+            .unwrap_or(false)
+    }
+
+    fn master_hw_link_live(&self, hw: &str) -> bool {
+        link_is_live("buschain_master.monitor", hw)
+            || link_is_live("buschain_post_master.monitor", hw)
     }
 
     /// Light Master HW switch: update Desired + relink Master→HW only.
@@ -80,6 +102,11 @@ impl Engine {
 
     pub fn desired(&self) -> &DesiredState {
         &self.desired
+    }
+
+    /// Capture fingerprint (verified-live sources only).
+    pub fn last_applied_bus_inputs(&self) -> &HashMap<String, Vec<String>> {
+        &self.last_applied_bus_inputs
     }
 
     pub fn desired_mut(&mut self) -> &mut DesiredState {
@@ -369,14 +396,34 @@ impl Engine {
                 for bus in vins {
                     let _ = crate::backend::teardown_virtual_input(&bus);
                 }
+                // Destroy OBJECT_LINGER null sinks / helpers so Quit does not leave a
+                // hollow graph (dead default sink, muted HW, silent YouTube).
+                let mut destroyed = 0u32;
+                if let Ok(names) = self.backend.list_sink_names() {
+                    for name in names {
+                        if name.starts_with("buschain_") || name.starts_with("shadow_") {
+                            if self.backend.destroy_node(&name).is_ok() {
+                                destroyed += 1;
+                            }
+                        }
+                    }
+                }
                 self.desired.clear_routes();
                 self.desired.bridges.clear();
                 self.desired.fx_chains.clear();
                 self.desired.bus_egress.clear();
                 self.desired.fx_failed.clear();
                 self.desired.virtual_inputs.clear();
+                self.desired.bus_inputs.clear();
+                self.desired.bus_playback.clear();
+                self.desired.buses.clear();
+                self.desired.bus_levels.clear();
+                self.last_applied_bus_inputs.clear();
+                self.capture_applied = false;
+                self.applied_monitor_mute.clear();
+                self.desired.set_preferred_default(None);
                 self.desired.speakers_armed = false;
-                report.push("engine teardown");
+                report.push(format!("engine teardown ({destroyed} linger node(s))"));
             }
             Intent::Recover => {
                 let r = self.reconcile()?;
@@ -388,6 +435,39 @@ impl Engine {
                 let r = self.arm_session(force_fx)?;
                 for m in r.messages {
                     report.push(m);
+                }
+            }
+            Intent::SyncCapture => {
+                let t0 = Instant::now();
+                self.reconcile_bus_inputs(&mut report, false);
+                lat_trace_line(
+                    'C',
+                    "SyncCapture",
+                    &report.messages.join("; "),
+                    t0.elapsed().as_millis(),
+                    !report.messages.iter().any(|m| m.contains("FAIL")),
+                );
+                if report.messages.is_empty() {
+                    report.push("capture synced");
+                }
+            }
+            Intent::SyncCaptureDelta { bus, remove, add } => {
+                let t0 = Instant::now();
+                self.apply_capture_delta(&bus, &remove, &add, &mut report);
+                let ok = !report.messages.iter().any(|m| m.contains("FAIL"));
+                lat_trace_line(
+                    'B',
+                    "CaptureDelta",
+                    &format!("{bus} {}", report.messages.join("; ")),
+                    t0.elapsed().as_millis(),
+                    ok,
+                );
+            }
+            Intent::SyncPlayback => {
+                match crate::backend::enforce_desired_playback(&self.desired) {
+                    Ok(n) if n > 0 => report.push(format!("playback placed {n}")),
+                    Ok(_) => report.push("playback synced"),
+                    Err(e) => report.push(format!("playback: {e:#}")),
                 }
             }
             Intent::BindDeviceClock {
@@ -446,6 +526,8 @@ impl Engine {
         }
         let mut report = self.reconcile_buses_and_levels()?;
         self.reconcile_fx(&mut report);
+        self.reconcile_bus_inputs(&mut report, false);
+        self.reapply_muted_egress(&mut report);
         self.reconcile_master_and_default(&mut report)?;
         if report.messages.is_empty() {
             report.push("reconcile ok");
@@ -462,17 +544,481 @@ impl Engine {
         let mut report = self.reconcile_buses_and_levels()?;
         // Drop orphan Custom-192k rate bridges after switching back to Balanced.
         self.prune_stale_rate_bridges(&mut report);
+        // Ghost track buses (not in Desired) keep leftover mic→Master paths.
+        self.prune_orphan_track_buses(&mut report);
         // Every idle tick: kill parallel dry+post paths (chorus/echo).
         self.prune_parallel_fx_routes(&mut report);
-        self.reconcile_master_and_default(&mut report)?;
+        // Skip full capture purge when Desired bus_inputs unchanged.
+        self.reconcile_bus_inputs(&mut report, true);
         self.idle_fx_ticks = self.idle_fx_ticks.wrapping_add(1);
         if self.idle_fx_ticks % 3 == 0 {
             self.reconcile_fx(&mut report);
         }
+        // Mute last — FX/prune must not leave muted tracks re-armed.
+        self.reapply_muted_egress(&mut report);
+        self.reconcile_master_and_default(&mut report)?;
         if report.messages.is_empty() {
             report.push("reconcile light ok");
         }
         Ok(report)
+    }
+
+    /// Re-disarm mixer-muted buses if egress leaked back (idle FX/prune).
+    /// Idle leak repair: Desired muted + native sees egress → disarm (no CLI).
+    fn reapply_muted_egress(&mut self, _report: &mut ApplyReport) {
+        let muted: Vec<String> = self
+            .desired
+            .bus_levels
+            .iter()
+            .filter(|(bus, l)| {
+                l.mixer_mute
+                    && self
+                        .desired
+                        .buses
+                        .get(bus.as_str())
+                        .is_some_and(|s| {
+                            matches!(s.role, NodeRole::TrackBus | NodeRole::MasterBus)
+                        })
+            })
+            .map(|(b, _)| b.clone())
+            .collect();
+        for bus in muted {
+            if self.egress_audible_native(&bus) {
+                pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
+            }
+            self.applied_monitor_mute.insert(bus, true);
+        }
+    }
+
+    /// Native-only leak probe (idle). Hot mute path must never call this.
+    fn egress_audible_native(&self, bus: &str) -> bool {
+        if !crate::backend::native_ready() {
+            return false;
+        }
+        let dests = self.desired.egress_dests(bus);
+        if dests.is_empty() {
+            return false;
+        }
+        let from = format!("{bus}.monitor");
+        let post = live_post_name(bus);
+        let post_mon = format!("{post}.monitor");
+        dests.iter().any(|d| {
+            !d.is_empty() && (link_is_live(&from, d) || link_is_live(&post_mon, d))
+        })
+    }
+
+    /// Destroy live `buschain_track_*` sinks that are not in Desired.
+    /// Session load / +Track used to leave linger buses with mic hops into Master
+    /// while the mixer UI no longer showed those tracks.
+    fn prune_orphan_track_buses(&mut self, report: &mut ApplyReport) {
+        let keep: std::collections::HashSet<String> = self
+            .desired
+            .buses
+            .keys()
+            .cloned()
+            .chain(std::iter::once("buschain_master".into()))
+            .collect();
+        let Ok(names) = self.backend.list_sink_names() else {
+            return;
+        };
+        for name in names {
+            if !name.starts_with("buschain_track_") || keep.contains(&name) {
+                continue;
+            }
+            // Tear virtual input + FX host for this ghost bus.
+            let _ = self.apply(Intent::TeardownVirtualInput {
+                bus: NodeName::new(&name),
+            });
+            let _ = self.teardown_fx_chain(&name);
+            pipeline::arm::disarm_track_egress(&mut self.backend, &name, false);
+            crate::backend::unload_legacy_loopbacks_into_sink_except(&name, &[]);
+            let _ = crate::backend::unlink_capture_into_sink_except(&name, &[]);
+            let post = post_name_for_bus(&name);
+            let stg = format!("{post}__stg");
+            let fx = live_fx_name(&name);
+            for n in [name.as_str(), post.as_str(), stg.as_str(), fx.as_str()] {
+                let _ = self.backend.destroy_node(n);
+            }
+            report.push(format!("destroyed orphan track bus {name}"));
+        }
+    }
+
+    /// Public: apply Desired `bus_inputs` only (Route / Hotplug path).
+    pub fn reconcile_inputs_only(&mut self) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        self.reconcile_bus_inputs(&mut report, false);
+        Ok(report)
+    }
+
+    /// Public: destroy live track buses that are not in Desired (Prune / Route).
+    pub fn prune_orphan_track_buses_now(&mut self) -> ApplyReport {
+        let mut report = ApplyReport::default();
+        self.prune_orphan_track_buses(&mut report);
+        report
+    }
+
+    /// Unlink one HW capture (and its rate-bridge hop) into a track bus.
+    /// Used when an In-rack row is muted or removed — must silence immediately.
+    fn teardown_capture_source_into_bus(
+        &mut self,
+        source: &str,
+        bus: &str,
+        report: &mut ApplyReport,
+        announce: bool,
+    ) {
+        let _ = self.backend.unlink_raw(source, bus);
+        self.desired
+            .routes
+            .remove(&(source.to_string(), bus.to_string()));
+        // Force-unload ghosts so re-Add cannot attach to a dead Pulse hop.
+        crate::backend::unload_legacy_loopback_force(source, bus);
+
+        let bridges: Vec<String> = self
+            .desired
+            .routes
+            .iter()
+            .filter(|(s, d)| {
+                s == source
+                    && (d.starts_with("buschain_rs_") || d.starts_with("shadow_rs_"))
+            })
+            .map(|(_, d)| d.clone())
+            .collect();
+        for bridge in bridges {
+            let mon = format!("{bridge}.monitor");
+            let _ = self.backend.unlink_raw(source, &bridge);
+            let _ = self.backend.unlink_raw(&mon, bus);
+            self.desired
+                .routes
+                .remove(&(source.to_string(), bridge.clone()));
+            self.desired.routes.remove(&(mon.clone(), bus.to_string()));
+            crate::backend::unload_legacy_loopback_force(source, &bridge);
+            crate::backend::unload_legacy_loopback_force(&mon, bus);
+            // Destroy bridge only if no other Desired hop still uses it.
+            let still_used = self.desired.routes.iter().any(|(s, d)| {
+                s == &bridge
+                    || d == &bridge
+                    || s == &mon
+                    || d.starts_with(&format!("{bridge}."))
+            });
+            if !still_used {
+                let _ = self.backend.destroy_node(&bridge);
+                self.desired.bridges.remove(&bridge);
+                self.desired.buses.remove(&bridge);
+            }
+        }
+        if announce {
+            report.push(format!("input mute/remove {source}↛{bus}"));
+        }
+    }
+
+    /// Surgical In-rack delta: never relinks egress; updates last_applied only on verify.
+    fn apply_capture_delta(
+        &mut self,
+        bus: &str,
+        remove: &[String],
+        add: &[String],
+        report: &mut ApplyReport,
+    ) {
+        if !bus.starts_with("buschain_track_") {
+            report.push(format!("CaptureDelta skip non-track {bus}"));
+            return;
+        }
+        for src in remove {
+            if src.is_empty() {
+                continue;
+            }
+            self.teardown_capture_source_into_bus(src, bus, report, true);
+            if let Some(v) = self.last_applied_bus_inputs.get_mut(bus) {
+                v.retain(|s| s != src);
+            }
+            if let Some(v) = self.desired.bus_inputs.get_mut(bus) {
+                v.retain(|s| s != src);
+            }
+        }
+        for src in add {
+            if src.is_empty() || src.starts_with("buschain_") {
+                continue;
+            }
+            // Force-clear ghosts before recreate (P0 re-Add silence).
+            self.teardown_capture_source_into_bus(src, bus, report, false);
+            let clock = self.desired.clock.clone();
+            match ensure_clocked_route_force(
+                &mut self.backend,
+                src,
+                bus,
+                &clock,
+                &mut self.desired,
+                false,
+            ) {
+                Ok(()) => {
+                    if capture_hop_verified(src, bus, &self.desired) {
+                        let entry = self
+                            .last_applied_bus_inputs
+                            .entry(bus.to_string())
+                            .or_default();
+                        if !entry.iter().any(|s| s == src) {
+                            entry.push(src.clone());
+                        }
+                        let want = self.desired.bus_inputs.entry(bus.to_string()).or_default();
+                        if !want.iter().any(|s| s == src) {
+                            want.push(src.clone());
+                        }
+                        report.push(format!("capture live {src}→{bus}"));
+                    } else {
+                        report.push(format!("FAIL capture not live {src}→{bus}"));
+                    }
+                }
+                Err(e) => report.push(format!("FAIL capture {src}→{bus}: {e:#}")),
+            }
+        }
+        self.capture_applied = true;
+    }
+
+    /// Shared HW capture: ensure Desired mic→bus hops; purge orphan capture.
+    /// Surgical: only buses whose Desired `bus_inputs` changed vs last apply.
+    /// `idle_skip_unchanged`: if fingerprint matches, skip heavy purge entirely.
+    fn reconcile_bus_inputs(&mut self, report: &mut ApplyReport, idle_skip_unchanged: bool) {
+        if idle_skip_unchanged
+            && self.capture_applied
+            && self.desired.bus_inputs == self.last_applied_bus_inputs
+        {
+            return;
+        }
+
+        let track_buses: Vec<String> = self
+            .desired
+            .buses
+            .iter()
+            .filter(|(_, spec)| matches!(spec.role, NodeRole::TrackBus))
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        // First SyncCapture / arm: purge every track bus (orphans on empty racks).
+        // Later: diff vs last applied — empty→nonempty / remove / mute-row.
+        let mut dirty: Vec<String> = Vec::new();
+        if !self.capture_applied {
+            dirty = track_buses.clone();
+        } else {
+            for bus in &track_buses {
+                let want = self
+                    .desired
+                    .bus_inputs
+                    .get(bus)
+                    .cloned()
+                    .unwrap_or_default();
+                let prev = self
+                    .last_applied_bus_inputs
+                    .get(bus)
+                    .cloned()
+                    .unwrap_or_default();
+                if want != prev {
+                    dirty.push(bus.clone());
+                }
+            }
+            // Buses removed from Desired still need purge if they linger in last_applied.
+            for bus in self.last_applied_bus_inputs.keys() {
+                if !track_buses.contains(bus) && !dirty.contains(bus) {
+                    dirty.push(bus.clone());
+                }
+            }
+        }
+
+        let want: std::collections::HashSet<(String, String)> = self
+            .desired
+            .bus_inputs
+            .iter()
+            .flat_map(|(bus, srcs)| srcs.iter().map(|s| (s.clone(), bus.clone())))
+            .collect();
+
+        let stale: Vec<(String, String)> = self
+            .desired
+            .routes
+            .iter()
+            .filter(|(src, sink)| {
+                sink.starts_with("buschain_track_")
+                    && !src.starts_with("buschain_")
+                    && !want.contains(&(src.clone(), sink.clone()))
+            })
+            .cloned()
+            .collect();
+        let had_stale = !stale.is_empty();
+        for (src, sink) in stale {
+            let _ = self.backend.unlink_raw(&src, &sink);
+            self.desired.routes.remove(&(src.clone(), sink.clone()));
+            report.push(format!("input unlink {src}→{sink}"));
+        }
+
+        for bus in &dirty {
+            if !bus.starts_with("buschain_track_") {
+                continue;
+            }
+            let allow = self
+                .desired
+                .bus_inputs
+                .get(bus)
+                .cloned()
+                .unwrap_or_default();
+            let prev = self
+                .last_applied_bus_inputs
+                .get(bus)
+                .cloned()
+                .unwrap_or_default();
+
+            // Drop routes for muted/removed sources first (In mute / ×).
+            // Old keep_rs kept every buschain_rs_* into this bus from Desired.routes,
+            // so mute-in-rack left Mic→rs→bus live and still audible on the device.
+            for src in &prev {
+                if src.is_empty() || allow.iter().any(|a| a == src) {
+                    continue;
+                }
+                self.teardown_capture_source_into_bus(src, bus, report, true);
+            }
+
+            // Only rate-bridges still fed by an *allowed* source — never stale rs hops.
+            let keep_rs: Vec<String> = {
+                let mut set = std::collections::HashSet::new();
+                for src in &allow {
+                    for (s, d) in &self.desired.routes {
+                        if s == src
+                            && (d.starts_with("buschain_rs_") || d.starts_with("shadow_rs_"))
+                        {
+                            set.insert(d.clone());
+                        }
+                    }
+                }
+                for (src, dst) in &self.desired.routes {
+                    if dst != bus {
+                        continue;
+                    }
+                    let node = src.strip_suffix(".monitor").unwrap_or(src.as_str());
+                    if !(node.starts_with("buschain_rs_") || node.starts_with("shadow_rs_")) {
+                        continue;
+                    }
+                    let fed = self.desired.routes.iter().any(|(s, d)| {
+                        d == node
+                            && allow.iter().any(|a| {
+                                s == a
+                                    || s.starts_with(&format!("{a}."))
+                                    || a.starts_with(&format!("{s}."))
+                            })
+                    });
+                    if fed {
+                        set.insert(node.to_string());
+                    }
+                }
+                set.into_iter().collect()
+            };
+            crate::backend::unload_legacy_loopbacks_into_sink_except(bus, &allow);
+            let n = crate::backend::unlink_capture_into_sink_except_with_bridges(
+                bus, &allow, &keep_rs,
+            );
+            if n > 0 {
+                report.push(format!("purged {n} orphan capture link(s) → {bus}"));
+            }
+            let mut verified: Vec<String> = Vec::new();
+            for src in &allow {
+                if src.is_empty() || src.starts_with("buschain_") {
+                    continue;
+                }
+                let clock = self.desired.clock.clone();
+                // Re-ensure with force when source was absent from last_applied
+                // (resurrect after mute/× / false-success).
+                let was_live = prev.iter().any(|p| p == src);
+                let ens = if was_live {
+                    ensure_clocked_route(
+                        &mut self.backend,
+                        src,
+                        bus,
+                        &clock,
+                        &mut self.desired,
+                        false,
+                    )
+                } else {
+                    ensure_clocked_route_force(
+                        &mut self.backend,
+                        src,
+                        bus,
+                        &clock,
+                        &mut self.desired,
+                        false,
+                    )
+                };
+                match ens {
+                    Ok(()) => {
+                        if capture_hop_verified(src, bus, &self.desired) {
+                            verified.push(src.clone());
+                            report.push(format!("capture live {src}→{bus}"));
+                        } else {
+                            report.push(format!("FAIL capture not live {src}→{bus}"));
+                        }
+                    }
+                    Err(e) => report.push(format!("FAIL capture {src}→{bus}: {e:#}")),
+                }
+            }
+            // Fingerprint = verified only (never paper-success Desired).
+            self.last_applied_bus_inputs
+                .insert(bus.clone(), verified);
+        }
+
+        if dirty.is_empty() && !had_stale {
+            self.capture_applied = true;
+            return;
+        }
+
+        // Global orphan HW→rs purge only when sources were removed (or first sync).
+        // Running it on every Add In was unloading live Mic→rs hops for other tracks
+        // (strict/racy allow match) → "only the old input still works".
+        let prev_global: std::collections::HashSet<String> = self
+            .last_applied_bus_inputs
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let global_allow: std::collections::HashSet<String> = self
+            .desired
+            .bus_inputs
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let sources_removed = prev_global.iter().any(|s| !global_allow.contains(s));
+        if !self.capture_applied || sources_removed {
+            let bridge_in_use: std::collections::HashSet<String> = self
+                .desired
+                .bridges
+                .keys()
+                .cloned()
+                .chain(self.desired.routes.iter().filter_map(|(s, d)| {
+                    if s.starts_with("buschain_rs_") {
+                        Some(s.clone())
+                    } else if d.starts_with("buschain_rs_") {
+                        Some(d.clone())
+                    } else {
+                        None
+                    }
+                }))
+                .collect();
+            let n = crate::backend::unload_orphan_hw_to_rs_loopbacks(&global_allow);
+            if n > 0 {
+                report.push(format!("unloaded {n} orphan HW→rs mic loopback(s)"));
+            }
+            if let Ok(names) = self.backend.list_sink_names() {
+                for name in names {
+                    if !name.starts_with("buschain_rs_") && !name.starts_with("shadow_rs_") {
+                        continue;
+                    }
+                    if bridge_in_use.contains(&name) {
+                        continue;
+                    }
+                    crate::backend::unload_legacy_loopbacks_into_sink_except(&name, &[]);
+                    if self.backend.destroy_node(&name).is_ok() {
+                        report.push(format!("destroyed orphan rate-bridge {name}"));
+                    }
+                }
+            }
+        }
+        // Do not overwrite per-bus verified fingerprints with Desired intent.
+        self.capture_applied = true;
     }
 
     /// Exclusive routing hygiene — run often; cheap when already clean.
@@ -504,9 +1050,14 @@ impl Engine {
                         report.push(format!("prune dry {bus}→{d} (wet exclusive)"));
                     }
                 }
-                let mut allow: Vec<&str> = dest_refs.clone();
-                allow.push("buschain_hold");
-                let _ = self.backend.unlink_from_source_except(&post_mon, &allow);
+                // Mixer-muted: strip all egress (hold only). Else keep Desired dests.
+                if self.mixer_muted(bus) {
+                    let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                } else {
+                    let mut allow: Vec<&str> = dest_refs.clone();
+                    allow.push("buschain_hold");
+                    let _ = self.backend.unlink_from_source_except(&post_mon, &allow);
+                }
             } else if !spec.inserts.is_empty() {
                 // Feed restore first: spine_ok requires bus→fx. After restart the
                 // feed often drops while fx/post remain — pruning post→dest then
@@ -517,7 +1068,7 @@ impl Engine {
                     report.push(format!("restore {bus}→fx feed"));
                 }
                 let spine_now = pipeline::arm::spine_instant_ready(bus);
-                if spine_now && allow_egress {
+                if spine_now && allow_egress && !self.mixer_muted(bus) {
                     let mut missing = false;
                     for d in &dests {
                         if !d.is_empty() && !link_is_live(&post_mon, d) {
@@ -527,12 +1078,7 @@ impl Engine {
                     }
                     if missing {
                         wake_sink_for_egress(&dests);
-                        match pipeline::arm::arm_track_egress(
-                            &mut self.backend,
-                            bus,
-                            true,
-                            &dests,
-                        ) {
+                        match self.arm_track_egress(bus, true, &dests) {
                             Ok(()) => report.push(format!("re-arm wet egress {bus}")),
                             Err(e) => report.push(format!("re-arm {bus}: {e:#}")),
                         }
@@ -628,12 +1174,14 @@ impl Engine {
                 .get(&name)
                 .copied()
                 .unwrap_or_default();
+            // Keep app sink open at fader gain (never cork). Mute = egress silence.
             let _ = self.backend.open_bus_gain(&name, level.gain_db);
-            let want_mute = level.mixer_mute;
-            let prev = self.applied_monitor_mute.get(&name).copied();
-            if prev != Some(want_mute) {
-                let _ = self.backend.gate_monitor(&name, want_mute);
-                self.applied_monitor_mute.insert(name.clone(), want_mute);
+            // Idle/reconcile must NEVER call gate_track_mute here — unmute arm is
+            // ~800ms/bus (CLI unlink) and was re-run every idle + after every Route,
+            // starving Add In for minutes. Mute keep is reapply_muted_egress only.
+            if matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus) {
+                self.applied_monitor_mute
+                    .insert(name.clone(), level.mixer_mute);
             }
         }
         self.reconcile_virtual_inputs(&mut report);
@@ -724,19 +1272,12 @@ impl Engine {
                         let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                         report.push(format!("FX {bus}: restored feed"));
                     }
-                    if pipeline::arm::spine_instant_ready(&bus) {
+                    if pipeline::arm::spine_instant_ready(&bus) && !self.mixer_muted(&bus) {
                         let dests = self.desired.egress_dests(&bus);
                         let allow = bus != "buschain_master" || self.desired.speakers_armed;
                         if allow && !dests.is_empty() {
                             wake_sink_for_egress(&dests);
-                            if pipeline::arm::arm_track_egress(
-                                &mut self.backend,
-                                &bus,
-                                true,
-                                &dests,
-                            )
-                            .is_ok()
-                            {
+                            if self.arm_track_egress(&bus, true, &dests).is_ok() {
                                 report.push(format!("FX {bus}: re-armed egress"));
                             }
                         }
@@ -809,6 +1350,7 @@ impl Engine {
                 // Duplex PwFxNode is not a null-sink; canonical-only checks stripped
                 // the wet path and fail-opened dry master→HW (plugins silently skipped).
                 if any_gen_live(master) {
+                    self.master_wet_hold_since = None;
                     let fx = live_fx_name(master);
                     let post = live_post_name(master);
                     let post_mon = format!("{post}.monitor");
@@ -848,6 +1390,7 @@ impl Engine {
                 } else if self.desired.fx_failed.contains(master) {
                     // FX ensure failed (e.g. legacy plugin labels) — fail-open dry
                     // Master→HW so system audio is not stuck on hold forever.
+                    self.master_wet_hold_since = None;
                     for post in [live_post_name(master), post_name_for_bus(master)] {
                         let post_mon = format!("{post}.monitor");
                         if link_is_live(&post_mon, &hw) || sink_exists(&post) {
@@ -865,16 +1408,42 @@ impl Engine {
                     }
                     let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                 } else {
-                    // FX node missing mid-build — hold only; never arm dry Master→HW.
-                    let _ = self
-                        .backend
-                        .unlink_from_source_except(&from, &["buschain_hold"]);
-                    let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
-                    if link_is_live(&from, &hw) {
-                        let _ = self.backend.unlink_raw(&from, &hw);
+                    // FX node missing mid-build — hold briefly, then fail-open dry
+                    // Master→HW so hold is never a stable audible path.
+                    const WET_HOLD_FAIL_OPEN: Duration = Duration::from_millis(2000);
+                    let hold_age = self.master_wet_hold_since.get_or_insert_with(Instant::now);
+                    if hold_age.elapsed() >= WET_HOLD_FAIL_OPEN {
+                        self.master_wet_hold_since = None;
+                        for post in [live_post_name(master), post_name_for_bus(master)] {
+                            let post_mon = format!("{post}.monitor");
+                            if link_is_live(&post_mon, &hw) || sink_exists(&post) {
+                                let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+                            }
+                        }
+                        wake_sink(&hw);
+                        let _ = self
+                            .backend
+                            .unlink_from_source_except(&from, &[&hw, "buschain_hold"]);
+                        if let Err(e) = self.backend.ensure_link_raw(&from, &hw) {
+                            report.push(format!("master→HW (wet timeout, dry): {e:#}"));
+                        } else {
+                            report.push(format!(
+                                "master→{hw} (wet mid-build timeout — dry fail-open)"
+                            ));
+                        }
+                        let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
+                    } else {
+                        let _ = self
+                            .backend
+                            .unlink_from_source_except(&from, &["buschain_hold"]);
+                        let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
+                        if link_is_live(&from, &hw) {
+                            let _ = self.backend.unlink_raw(&from, &hw);
+                        }
                     }
                 }
             } else {
+                self.master_wet_hold_since = None;
                 // Dry Master: never leave orphan post→HW (parallel with master→HW =
                 // delayed double = chorus/echo). Prune post outs every idle pass.
                 for post in [live_post_name(master), post_name_for_bus(master)] {
@@ -899,27 +1468,52 @@ impl Engine {
             }
         }
 
+        // Preferred BusChain default only when speakers are armed and Master→HW is
+        // live — otherwise reclaim would park apps on a silent hollow bus.
         if let Some(pref) = self.desired.preferred_default.clone() {
-            let exists = self
-                .backend
-                .list_sink_names()
-                .map(|n| n.iter().any(|s| s == &pref))
-                .unwrap_or(false);
-            if exists {
-                let live = self.backend.default_sink_name();
-                if live.as_deref() != Some(pref.as_str()) {
-                    let due = self
-                        .last_default_assert
-                        .map(|t| t.elapsed() >= Duration::from_millis(500))
-                        .unwrap_or(true);
-                    if due {
-                        self.last_default_assert = Some(Instant::now());
-                        match self.backend.set_default_sink(&pref) {
-                            Ok(true) => report.push(format!("default→{pref}")),
-                            Ok(false) => {
-                                report.push(format!("default did not stick — retrying ({pref})"))
+            let pref_is_buschain = pref.starts_with("buschain_") || pref.starts_with("shadow_");
+            let hw = self
+                .desired
+                .master_hw
+                .clone()
+                .or_else(|| self.master_hw.clone());
+            let master_ok = self.desired.speakers_armed
+                && hw.as_ref().is_some_and(|h| self.master_hw_link_live(h));
+            let target = if pref_is_buschain && !master_ok {
+                hw.filter(|h| !h.is_empty())
+            } else {
+                Some(pref)
+            };
+            if let Some(target) = target {
+                let exists = self
+                    .backend
+                    .list_sink_names()
+                    .map(|n| n.iter().any(|s| s == &target))
+                    .unwrap_or(false);
+                if exists {
+                    let live = self.backend.default_sink_name();
+                    if live.as_deref() != Some(target.as_str()) {
+                        let due = self
+                            .last_default_assert
+                            .map(|t| t.elapsed() >= Duration::from_millis(500))
+                            .unwrap_or(true);
+                        if due {
+                            self.last_default_assert = Some(Instant::now());
+                            match self.backend.set_default_sink(&target) {
+                                Ok(true) => {
+                                    if pref_is_buschain && !master_ok {
+                                        report.push(format!(
+                                            "default→{target} (Master HW not live — skip buschain preferred)"
+                                        ));
+                                    } else {
+                                        report.push(format!("default→{target}"));
+                                    }
+                                }
+                                Ok(false) => report.push(format!(
+                                    "default did not stick — retrying ({target})"
+                                )),
+                                Err(e) => report.push(format!("default: {e:#}")),
                             }
-                            Err(e) => report.push(format!("default: {e:#}")),
                         }
                     }
                 }
@@ -962,15 +1556,10 @@ impl Engine {
         } else if state.is_wet() {
             self.desired.ensure_fx_chain(spec);
             // Multi-dest: arm every configured hop after primary wet land.
-            if arm_egress {
+            if arm_egress && !self.mixer_muted(&bus) {
                 let dests = self.desired.egress_dests(&bus);
                 if dests.len() > 1 {
-                    let _ = pipeline::arm::arm_track_egress(
-                        &mut self.backend,
-                        &bus,
-                        true,
-                        &dests,
-                    );
+                    let _ = self.arm_track_egress(&bus, true, &dests);
                 }
             }
         }
@@ -1064,6 +1653,9 @@ impl Engine {
         let mut bus_report = self.reconcile_buses_and_levels()?;
         report.messages.append(&mut bus_report.messages);
         self.reconcile_fx(&mut report);
+        self.prune_orphan_track_buses(&mut report);
+        self.reconcile_bus_inputs(&mut report, false);
+        self.reapply_muted_egress(&mut report);
         self.reconcile_master_and_default(&mut report)?;
         report.push("speakers armed (adopted)");
         Ok(report)
@@ -1076,25 +1668,32 @@ impl Engine {
             return self.adopt_live_session();
         }
 
+        let hw = self
+            .desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone());
+        // If Master→HW is already playing, never cold-disarm it. A brand-new dry
+        // bus missing egress used to fail `session_graph_healthy` and tear down
+        // post→HW (+Track silence). Keep speakers; arm missing buses only.
+        let master_live = hw.as_ref().is_some_and(|h| {
+            link_is_live("buschain_master.monitor", h)
+                || link_is_live("buschain_post_master.monitor", h)
+        });
+
         let mut report = ApplyReport::default();
-        self.desired.speakers_armed = false;
+        self.desired.speakers_armed = master_live;
         self.desired.fx_failed.clear();
 
         let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
         for bus in &buses {
+            if master_live && bus == "buschain_master" {
+                continue;
+            }
             let keep_fx = self.desired.fx_chains.contains_key(bus);
             pipeline::arm::disarm_track_egress(&mut self.backend, bus, keep_fx);
         }
-        // Soft-arm Master: do not silence speakers if Master→HW is already live.
-        // Cold disarm-first caused multi-second mute on UI restart (fail-closed).
-        if let Some(hw) = self
-            .desired
-            .master_hw
-            .clone()
-            .or_else(|| self.master_hw.clone())
-        {
-            let master_live = link_is_live("buschain_master.monitor", &hw)
-                || link_is_live("buschain_post_master.monitor", &hw);
+        if let Some(hw) = hw {
             if master_live {
                 report.push(format!("soft-arm speakers (keep live →{hw})"));
             } else {
@@ -1105,6 +1704,8 @@ impl Engine {
 
         let mut bus_report = self.reconcile_buses_and_levels()?;
         report.messages.append(&mut bus_report.messages);
+        self.prune_orphan_track_buses(&mut report);
+        self.reconcile_bus_inputs(&mut report, false);
 
         let mode = if force_fx {
             ChainEnsureMode::ForceRespawn
@@ -1170,9 +1771,7 @@ impl Engine {
                 report.push(format!("dry {bus}: bus not ready"));
                 continue;
             }
-            if let Err(e) =
-                pipeline::arm::arm_track_egress(&mut self.backend, bus, false, &dests)
-            {
+            if let Err(e) = self.arm_track_egress(bus, false, &dests) {
                 report.push(format!("dry arm {bus}: {e:#}"));
             } else {
                 report.push(format!("dry armed {bus}"));
@@ -1189,12 +1788,12 @@ impl Engine {
             }
             if self.desired.fx_failed.contains(bus) {
                 let dests = self.desired.egress_dests(bus);
-                let _ = pipeline::arm::arm_track_egress(&mut self.backend, bus, false, &dests);
+                let _ = self.arm_track_egress(bus, false, &dests);
                 continue;
             }
             if pipeline::arm::spine_instant_ready(bus) || self.chain_is_wet(bus) {
                 let dests = self.desired.egress_dests(bus);
-                let _ = pipeline::arm::arm_track_egress(&mut self.backend, bus, true, &dests);
+                let _ = self.arm_track_egress(bus, true, &dests);
             }
         }
 
@@ -1313,13 +1912,28 @@ impl Engine {
     }
 
     /// Route / Hotplug: Desired sync already applied — relink egress + Master HW only.
-    /// Never ForceRespawn / reconcile_fx.
+    /// Never ForceRespawn / ArmSession — cold bring-up stays on Reconcile.
     pub fn relink_routes(&mut self) -> Result<ApplyReport> {
-        if !self.desired.speakers_armed && !self.desired.buses.is_empty() {
-            return self.arm_session(true);
-        }
         let mut report = ApplyReport::default();
+        if !self.desired.speakers_armed && !self.desired.buses.is_empty() {
+            // Soft-arm latch only when Master→HW is already live. Never ArmSession.
+            let hw = self
+                .desired
+                .master_hw
+                .clone()
+                .or_else(|| self.master_hw.clone());
+            let master_live = hw.as_ref().is_some_and(|h| {
+                link_is_live("buschain_master.monitor", h)
+                    || link_is_live("buschain_post_master.monitor", h)
+            });
+            if master_live {
+                self.desired.speakers_armed = true;
+                report.push("soft-arm speakers latch (Route)");
+            }
+        }
+        self.prune_orphan_track_buses(&mut report);
         // Re-arm every bus egress from Desired (listen / outs / Master).
+        // Capture hops are Intent::SyncCapture / reconcile_inputs_only.
         let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
         for bus in buses {
             if bus.starts_with("buschain_vinf_") || bus == "buschain_hold" {
@@ -1453,6 +2067,10 @@ impl Engine {
     }
 
     pub fn arm_track_egress(&mut self, bus: &str, wet: bool, dests: &[String]) -> Result<()> {
+        if self.mixer_muted(bus) {
+            pipeline::arm::disarm_track_egress(&mut self.backend, bus, true);
+            return Ok(());
+        }
         pipeline::arm::arm_track_egress(&mut self.backend, bus, wet, dests)
     }
 
@@ -1469,6 +2087,108 @@ impl Engine {
         self.backend.unlink_from_source_except(source, allow)
     }
 
+    pub fn mixer_muted_public(&self, bus: &str) -> bool {
+        self.mixer_muted(bus)
+    }
+
+    pub fn mark_monitor_mute_applied(&mut self, bus: &str, muted: bool) {
+        self.applied_monitor_mute.insert(bus.to_string(), muted);
+    }
+
+    /// True when dry bus.monitor→dests or wet post→dests is live (native when ready).
+    pub fn egress_to_dests_live(&self, bus: &str, wet: bool, dests: &[String]) -> bool {
+        if dests.is_empty() {
+            return false;
+        }
+        let src = if wet {
+            format!("{}.monitor", live_post_name(bus))
+        } else {
+            format!("{bus}.monitor")
+        };
+        dests.iter().any(|d| {
+            !d.is_empty() && sink_exists(d) && link_is_live(&src, d)
+        })
+    }
+
+    /// Mixer mute: silence egress (unlink bus/post → dests), never cork the app sink.
+    /// Latch-only on the hot path — but if unmuted latch lies (hold-only), re-arm.
+    pub fn gate_track_mute(&mut self, bus: &str, muted: bool) -> Result<()> {
+        let t0 = Instant::now();
+        let prev = self.applied_monitor_mute.get(bus).copied();
+        self.desired_mut_bus_mixer_mute(bus, muted);
+        // Already at desired latch — skip disarm/arm (Class A budget), unless
+        // unmuted but egress is missing (EnsureTrack/Capture left hold-only).
+        if prev == Some(muted) {
+            if muted {
+                lat_trace_line(
+                    'A',
+                    "gate_track_mute",
+                    &format!("{bus} muted={muted} (latch)"),
+                    t0.elapsed().as_millis(),
+                    true,
+                );
+                return Ok(());
+            }
+            let dests = self.desired.egress_dests(bus);
+            let wet = any_gen_live(bus);
+            if self.egress_to_dests_live(bus, wet, &dests) {
+                lat_trace_line(
+                    'A',
+                    "gate_track_mute",
+                    &format!("{bus} muted={muted} (latch)"),
+                    t0.elapsed().as_millis(),
+                    true,
+                );
+                return Ok(());
+            }
+            // Fall through to arm — latch said open but graph is hold-only.
+        }
+        if muted {
+            pipeline::arm::disarm_track_egress(&mut self.backend, bus, true);
+        } else {
+            // Master→HW stays behind speakers_armed.
+            if bus == "buschain_master" && !self.desired.speakers_armed {
+                self.applied_monitor_mute.insert(bus.to_string(), false);
+                lat_trace_line(
+                    'A',
+                    "gate_track_mute",
+                    &format!("{bus} muted={muted} (master barrier)"),
+                    t0.elapsed().as_millis(),
+                    true,
+                );
+                return Ok(());
+            }
+            let dests = self.desired.egress_dests(bus);
+            let wet = any_gen_live(bus);
+            let _ = self.arm_track_egress(bus, wet, &dests);
+        }
+        self.applied_monitor_mute.insert(bus.to_string(), muted);
+        lat_trace_line(
+            'A',
+            "gate_track_mute",
+            &format!("{bus} muted={muted}"),
+            t0.elapsed().as_millis(),
+            t0.elapsed().as_millis() < 20,
+        );
+        Ok(())
+    }
+
+    fn desired_mut_bus_mixer_mute(&mut self, bus: &str, muted: bool) {
+        let gain = self
+            .desired
+            .bus_levels
+            .get(bus)
+            .map(|l| l.gain_db)
+            .unwrap_or(0.0);
+        self.desired.set_bus_level(
+            bus,
+            crate::plan::BusLevel {
+                gain_db: gain,
+                mixer_mute: muted,
+            },
+        );
+    }
+
     pub fn teardown_links(&mut self) {
         self.backend.teardown_links();
         let _ = self.backend.teardown_rate_bridges();
@@ -1477,6 +2197,11 @@ impl Engine {
     pub fn destroy_rate_bridges_only(&mut self) {
         let _ = self.backend.teardown_rate_bridges();
         self.desired.bridges.clear();
+    }
+
+    /// Destroy a linger null-sink / helper by name (native registry, then Pulse).
+    pub fn destroy_node(&mut self, name: &str) -> Result<()> {
+        self.backend.destroy_node(name)
     }
 
     pub fn link_is_live(source: &str, sink: &str) -> bool {
@@ -1512,6 +2237,28 @@ impl Default for Engine {
     }
 }
 
+fn lat_trace_enabled() -> bool {
+    matches!(
+        std::env::var("BUSCHAIN_CONTROL_LAT_TRACE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn lat_trace_line(class: char, op: &str, detail: &str, ms: u128, ok: bool) {
+    if !lat_trace_enabled() {
+        return;
+    }
+    let verdict = if !ok {
+        "FAIL"
+    } else if (class == 'A' && ms > 20) || (class == 'B' && ms > 200) || (class == 'C' && ms > 500)
+    {
+        "SLOW"
+    } else {
+        "OK"
+    };
+    eprintln!("[lat] {class} {op} {detail} {ms}ms {verdict}");
+}
+
 /// Wake a PipeWire/Pulse sink that may have auto-suspended (USB idle, etc.).
 fn wake_sink(name: &str) {
     if name.is_empty() {
@@ -1531,5 +2278,75 @@ fn wake_sink_for_egress(dests: &[String]) {
             continue;
         }
         wake_sink(d);
+    }
+}
+
+/// Plan CaptureDelta remove/add sets (unit-testable contract).
+///
+/// `is_verified_live(src)` must reflect native hop truth for `src→bus`.
+/// Add includes every Desired source that is new **or** not verified-live
+/// (force-recreate — never idempotent-skip after mute/×).
+pub fn plan_capture_delta(
+    prev_applied: &[String],
+    want: &[String],
+    is_verified_live: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let remove: Vec<String> = prev_applied
+        .iter()
+        .filter(|s| !want.iter().any(|w| w == *s))
+        .cloned()
+        .collect();
+    let add: Vec<String> = want
+        .iter()
+        .filter(|s| {
+            if !prev_applied.iter().any(|p| p == *s) {
+                return true;
+            }
+            !is_verified_live(s)
+        })
+        .cloned()
+        .collect();
+    (remove, add)
+}
+
+#[cfg(test)]
+mod capture_contract_tests {
+    use super::plan_capture_delta;
+
+    #[test]
+    fn mute_row_removes_from_applied() {
+        let prev = vec!["mic1".into(), "mic2".into()];
+        let want = vec!["mic2".into()]; // mic1 muted
+        let (remove, add) = plan_capture_delta(&prev, &want, |_| true);
+        assert_eq!(remove, vec!["mic1"]);
+        assert!(add.is_empty());
+    }
+
+    #[test]
+    fn re_add_after_teardown_force_recreates() {
+        let prev: Vec<String> = vec![]; // tear down cleared last_applied
+        let want = vec!["mic1".into()];
+        let (remove, add) = plan_capture_delta(&prev, &want, |_| false);
+        assert!(remove.is_empty());
+        assert_eq!(add, vec!["mic1"]);
+    }
+
+    #[test]
+    fn ghost_fingerprint_forces_recreate() {
+        // last_applied lies (paper success) but hop is dead → must Add again.
+        let prev = vec!["mic1".into()];
+        let want = vec!["mic1".into()];
+        let (remove, add) = plan_capture_delta(&prev, &want, |_| false);
+        assert!(remove.is_empty());
+        assert_eq!(add, vec!["mic1"]);
+    }
+
+    #[test]
+    fn verified_live_skips_recreate() {
+        let prev = vec!["mic1".into()];
+        let want = vec!["mic1".into()];
+        let (remove, add) = plan_capture_delta(&prev, &want, |_| true);
+        assert!(remove.is_empty());
+        assert!(add.is_empty());
     }
 }

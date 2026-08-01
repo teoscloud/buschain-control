@@ -110,7 +110,22 @@ pub fn arm_track_egress(
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
 
+    let dests_live = |src: &str| {
+        dests.iter().all(|d| {
+            d.is_empty() || !sink_exists(d) || link_is_live(src, d)
+        }) && dests.iter().any(|d| !d.is_empty() && sink_exists(d) && link_is_live(src, d))
+    };
+
     if wet {
+        // Fast path: wet exclusive already up — skip unlink storms.
+        if link_is_live(&from, &fx)
+            && link_is_live(&fx, &post)
+            && dests_live(&post_mon)
+            && !dests.iter().any(|d| !d.is_empty() && link_is_live(&from, d))
+        {
+            let _ = backend.ensure_link_raw(&from, "buschain_hold");
+            return Ok(());
+        }
         // Exclusive wet: never leave dry bus→dest alongside post→dest.
         let _ = backend.unlink_from_source_except(&from, &[fx.as_str(), "buschain_hold"]);
         let _ = backend.ensure_link_raw(&from, &fx);
@@ -129,6 +144,10 @@ pub fn arm_track_egress(
             backend.ensure_link_raw(&post_mon, d)?;
         }
     } else {
+        if dests_live(&from) {
+            let _ = backend.ensure_link_raw(&from, "buschain_hold");
+            return Ok(());
+        }
         let _ = backend.unlink_from_source_except(&post_mon, &[]);
         let allow: Vec<&str> = dests
             .iter()

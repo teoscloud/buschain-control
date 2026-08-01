@@ -46,6 +46,10 @@ pub struct DesiredState {
     pub fx_failed: HashSet<String>,
     /// Track buses that should expose `buschain_vin_*` (description for remap).
     pub virtual_inputs: HashMap<String, String>,
+    /// Bus → unmuted HW capture sources (shared / non-exclusive mic hops).
+    pub bus_inputs: HashMap<String, Vec<String>>,
+    /// Bus → session-pinned playback app keys (`bin:…` / `name:…`).
+    pub bus_playback: HashMap<String, Vec<String>>,
 }
 
 impl DesiredState {
@@ -98,6 +102,22 @@ impl DesiredState {
             None => {
                 self.virtual_inputs.remove(bus);
             }
+        }
+    }
+
+    pub fn set_bus_inputs(&mut self, bus: &str, sources: Vec<String>) {
+        if sources.is_empty() {
+            self.bus_inputs.remove(bus);
+        } else {
+            self.bus_inputs.insert(bus.to_string(), sources);
+        }
+    }
+
+    pub fn set_bus_playback(&mut self, bus: &str, keys: Vec<String>) {
+        if keys.is_empty() {
+            self.bus_playback.remove(bus);
+        } else {
+            self.bus_playback.insert(bus.to_string(), keys);
         }
     }
 

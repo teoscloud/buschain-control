@@ -20,6 +20,7 @@ Standalone Nix flake — build and run from this repository.
 ### Mixer & graph
 
 - Dynamic **tracks / buses** with mute, solo, listen, and gain
+- **Input rack** per track (multi HW capture, shared with desktop / other tracks)
 - **Channel rack** of inserts per track (add / remove / reorder / power / wet Mix)
 - Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → dest`
 - Live hotplug: knob Props without tearing the graph; structural FX rewire when needed
@@ -360,6 +361,7 @@ Quant handover: [`HANDOVER-QUICKSHELL.md`](HANDOVER-QUICKSHELL.md) · stubs in [
 | ctl / helper not found | Build ctl (`cargo build -p buschain-tools --bin buschain-ctl`); absolute path for bare Waybar PATH |
 | VST3 editor tiled (Hyprland) | Ensure `hyprctl` works; add the optional `windowrulev2` above |
 | VST3 missing `.so` | Expand `vst3PluginRuntimeLibs` in `flake.nix` |
+| Desktop silent after Quit / kill | `buschain-ctl recover-audio` · see [PIN](#pin--quit-leaves-system-audio-broken). Blunt: `systemctl --user restart wireplumber` |
 
 ```bash
 buschain-waybar status
@@ -367,6 +369,74 @@ buschain-ctl status
 command -v buschain-mixer-gtk
 command -v buschain-plugin-surface
 ```
+
+---
+
+## Pins / follow-ups
+
+### PIN — quit / graph edits leave system audio broken
+
+**Status:** hard invariants + graceful restore landed (2026-07); residual = crash/`kill -9` and WP races.
+
+**Symptom:** After closing, killing, **+Track**, or assigning a system mic as track input, PipeWire can stay hollow — default on dead `buschain_*`, Master HW muted, apps on linger null sinks, or Master→HW cold-disarmed. Desktop capture can also die when exclusive mic hops steal the default source.
+
+**Field note (2026-07-31):** A NixOS rebuild that **restarted `wireplumber.service`** cleared hollow desktop audio. Blunt recovery: `systemctl --user restart wireplumber`.
+
+**Mitigations in tree:**
+
+- Quit / Teardown → `restore_system_audio` + linger destroy; persist HW preferred on quit
+- Surgical commits (`EnsureTrack` / `Route` / `VirtualInput` / `FxRewire`) **never** escalate to Full Apply when the snapshot looks cold — only `Reconcile` may ArmSession
+- Preferred `buschain_*` default / reclaim only when `speakers_armed && Master→HW` live; else force HW
+- Capture is **shared** (`exclusive: false`); Desired `bus_inputs` reconcile + sink-side unlink
+- Wet Master hold mid-build fail-opens dry Master→HW after ~2s
+- Session load prune uses the same `teardown_track_bus` as UI delete (`destroy_node` + virtual-input teardown)
+- Input rack: `Track.inputs: Vec<TrackInput>` (multi-source, mute per row); same mic on many tracks OK
+- `buschain-ctl recover-audio` — pactl restore without tray
+- **Route is one-shot** (`Intent::SyncCapture` + egress relink) — not N× per-track purge/rebuild (graph-apply lag, not buffer delay)
+- **PruneTrack silence-first** — gate + disarm egress + unlink capture before FX/vin destroy
+- Desired `buschain_rs_*` kept during capture purge; sink-side dual-path prune when bridging
+- `relink_routes` never ArmSession / ForceRespawn (soft-arm latch only)
+- **Mic Pulse flap sealed:** `link_is_live` / `ensure_link` treat live `module-loopback` as already-ok (no unload→reload silence); wait for `buschain_rs_*` ports after create
+- **Apps rack:** PlaceApp / `Intent::SyncPlayback` only (no ApplyLevels HOL); one-shot placement list; light `SinkInputs` UI refresh
+
+**Still open:**
+
+- Hard `kill -9` / crash (no atexit watchdog)
+- Thin-client `--daemon-client` quit leaves external graph alone
+- Automated smoke: Quit → HW default unmuted + no orphan `buschain_track_*`; +Track / mic assign → Master→HW link count never zero; Add In / Delete track → take effect &lt; ~1s
+
+**Manual recovery:**
+
+```bash
+buschain-ctl recover-audio
+# or blunt:
+systemctl --user restart wireplumber
+```
+
+### Smoke matrix (manual)
+
+Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
+
+| Step | Expect |
+|------|--------|
+| Track mute LED | Silence &lt;20ms; one `SetTrackLevel`; no N× gate; `[lat] A gate_track_mute … OK` |
+| In **M** / **×** | `[lat] B CaptureDelta …`; mic silent; no `RewireSessionRoutes` |
+| Re-Add mic after × | Audible &lt;~200ms; `capture live …` (never empty SyncCapture); no ghost In |
+| Idle 10s while muted | Stays muted (no open_bus_gain undo) |
+| Apps Add during In edit | PlaceApp completes; mute still Class A priority |
+
+| Step | Expect |
+|------|--------|
+| Quit from tray | Default sink/source = HW, unmuted; no `buschain_*` sinks |
+| +Track with live Master | Master→HW stays linked; desktop playback continues |
+| Add Scarlett mic to track while Discord captures | Discord keeps the mic; track meters show signal |
+| Same mic on two tracks | Both tracks get signal; no exclusive steal |
+| Load session with fewer tracks | Mixer strip count matches JSON; `pactl list short sinks` has no orphan `buschain_track_*` |
+| Clear all In rows | Capture hops unlinked; desktop mic unchanged |
+| Add mic to track | Meters/signal within ~1s; no silence flap / repeated Pulse WARN |
+| Delete track feeding Master | Master stops that feed immediately (silence-first prune) |
+| Assign app to track (Apps rack) | Stream on target bus within ~1s; no ApplyLevels HOL |
+| Unpin app from track | Leaves track quickly (preferred default / Master) |
 
 ---
 
@@ -390,6 +460,8 @@ command -v buschain-plugin-surface
 | `BUSCHAIN_CONTROL_CTL` | Path to `buschain-ctl` |
 | `BUSCHAIN_CONTROL_DAEMON` | Socket path override |
 | `BUSCHAIN_CONTROL_USE_DAEMON` | Thin-client debug |
+| `BUSCHAIN_CONTROL_LAT_TRACE` | `1` → Class A/B/C latency lines (`OK`/`SLOW`/`FAIL`) |
+| `BUSCHAIN_ALLOW_PULSE_CAPTURE` | Escape hatch: allow Pulse loopback when native registry is up |
 | `VST3_PATH` / `CLAP_PATH` / `LV2_PATH` / `LADSPA_PATH` | Plugin scan roots |
 | `HYPRLAND_INSTANCE_SIGNATURE` | Enables Hyprland float dispatch for editors |
 
@@ -397,7 +469,19 @@ command -v buschain-plugin-surface
 
 ## Architecture
 
-One `buschain-control` process owns the graph (in-process worker + coalesce).
+One `buschain-control` process owns the graph via a **dual-thread control plane**:
+
+| Lane | Thread | Owns |
+|------|--------|------|
+| **Interactive** | `buschain-interactive` | Mute/fader/Props, `SyncCaptureDelta`, PlaceApp (Class A/B) |
+| **Supervisor** | `buschain-supervisor` | Route/Ensure/Prune/ArmSession/FxRewire, idle reconcile (Class C) |
+| **Observer** | `buschain-observer` | `refresh_snapshot` only — never ENGINE mute path |
+
+Sealed FX pillars stay unchanged: `pipeline/arm` disarm/arm, gen-swap ForceRespawn
+(Supervisor/FxRewire only), `speakers_armed` / ArmSession barrier, ControlQueue Props,
+never-cork app sinks, PruneTrack silence-first. Capture hops verify native-live before
+`last_applied` updates (`Intent::SyncCaptureDelta`).
+
 The engine insert rack (`PwFxNode` + `AudioProcessor` host) is the DSP path;
 PipeWire is mixer I/O. Helpers (`plugin-surface` / `plugin-dsp`) run only when
 promoted or sandboxed.

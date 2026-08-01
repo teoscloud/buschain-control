@@ -42,6 +42,17 @@ impl TrackKind {
     }
 }
 
+/// One hardware / system capture source feeding a track (input rack row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackInput {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_desc: Option<String>,
+    /// When true, source is kept in the rack but not linked into the bus.
+    #[serde(default)]
+    pub mute: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: Uuid,
@@ -58,11 +69,14 @@ pub struct Track {
     /// Legacy bare names / stream indices still match at apply time.
     #[serde(default)]
     pub assigned_playback: Vec<String>,
-    /// PipeWire source name feeding this track (dropdown).
+    /// Capture rack: multiple HW sources may feed this track (shared with desktop).
     #[serde(default)]
+    pub inputs: Vec<TrackInput>,
+    /// Legacy single input — migrated into `inputs` on [`Session::normalize`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_source: Option<String>,
-    /// Human description of input (survives PipeWire renaming the node).
-    #[serde(default)]
+    /// Legacy input description — migrated with `input_source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_source_desc: Option<String>,
     /// Destinations: other track IDs and/or master. Empty ⇒ master only.
     #[serde(default)]
@@ -103,6 +117,17 @@ impl Track {
     /// Internal feed null-sink; egress arms into this, remap masters its `.monitor`.
     pub fn expected_virtual_input_feed_name(&self) -> String {
         format!("buschain_vinf_{}", self.id.simple())
+    }
+
+    /// Sync legacy `input_source` fields from the first unmuted rack row.
+    pub fn sync_legacy_input_fields(&mut self) {
+        if let Some(first) = self.inputs.iter().find(|i| !i.mute) {
+            self.input_source = Some(first.source.clone());
+            self.input_source_desc = first.source_desc.clone();
+        } else {
+            self.input_source = None;
+            self.input_source_desc = None;
+        }
     }
 }
 
@@ -185,6 +210,7 @@ impl Default for Session {
                     listen: false,
                     inserts: vec![],
                     assigned_playback: vec![],
+                    inputs: vec![],
                     input_source: None,
                     input_source_desc: None,
                     output_targets: vec![],
@@ -202,6 +228,7 @@ impl Default for Session {
                     listen: false,
                     inserts: vec![],
                     assigned_playback: vec![],
+                    inputs: vec![],
                     input_source: None,
                     input_source_desc: None,
                     output_targets: vec![master_id],
@@ -254,16 +281,13 @@ impl Session {
         self.device_clocks
             .retain(|k, _| !k.starts_with("buschain_") && !k.starts_with("shadow_"));
         for t in &mut self.tracks {
-            // Empty optionals stay null; clear blank descs.
-            if t.input_source_desc
-                .as_ref()
-                .is_some_and(|d| d.trim().is_empty())
-            {
-                t.input_source_desc = None;
+            t.inputs.retain(|i| !i.source.trim().is_empty());
+            for i in &mut t.inputs {
+                if i.source_desc.as_ref().is_some_and(|d| d.trim().is_empty()) {
+                    i.source_desc = None;
+                }
             }
-            if t.input_source.is_none() {
-                t.input_source_desc = None;
-            }
+            t.sync_legacy_input_fields();
         }
         if self
             .master_output_desc
@@ -306,6 +330,23 @@ impl Session {
                     t.output_targets.push(mid);
                     dirty = true;
                 }
+            }
+            // Migrate legacy single input → input rack.
+            if t.inputs.is_empty() {
+                if let Some(src) = t.input_source.clone().filter(|s| !s.is_empty() && s != "(none)")
+                {
+                    t.inputs.push(TrackInput {
+                        source: src,
+                        source_desc: t.input_source_desc.clone(),
+                        mute: false,
+                    });
+                    dirty = true;
+                }
+            }
+            let before = (t.input_source.clone(), t.input_source_desc.clone());
+            t.sync_legacy_input_fields();
+            if (t.input_source.clone(), t.input_source_desc.clone()) != before {
+                dirty = true;
             }
             for plug in &mut t.inserts {
                 let migrated = crate::audio::plugin::normalize_label(&plug.id.id);
@@ -360,6 +401,7 @@ impl Session {
             listen: false,
             inserts: vec![],
             assigned_playback: vec![],
+            inputs: vec![],
             input_source: None,
             input_source_desc: None,
             output_targets: master.into_iter().collect(),

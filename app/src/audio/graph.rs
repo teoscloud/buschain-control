@@ -159,6 +159,27 @@ fn run_ok(cmd: &str, args: &[&str]) -> Result<()> {
     run(cmd, args).map(|_| ())
 }
 
+/// Observer-published topology (read-only for UI/IPC). Never written from mute path.
+static OBSERVER_SNAPSHOT: std::sync::OnceLock<std::sync::RwLock<PwSnapshot>> =
+    std::sync::OnceLock::new();
+
+fn observer_snapshot_slot() -> &'static std::sync::RwLock<PwSnapshot> {
+    OBSERVER_SNAPSHOT.get_or_init(|| std::sync::RwLock::new(PwSnapshot::default()))
+}
+
+pub fn publish_observer_snapshot(snap: PwSnapshot) {
+    if let Ok(mut g) = observer_snapshot_slot().write() {
+        *g = snap;
+    }
+}
+
+pub fn load_observer_snapshot() -> PwSnapshot {
+    observer_snapshot_slot()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 pub fn refresh_snapshot() -> PwSnapshot {
     let mut snap = PwSnapshot::default();
     match list_sinks() {
@@ -584,9 +605,8 @@ pub fn set_sink_mute(name_or_index: &str, mute: bool) -> Result<()> {
 }
 
 pub fn sink_exists(name: &str) -> bool {
-    list_sinks()
-        .map(|s| s.iter().any(|n| n.name == name))
-        .unwrap_or(false)
+    // Prefer native registry — full `pactl list sinks` on every probe was a mute HOL.
+    buschain_engine::backend::sink_exists(name)
 }
 
 /// True when module args name this sink exactly (not a `__stg` / prefix sibling).
@@ -668,11 +688,18 @@ pub fn move_sink_input_if_needed(index: u32, sink: &str, current: &str) -> Resul
     if current == sink {
         return Ok(false);
     }
-    // Numeric Sink: index from pactl — resolve via list if needed
+    // Numeric Sink: index from pactl — resolve via short list (cached), not full sinks.
     if let Ok(idx) = current.parse::<u32>() {
-        if let Ok(sinks) = list_sinks() {
-            if sinks.iter().any(|s| s.index == idx && s.name == sink) {
-                return Ok(false);
+        if let Some(text) = buschain_engine::backend::pactl_short_sinks() {
+            for line in text.lines() {
+                let mut parts = line.split('\t');
+                let Some(i) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                let Some(name) = parts.next() else { continue };
+                if i == idx && name == sink {
+                    return Ok(false);
+                }
             }
         }
     }
@@ -787,47 +814,15 @@ fn set_named_sink_audible(name: &str, muted: bool) {
     }
 }
 
-/// Open or silence FX helpers on a bus (monolithic FX + leftover slot/mid nodes).
-/// Open path: live A/B generation only (never both gens — dual post→dest sums loud).
-/// Mute path: silence every gen still present.
+/// Open or silence live FX/post helpers only (no `list_sinks` scan).
 fn set_slot_chain_audible(bus: &str, muted: bool) {
     let live_fx = buschain_engine::live_fx_name(bus);
     let live_post = buschain_engine::live_post_name(bus);
-    let can_fx = crate::audio::filter_chain::fx_name_for_bus(bus);
-    let can_post = crate::audio::filter_chain::post_name_for_bus(bus);
-    let stg_fx = format!("{can_fx}__stg");
-    let stg_post = format!("{can_post}__stg");
-    if muted {
-        for name in [&live_fx, &live_post, &can_fx, &can_post, &stg_fx, &stg_post] {
-            if sink_exists(name) {
-                set_named_sink_audible(name, true);
-            }
-        }
-    } else {
-        if sink_exists(&live_fx) {
-            set_named_sink_audible(&live_fx, false);
-        }
-        if sink_exists(&live_post) {
-            set_named_sink_audible(&live_post, false);
-        }
+    if sink_exists(&live_fx) {
+        set_named_sink_audible(&live_fx, muted);
     }
-    // Leftover per-slot nodes from older builds (never A/B gens — handled above).
-    let fx_prefix = crate::audio::filter_chain::slot_fx_prefix(bus);
-    let mid_prefix = crate::audio::filter_chain::slot_mid_prefix(bus);
-    for sink in list_sinks().unwrap_or_default() {
-        let n = &sink.name;
-        if n.as_str() == live_fx
-            || n.as_str() == can_fx
-            || n.as_str() == stg_fx
-            || n.as_str() == live_post
-            || n.as_str() == can_post
-            || n.as_str() == stg_post
-        {
-            continue;
-        }
-        if n.starts_with(&fx_prefix) || n.starts_with(&mid_prefix) {
-            set_named_sink_audible(n, muted);
-        }
+    if sink_exists(&live_post) {
+        set_named_sink_audible(&live_post, muted);
     }
 }
 
@@ -873,28 +868,11 @@ pub fn gate_bus_output(bus: &str, gated: bool) {
     }
 }
 
-/// Apply mute/volume to a track bus, FX chain, and post-FX meter sink.
+/// Apply mute/volume to a track bus without corking apps.
+/// Hot path: native gate + gain only — never `list_sinks` / `ensure_fx_path_open`.
 fn set_track_audible(sink: &str, muted: bool, gain_db: f32) -> Result<()> {
-    let mon = format!("{sink}.monitor");
-    // Never mute/zero the *app-facing sink* for user mute — that corks Chromium.
-    // Silence the outbound monitor / FX chain only; keep sink open for streams.
-    // Always apply fader with muted=false on the app sink.
     let _ = crate::audio::engine_handle::set_levels(sink, gain_db, false);
-    if muted {
-        let _ = set_source_mute(&mon, true);
-        let _ = set_source_volume(&mon, 0);
-        set_slot_chain_audible(sink, true);
-        let _ = set_sink_volume(sink, db_to_pct(gain_db));
-        let _ = run_ok("pactl", &["set-sink-mute", sink, "0"]);
-    } else {
-        let _ = set_sink_volume(sink, db_to_pct(gain_db));
-        let _ = run_ok("pactl", &["set-sink-mute", sink, "0"]);
-        let _ = set_source_mute(&mon, false);
-        let _ = set_source_volume(&mon, 100);
-        set_slot_chain_audible(sink, false);
-        ensure_fx_path_open(sink);
-    }
-    Ok(())
+    crate::audio::engine_handle::gate_track_mute(sink, muted)
 }
 
 /// Continuous fader path — **bus volume only**.
@@ -914,9 +892,10 @@ pub fn apply_one_track_volume(sink: &str, gain_db: f32) -> Result<()> {
     Ok(())
 }
 
-/// Mute / unmute transition — gates monitor + FX/post. Not for fader drags.
+/// Mute / unmute transition — native monitor gate. Not for fader drags.
 pub fn apply_one_track_mute_gate(sink: &str, muted: bool, gain_db: f32) -> Result<()> {
-    set_track_audible(sink, muted, gain_db)
+    let _ = crate::audio::engine_handle::set_levels(sink, gain_db, false);
+    crate::audio::engine_handle::gate_track_mute(sink, muted)
 }
 
 /// Fast fader path. `mute_changed` true → full gate; else volume-only.
@@ -926,6 +905,15 @@ pub fn apply_one_track_level(sink: &str, muted: bool, gain_db: f32) -> Result<()
 }
 
 fn collect_buschain_modules(loopbacks_only: bool) -> Vec<String> {
+    collect_buschain_modules_inner(loopbacks_only, false)
+}
+
+/// Full quit/teardown: also unload hold, keepalives, and remap-source modules.
+fn collect_buschain_modules_quit() -> Vec<String> {
+    collect_buschain_modules_inner(false, true)
+}
+
+fn collect_buschain_modules_inner(loopbacks_only: bool, for_quit: bool) -> Vec<String> {
     let text = run("pactl", &["list", "modules", "short"]).unwrap_or_default();
     let mut to_unload: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -935,10 +923,10 @@ fn collect_buschain_modules(loopbacks_only: bool) -> Vec<String> {
         let args = parts.next().unwrap_or("");
         // Keepalives must survive soft rebuilds — without a monitor reader PipeWire
         // suspends the null-sink and Chromium corks/pauses YouTube.
-        if is_keepalive_loopback(args) {
+        if !for_quit && is_keepalive_loopback(args) {
             continue;
         }
-        if name == "module-null-sink" && args.contains("sink_name=buschain_hold") {
+        if !for_quit && name == "module-null-sink" && args.contains("sink_name=buschain_hold") {
             continue;
         }
         let shadowy = args.contains("buschain_")
@@ -966,6 +954,7 @@ fn collect_buschain_modules(loopbacks_only: bool) -> Vec<String> {
                 "module-null-sink" | "module-ladspa-sink" | "module-loopback" => {
                     shadowy || legacy_loop
                 }
+                "module-remap-source" if for_quit => shadowy,
                 _ => false,
             }
         };
@@ -997,7 +986,7 @@ pub fn teardown_buschain_graph() -> Result<String> {
     silence_buschain_nodes();
     crate::audio::engine_handle::teardown_links();
     std::thread::sleep(std::time::Duration::from_millis(40));
-    let to_unload = collect_buschain_modules(false);
+    let to_unload = collect_buschain_modules_quit();
     let mut unloaded = 0u32;
     for idx in to_unload {
         if run_ok("pactl", &["unload-module", &idx]).is_ok() {
@@ -1005,8 +994,130 @@ pub fn teardown_buschain_graph() -> Result<String> {
         }
     }
     std::thread::sleep(std::time::Duration::from_millis(60));
+    destroy_remaining_buschain_nodes();
     Ok(format!(
         "Tore down PW links + {unloaded} BusChain Control module(s). System audio clean — next live edit auto bring-up the mixer."
+    ))
+}
+
+fn is_real_hw_sink(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("buschain_")
+        && !name.starts_with("shadow_")
+        && !name.contains("auto_null")
+}
+
+fn resolve_restore_hw_sink(preferred_hw: Option<&str>) -> Option<String> {
+    let sinks = list_sinks().unwrap_or_default();
+    if let Some(pref) = preferred_hw {
+        if is_real_hw_sink(pref) && sinks.iter().any(|s| s.name == pref) {
+            return Some(pref.to_string());
+        }
+    }
+    if let Some(cur) = pactl_info_default("Default Sink:") {
+        if is_real_hw_sink(&cur) && sinks.iter().any(|s| s.name == cur) {
+            return Some(cur);
+        }
+    }
+    sinks
+        .into_iter()
+        .find(|s| is_real_hw_sink(&s.name))
+        .map(|s| s.name)
+}
+
+fn resolve_restore_hw_source() -> Option<String> {
+    let sources = list_sources().unwrap_or_default();
+    if let Some(cur) = pactl_info_default("Default Source:") {
+        if is_real_hw_sink(&cur) && sources.iter().any(|s| s.name == cur) {
+            return Some(cur);
+        }
+    }
+    sources
+        .into_iter()
+        .find(|s| is_real_hw_sink(&s.name))
+        .map(|s| s.name)
+}
+
+/// Best-effort destroy for linger native nodes pactl unload missed.
+/// Never pass Pulse sink indices to `pw-cli` — they are not PipeWire global ids.
+fn destroy_remaining_buschain_nodes() {
+    let mut names: Vec<String> = list_sinks()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|n| n.starts_with("buschain_") || n.starts_with("shadow_"))
+        .collect();
+    names.extend(
+        list_sources()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .filter(|n| n.starts_with("buschain_") || n.starts_with("shadow_")),
+    );
+    names.sort();
+    names.dedup();
+    for name in names {
+        let _ = unload_named_null_sink(&name);
+        if let Some(id) = buschain_engine::backend::find_node_id_by_name(&name) {
+            let _ = run_ok("pw-cli", &["destroy", &id.to_string()]);
+        }
+    }
+}
+
+/// Hand PipeWire back to real hardware and destroy linger BusChain nodes.
+/// Call on Quit / Shutdown / Teardown — not on hide-to-tray.
+pub fn restore_system_audio(preferred_hw: Option<&str>) -> Result<String> {
+    let hw_sink = resolve_restore_hw_sink(preferred_hw);
+    let hw_src = resolve_restore_hw_source();
+
+    let mut moved = 0u32;
+    if let Some(ref hw) = hw_sink {
+        if let Ok(inputs) = list_sink_inputs() {
+            for si in inputs {
+                if si.sink_or_source.starts_with("buschain_")
+                    || si.sink_or_source.starts_with("shadow_")
+                {
+                    if move_sink_input(si.index, hw).is_ok() {
+                        moved += 1;
+                    }
+                }
+            }
+        }
+        let _ = set_default_sink(hw);
+        let _ = set_sink_mute(hw, false);
+    }
+
+    if let Some(ref src) = hw_src {
+        let _ = set_default_source(src);
+        let _ = set_source_mute(src, false);
+    }
+
+    // Clear DesiredState + destroy OBJECT_LINGER nodes while the engine is up.
+    let _ = crate::audio::engine_handle::engine_teardown();
+    silence_buschain_nodes();
+    let to_unload = collect_buschain_modules_quit();
+    let mut unloaded = 0u32;
+    for idx in to_unload {
+        if run_ok("pactl", &["unload-module", &idx]).is_ok() {
+            unloaded += 1;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    destroy_remaining_buschain_nodes();
+
+    // Re-assert defaults after unload (WirePlumber can bounce to a dead buschain_*).
+    if let Some(ref hw) = hw_sink {
+        let _ = set_default_sink(hw);
+        let _ = set_sink_mute(hw, false);
+    }
+    if let Some(ref src) = hw_src {
+        let _ = set_default_source(src);
+        let _ = set_source_mute(src, false);
+    }
+
+    Ok(format!(
+        "Restored system audio → {} (moved {moved} stream(s), unloaded {unloaded} module(s))",
+        hw_sink.as_deref().unwrap_or("(no HW sink found)"),
     ))
 }
 
@@ -1343,24 +1454,45 @@ fn bus_for_post_sink(name: &str) -> Option<String> {
     }
 }
 
-/// Remove track buses / FX helpers that no longer belong to any session track.
-/// Rehomes any sink-inputs still on an orphan bus before unload (avoids browser pause).
-pub fn prune_orphan_buschain_track_sinks(
+/// Full teardown for one track bus (session delete + load-shrink orphans).
+/// Gate → FX/host → virtual input → helpers → rehome streams → destroy_node.
+fn teardown_track_bus(
+    bus: &str,
     session: &Session,
     fx: &mut crate::audio::filter_chain::FilterChainRuntime,
 ) {
-    // Gate orphans first so teardown never blasts open speakers.
-    let mut keep_bus: std::collections::HashSet<String> = std::collections::HashSet::new();
-    keep_bus.insert("buschain_master".into());
-    for t in &session.tracks {
-        keep_bus.insert(t.expected_sink_name());
+    if bus == "buschain_master" || !bus.starts_with("buschain_track_") {
+        return;
     }
-
+    // Silence-first: cut egress + capture before FX/vin/destroy so Master stops
+    // hearing this track immediately (not after multi-second host teardown).
+    gate_bus_output(bus, true);
+    crate::audio::engine_handle::disarm_track_egress(bus, false);
+    buschain_engine::backend::unload_legacy_loopbacks_into_sink_except(bus, &[]);
+    let _ = buschain_engine::backend::unlink_capture_into_sink_except(bus, &[]);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let fx_name = crate::audio::filter_chain::fx_name_for_bus(bus);
+    crate::audio::filter_chain::stop_slots_for_bus(fx, bus);
+    let _ = unload_loopbacks_for_track_bus(bus, &fx_name);
+    unload_mids_for_bus(bus);
+    unload_post_sink_for_bus(bus);
+    fx.stop_one(bus);
+    crate::audio::engine_handle::with_engine(|eng| {
+        let _ = eng.apply(buschain_engine::Intent::TeardownVirtualInput {
+            bus: buschain_engine::NodeName::new(bus),
+        });
+        let _ = eng.teardown_fx_chain(bus);
+    });
+    let keep: std::collections::HashSet<String> = session
+        .tracks
+        .iter()
+        .map(|t| t.expected_sink_name())
+        .chain(std::iter::once("buschain_master".into()))
+        .collect();
     let fallback = session
         .preferred_default_sink
-        .as_ref()
-        .filter(|s| keep_bus.contains(s.as_str()) && sink_exists(s))
-        .cloned()
+        .clone()
+        .filter(|s| keep.contains(s.as_str()) && sink_exists(s))
         .or_else(|| {
             if sink_exists("buschain_master") {
                 Some("buschain_master".into())
@@ -1368,34 +1500,60 @@ pub fn prune_orphan_buschain_track_sinks(
                 None
             }
         });
+    if let (Some(dest), Ok(inputs)) = (fallback, list_sink_inputs()) {
+        for si in inputs {
+            if si.sink_or_source == bus {
+                let _ = move_sink_input_if_needed(si.index, &dest, &si.sink_or_source);
+            }
+        }
+    }
+    // Native linger nodes need destroy_node; pactl unload is a no-op for them.
+    let _ = crate::audio::engine_handle::destroy_node(bus);
+    let _ = unload_named_null_sink(bus);
+    let post = buschain_engine::post_name_for_bus(bus);
+    let _ = crate::audio::engine_handle::destroy_node(&post);
+    let _ = crate::audio::engine_handle::destroy_node(&format!("{post}__stg"));
+    let live_fx = buschain_engine::live_fx_name(bus);
+    let _ = crate::audio::engine_handle::destroy_node(&live_fx);
+}
+
+/// Remove track buses / FX helpers that no longer belong to any session track.
+/// Rehomes any sink-inputs still on an orphan bus before unload (avoids browser pause).
+pub fn prune_orphan_buschain_track_sinks(
+    session: &mut Session,
+    fx: &mut crate::audio::filter_chain::FilterChainRuntime,
+) {
+    let mut keep_bus: std::collections::HashSet<String> = std::collections::HashSet::new();
+    keep_bus.insert("buschain_master".into());
+    for t in &session.tracks {
+        keep_bus.insert(t.expected_sink_name());
+    }
+
+    if let Some(pref) = session.preferred_default_sink.clone() {
+        if pref.starts_with("buschain_track_") && !keep_bus.contains(&pref) {
+            session.preferred_default_sink = None;
+        }
+    }
+
+    let orphan_tracks: Vec<String> = list_sinks()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|name| name.starts_with("buschain_track_") && !keep_bus.contains(name))
+        .collect();
+    for name in orphan_tracks {
+        teardown_track_bus(&name, session, fx);
+    }
 
     for sink in list_sinks().unwrap_or_default() {
         let name = sink.name;
-        if name.starts_with("buschain_track_") && !keep_bus.contains(&name) {
-            gate_bus_output(&name, true);
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            if let (Some(dest), Ok(inputs)) = (fallback.as_ref(), list_sink_inputs()) {
-                for si in inputs {
-                    if si.sink_or_source == name {
-                        let _ = move_sink_input_if_needed(si.index, dest, &si.sink_or_source);
-                    }
-                }
-            }
-            crate::audio::filter_chain::stop_slots_for_bus(fx, &name);
-            let fx_name = crate::audio::filter_chain::fx_name_for_bus(&name);
-            let _ = unload_loopbacks_for_track_bus(&name, &fx_name);
-            unload_mids_for_bus(&name);
-            unload_post_sink_for_bus(&name);
-            // Legacy: FC used to *be* the track sink
-            fx.stop_one(&name);
-            let _ = unload_named_null_sink(&name);
-        }
         // Orphan slot mids (not belonging to any live bus)
         if name.starts_with("buschain_mid_") {
             let owned = keep_bus.iter().any(|b| {
                 name.starts_with(&crate::audio::filter_chain::slot_mid_prefix(b))
             });
             if !owned {
+                let _ = crate::audio::engine_handle::destroy_node(&name);
                 let _ = unload_named_null_sink(&name);
             }
         }
@@ -1403,6 +1561,7 @@ pub fn prune_orphan_buschain_track_sinks(
         if name.starts_with("buschain_post_") {
             if let Some(bus) = bus_for_post_sink(&name) {
                 if !keep_bus.contains(&bus) {
+                    let _ = crate::audio::engine_handle::destroy_node(&name);
                     let _ = unload_named_null_sink(&name);
                 }
             }
@@ -1411,6 +1570,8 @@ pub fn prune_orphan_buschain_track_sinks(
 }
 
 /// Live level update — never reloads modules (safe while dragging faders).
+///
+/// Uses engine mute latch: unmuted buses already open skip full egress re-arm.
 pub fn apply_track_levels(session: &Session) -> Result<()> {
     let any_solo = session
         .tracks
@@ -1513,33 +1674,56 @@ pub fn resolve_hardware_output(session: &Session) -> Result<String> {
         })
 }
 
-fn resolve_input_source(track: &crate::session::Track, sources: &[DeviceNode]) -> Option<String> {
-    let name = track.input_source.as_deref()?;
-    if name.is_empty() || name == "(none)" || name.contains("buschain_") {
+fn resolve_one_input_source(
+    source: &str,
+    source_desc: Option<&str>,
+    own_vin: &str,
+    sources: &[DeviceNode],
+) -> Option<String> {
+    if source.is_empty() || source == "(none)" || source.contains("buschain_") || source == own_vin {
         return None;
     }
-    // Never capture a track's own virtual input (hard feedback).
-    let own_vin = track.expected_virtual_input_name();
-    if name == own_vin {
-        return None;
-    }
-    resolve_device(
-        Some(name),
-        track.input_source_desc.as_deref(),
-        sources,
-        |d| {
-            !d.name.ends_with(".monitor")
-                && !d.name.starts_with("buschain_")
-                && d.name != own_vin
-        },
-    )
+    resolve_device(Some(source), source_desc, sources, |d| {
+        !d.name.ends_with(".monitor")
+            && !d.name.starts_with("buschain_")
+            && d.name != own_vin
+    })
     .or_else(|| {
-        // Last resort: exact name if still listed (never own vin / buschain_*).
         sources
             .iter()
-            .find(|s| s.name == name && s.name != own_vin && !s.name.starts_with("buschain_"))
+            .find(|s| s.name == source && s.name != own_vin && !s.name.starts_with("buschain_"))
             .map(|s| s.name.clone())
     })
+}
+
+/// Resolved unmuted capture sources for a track (input rack).
+fn resolve_input_sources(track: &crate::session::Track, sources: &[DeviceNode]) -> Vec<String> {
+    let own_vin = track.expected_virtual_input_name();
+    let mut out = Vec::new();
+    if track.inputs.is_empty() {
+        // Legacy single-field path (pre-normalize).
+        if let Some(name) = track.input_source.as_deref() {
+            if let Some(r) =
+                resolve_one_input_source(name, track.input_source_desc.as_deref(), &own_vin, sources)
+            {
+                out.push(r);
+            }
+        }
+        return out;
+    }
+    for inp in &track.inputs {
+        if inp.mute {
+            continue;
+        }
+        if let Some(r) =
+            resolve_one_input_source(&inp.source, inp.source_desc.as_deref(), &own_vin, sources)
+        {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
 }
 
 /// Whether a live sink-input belongs to an assigned app key (`bin:…` / `name:…` / legacy).
@@ -1549,13 +1733,28 @@ pub fn stream_matches_app_key(si: &StreamNode, token: &str) -> bool {
 
 /// Move every live stream matching `app_key` onto `sink` (fresh `pactl` list — not UI snapshot).
 pub fn place_app_on_sink(app_key: &str, sink: &str) -> Result<u32> {
-    if !sink_exists(sink) {
+    place_app_on_sink_with(app_key, sink, None)
+}
+
+/// Like [`place_app_on_sink`], optionally reusing a prefetched sink-input list.
+pub fn place_app_on_sink_with(
+    app_key: &str,
+    sink: &str,
+    prefetched: Option<&[StreamNode]>,
+) -> Result<u32> {
+    if prefetched.is_none() && !sink_exists(sink) {
         return Err(anyhow!("sink `{sink}` not found for app place"));
     }
-    let inputs = list_sink_inputs()?;
+    let owned;
+    let inputs: &[StreamNode] = if let Some(p) = prefetched {
+        p
+    } else {
+        owned = list_sink_inputs()?;
+        &owned
+    };
     let mut moved = 0u32;
     for si in inputs {
-        if !stream_matches_app_key(&si, app_key) {
+        if !stream_matches_app_key(si, app_key) {
             continue;
         }
         if si.sink_or_source == sink {
@@ -1570,71 +1769,27 @@ pub fn place_app_on_sink(app_key: &str, sink: &str) -> Result<u32> {
 
 /// Enforce assigned apps → track buses, then unassigned user apps → preferred default.
 ///
-/// Without this, `module-stream-restore` leaves Chromium/Brave on Master while the
-/// system-default bus sits idle (empty meter) even though Pulse default is correct.
+/// One-shot via engine `Intent::SyncPlayback` (single pactl list). Without this,
+/// `module-stream-restore` leaves Chromium/Brave on Master while the system-default
+/// bus sits idle.
 pub fn enforce_playback_placements(session: &Session) -> Result<u32> {
-    let mut moved = 0u32;
-    let mut assigned_keys: Vec<String> = Vec::new();
-
-    for track in &session.tracks {
-        let sink = track.expected_sink_name();
-        if !sink_exists(&sink) {
-            continue;
-        }
-        for key in &track.assigned_playback {
-            assigned_keys.push(key.clone());
-            match place_app_on_sink(key, &sink) {
-                Ok(n) => moved += n,
-                Err(_) => {}
-            }
-        }
-    }
-
-    let Some(pref) = session.preferred_default_sink.as_deref() else {
-        return Ok(moved);
-    };
-    if pref.is_empty() || !sink_exists(pref) {
-        return Ok(moved);
-    }
-
-    let sinks = list_sinks().unwrap_or_default();
-    let inputs = list_sink_inputs().unwrap_or_default();
-    for si in inputs {
-        if !si.is_user_app() {
-            continue;
-        }
-        // Already claimed by a track assignment — leave it (handled above).
-        if assigned_keys
-            .iter()
-            .any(|k| stream_matches_app_key(&si, k))
+    let msg = crate::audio::engine_handle::sync_playback(session)?;
+    // Parse "playback placed N" when present.
+    if let Some(rest) = msg.split("playback placed ").nth(1) {
+        if let Some(n) = rest
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|s| s.parse().ok())
         {
-            continue;
-        }
-        if si.sink_or_source == pref {
-            continue;
-        }
-        // Resolve current sink name (Pulse may report index or name).
-        let cur_name = if sinks.iter().any(|s| s.name == si.sink_or_source) {
-            si.sink_or_source.clone()
-        } else {
-            si.sink_or_source
-                .parse::<u32>()
-                .ok()
-                .and_then(|idx| sinks.iter().find(|s| s.index == idx).map(|s| s.name.clone()))
-                .unwrap_or_else(|| si.sink_or_source.clone())
-        };
-        let on_buschain = cur_name.starts_with("buschain_") || is_legacy_shadow_sink(&cur_name);
-        // When system default is a BusChain bus, reclaim unassigned user apps from
-        // HW too — otherwise stream-restore leaves Chromium on Scarlett forever.
-        let pref_is_buschain = pref.starts_with("buschain_");
-        if !on_buschain && !(pref_is_buschain && si.is_user_app()) {
-            continue;
-        }
-        if move_sink_input_if_needed(si.index, pref, &si.sink_or_source).unwrap_or(false) {
-            moved += 1;
+            return Ok(n);
         }
     }
-    Ok(moved)
+    Ok(0)
+}
+
+/// Refresh sink-inputs only (merge into existing UI snapshot — never replace sinks/sources).
+pub fn refresh_sink_inputs_only() -> Result<Vec<StreamNode>> {
+    list_sink_inputs()
 }
 
 fn sink_input_matches_assignment(si: &StreamNode, token: &str) -> bool {
@@ -1813,68 +1968,73 @@ pub fn apply_session(
     // burned ~minute before the first ForceRespawn log line appeared.
     crate::audio::engine_handle::sync_desired_from_session(session, &hw_sink);
 
-    // Hotplug/Route: links + Props only — NEVER ForceRespawn (that starved knobs
-    // whenever wet probes flapped). Structural FX = RewireTrackFx / ClockBind.
+    // Hotplug/Route: one-shot Desired capture + egress — NEVER N× per-track
+    // reconcile/ensure_loopback (that was the ~30s Add In lag).
     // ClockBind: ForceRespawn every insert rack so FX/post match the new GraphClock.
-    for id in ids {
-        let result = match kind {
-            ApplyKind::Full => prepare_track_for_arm(session, id).map(|m| (false, m)),
-            ApplyKind::Hotplug => {
-                // Links + Props only — NEVER ForceRespawn (wet flaps stole minutes).
-                let msg = rewire_track_route(session, id, &hw_sink, false)?;
+    match kind {
+        ApplyKind::Hotplug => {
+            for id in &ids {
                 let want_fx = session
                     .tracks
                     .iter()
-                    .find(|t| t.id == id)
+                    .find(|t| t.id == *id)
                     .map(track_has_live_fx)
                     .unwrap_or(false);
                 if want_fx {
-                    let _ = crate::audio::insert_map::push_track_controls(session, id);
+                    let _ = crate::audio::insert_map::push_track_controls(session, *id);
                 }
-                Ok((false, msg))
-            }
-            ApplyKind::ClockBind => {
-                let has_fx = session
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == id)
-                    .map(track_has_live_fx)
-                    .unwrap_or(false);
-                if has_fx {
-                    rewire_track_fx(session, fx, id).map(|m| (true, m))
-                } else {
-                    rewire_track_route(session, id, &hw_sink, false).map(|m| (false, m))
-                }
-            }
-        };
-        match result {
-            Ok((true, m)) => {
-                rebuilt += 1;
-                if m.contains("FX") {
-                    fx_count += 1;
-                }
-            }
-            Ok((false, m)) => {
                 kept += 1;
-                if m.contains("FX") {
-                    fx_count += 1;
+            }
+        }
+        ApplyKind::Full | ApplyKind::ClockBind => {
+            for id in ids {
+                let result = match kind {
+                    ApplyKind::Full => prepare_track_for_arm(session, id).map(|m| (false, m)),
+                    ApplyKind::ClockBind => {
+                        let has_fx = session
+                            .tracks
+                            .iter()
+                            .find(|t| t.id == id)
+                            .map(track_has_live_fx)
+                            .unwrap_or(false);
+                        if has_fx {
+                            rewire_track_fx(session, fx, id).map(|m| (true, m))
+                        } else {
+                            // Egress arm only — capture is one-shot via supervisor.
+                            rewire_track_route(session, id, &hw_sink, false).map(|m| (false, m))
+                        }
+                    }
+                    ApplyKind::Hotplug => unreachable!(),
+                };
+                match result {
+                    Ok((true, m)) => {
+                        rebuilt += 1;
+                        if m.contains("FX") {
+                            fx_count += 1;
+                        }
+                    }
+                    Ok((false, m)) => {
+                        kept += 1;
+                        if m.contains("FX") {
+                            fx_count += 1;
+                        }
+                    }
+                    Err(e) => warnings.push(format!("{e:#}")),
                 }
             }
-            Err(e) => warnings.push(format!("{e:#}")),
         }
     }
 
     // Full Apply: warm-adopt when PW graph already matches session; else sealed arm.
     // force_fx=false → Idempotent (only rebuild tracks that aren't already wet).
     // force_fx=true ForceRespawn'd every rack on UI restart (~10s×N under CLI load).
-    // Hotplug / ClockBind: supervisor repair (ClockBind ForceRespawns FX in the loop above).
+    // Hotplug: one-shot capture + egress (never ArmSession / ForceRespawn).
     let supervisor = match kind {
         ApplyKind::Full => {
             crate::audio::engine_handle::arm_session(session, &hw_sink, false)
         }
         ApplyKind::Hotplug => {
-            // Links / egress only — never full reconcile (that ForceRespawns FX).
-            crate::audio::engine_handle::relink_routes(session, &hw_sink)
+            crate::audio::engine_handle::rewire_session_routes(session, &hw_sink)
         }
         ApplyKind::ClockBind => {
             crate::audio::engine_handle::reconcile(session, &hw_sink)
@@ -1902,9 +2062,23 @@ pub fn apply_session(
     }
 
     if let Some(pref) = session.preferred_default_sink.clone() {
-        match set_default_sink_if_needed(&pref) {
+        let pref_is_buschain =
+            pref.starts_with("buschain_") || is_legacy_shadow_sink(&pref);
+        let master_live = crate::audio::engine_handle::link_is_live(
+            "buschain_master.monitor",
+            &hw_sink,
+        ) || crate::audio::engine_handle::link_is_live(
+            "buschain_post_master.monitor",
+            &hw_sink,
+        );
+        let target = if pref_is_buschain && !master_live {
+            hw_sink.clone()
+        } else {
+            pref
+        };
+        match set_default_sink_if_needed(&target) {
             Ok(true) => {}
-            Ok(false) => warnings.push(format!("preferred default did not stick: {pref}")),
+            Ok(false) => warnings.push(format!("preferred default did not stick: {target}")),
             Err(e) => warnings.push(format!("preferred default: {e:#}")),
         }
     }
@@ -1928,30 +2102,19 @@ pub fn hotplug_track_fx(
     rewire_track_fx(session, fx, track_id)
 }
 
-/// Full-apply prepare: keepalive + input only — no wet probes / arm storms.
+/// Full-apply prepare: keepalive only — capture is owned by ArmSession
+/// `reconcile_bus_inputs` (no imperative ensure_loopback).
 fn prepare_track_for_arm(session: &mut Session, track_id: uuid::Uuid) -> Result<String> {
-    let (is_master, bus, input_source) = {
+    let bus = {
         let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
             return Err(anyhow!("track not found"));
         };
-        let sources = list_sources().unwrap_or_default();
-        (
-            track.kind.is_master(),
-            track.expected_sink_name(),
-            resolve_input_source(track, &sources),
-        )
+        track.expected_sink_name()
     };
     let _ = ensure_bus_keepalive(&bus);
-    if let Some(src) = &input_source {
-        if !is_master {
-            let _ = ensure_loopback(src, &bus, MONITOR_LATENCY_MS);
-        }
-    }
     if let Some(t) = session.tracks.iter_mut().find(|t| t.id == track_id) {
         t.sink_name = Some(bus.clone());
-        if let Some(src) = input_source {
-            t.input_source = Some(src);
-        }
+        t.sync_legacy_input_fields();
     }
     Ok(format!("Prepare {bus}"))
 }
@@ -1968,20 +2131,19 @@ pub fn rewire_track_route(
 ) -> Result<String> {
     session.normalize();
     let _master_name = "buschain_master";
-    let (is_master, bus, inserts, input_source) = {
+    let (is_master, bus, inserts) = {
         let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
             return Err(anyhow!("track not found for route rewire"));
         };
-        let sources = list_sources().unwrap_or_default();
         (
             track.kind.is_master(),
             track.expected_sink_name(),
             live_ladspa_inserts(track),
-            resolve_input_source(track, &sources),
         )
     };
 
-    // Sync DesiredState egress before any arm intent.
+    // Egress arm only — capture is one-shot via `rewire_session_routes` /
+    // `Intent::SyncCapture`. Never per-track reconcile_inputs / ensure_loopback.
     crate::audio::engine_handle::sync_desired_from_session(session, hw_sink);
 
     // Helper alive (canonical or `__stg`) counts as FX present even if post→dest
@@ -2042,22 +2204,13 @@ pub fn rewire_track_route(
         warnings.push(format!("arm dry: {e:#}"));
     }
 
-    if let Some(src) = &input_source {
-        if !is_master {
-            if let Err(e) = ensure_loopback(src, &bus, MONITOR_LATENCY_MS) {
-                warnings.push(format!("input: {e:#}"));
-            }
-        }
-    }
-
     if let Some(t) = session.tracks.iter_mut().find(|t| t.id == track_id) {
         t.sink_name = Some(bus.clone());
-        if let Some(src) = input_source {
-            t.input_source = Some(src);
-        }
+        t.sync_legacy_input_fields();
     }
 
-    apply_track_levels(session)?;
+    // One-bus open only — never session-wide apply_track_levels (N× gate HOL).
+    open_track_audio(session, track_id, &bus)?;
     let mut msg = format!(
         "Route {} · {}",
         bus,
@@ -2195,82 +2348,44 @@ pub fn ensure_live_track(
     }
     let bus = track.expected_sink_name();
     let desc = format!("BusChainControl_{}", track.name.replace(' ', "_"));
-    let master_id = session.master_id();
-    let mut targets = track.output_targets.clone();
 
     ensure_null_sink(&bus, &desc)?;
     let _ = ensure_bus_keepalive(&bus);
-    gate_bus_output(&bus, true);
 
-    // Drop any stale outbound links for this bus, then dry-route to Master.
+    // Drop legacy Pulse loopbacks — egress is native arm via Desired.
     let fx_name = crate::audio::filter_chain::fx_name_for_bus(&bus);
     let _ = unload_loopbacks_for_track_bus(&bus, &fx_name);
 
-    if targets.is_empty() {
-        if let Some(mid) = master_id {
-            targets.push(mid);
-        }
-    }
-    let from = format!("{bus}.monitor");
-    for tid in &targets {
-        if master_id == Some(*tid) {
-            let _ = load_loopback(&from, master_name, BUS_LATENCY_MS);
-        } else if let Some(t) = session.tracks.iter().find(|t| t.id == *tid) {
-            let dest = t.expected_sink_name();
-            if dest != bus && sink_exists(&dest) {
-                let _ = load_loopback(&from, &dest, BUS_LATENCY_MS);
-            }
-        }
+    let hw = resolve_hardware_output(session).unwrap_or_else(|_| master_name.to_string());
+    crate::audio::engine_handle::sync_desired_from_session(session, &hw);
+    // Dry arm (no inserts yet) — Capture must not be the only path that "brings up" a track.
+    if let Err(e) = crate::audio::engine_handle::arm_track_egress(&bus, false) {
+        eprintln!("[buschain] WARN: ensure track arm {bus}: {e:#}");
     }
 
     if let Some(t) = session.tracks.iter_mut().find(|t| t.id == track_id) {
         t.sink_name = Some(bus.clone());
     }
-    std::thread::sleep(std::time::Duration::from_millis(60));
-    apply_track_levels(session)?;
+    // Transition mute/volume for this bus only (never N× session gate).
+    open_track_audio(session, track_id, &bus)?;
     Ok(format!("Ensure track bus live · {bus}"))
 }
 
 /// After a track is removed from the session: gate + tear its leftover PW nodes only.
 pub fn prune_removed_track(
-    session: &Session,
+    session: &mut Session,
     fx: &mut crate::audio::filter_chain::FilterChainRuntime,
     removed_bus: &str,
 ) -> Result<String> {
-    gate_bus_output(removed_bus, true);
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    let fx_name = crate::audio::filter_chain::fx_name_for_bus(removed_bus);
-    crate::audio::filter_chain::stop_slots_for_bus(fx, removed_bus);
-    let _ = unload_loopbacks_for_track_bus(removed_bus, &fx_name);
-    unload_mids_for_bus(removed_bus);
-    unload_post_sink_for_bus(removed_bus);
-    // Drop system virtual input (remap-source + feed) before the track bus.
-    crate::audio::engine_handle::with_engine(|eng| {
-        let _ = eng.apply(buschain_engine::Intent::TeardownVirtualInput {
-            bus: buschain_engine::NodeName::new(removed_bus),
-        });
-    });
-    // Move any stragglers off the doomed bus before unload.
-    let fallback = session
-        .preferred_default_sink
-        .clone()
-        .filter(|s| sink_exists(s))
-        .or_else(|| {
-            if sink_exists("buschain_master") {
-                Some("buschain_master".into())
-            } else {
-                None
-            }
-        });
-    if let (Some(dest), Ok(inputs)) = (fallback, list_sink_inputs()) {
-        for si in inputs {
-            if si.sink_or_source == removed_bus {
-                let _ = move_sink_input_if_needed(si.index, &dest, &si.sink_or_source);
-            }
-        }
+    // Desired without the removed track — idle reconcile must not re-arm it.
+    if let Ok(hw) = resolve_hardware_output(session) {
+        crate::audio::engine_handle::sync_desired_from_session(session, &hw);
     }
-    let _ = unload_named_null_sink(removed_bus);
+    teardown_track_bus(removed_bus, session, fx);
+    crate::audio::engine_handle::with_engine(|eng| {
+        let _ = eng.prune_orphan_track_buses_now();
+    });
     prune_orphan_buschain_track_sinks(session, fx);
-    apply_track_levels(session)?;
+    // Silence-first prune already gated the removed bus — no session-wide re-gate.
     Ok(format!("Removed bus {removed_bus}"))
 }
