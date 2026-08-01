@@ -4,85 +4,27 @@
   <img src="docs/assets/hero.jpg" alt="BusChain Control — mixer, insert FX, and spectrum view" width="960" />
 </p>
 
-**Tray-resident PipeWire system mixer for Linux.** Route desktop apps onto tracks, stack insert FX (builtins + LADSPA / LV2 / CLAP / VST3), drive Master HW from your bar, and save named sessions — without a separate audio daemon.
+BusChain Control is a **PipeWire system mixer** for Linux. It aims for **DAW-grade control of the desktop audio graph** — tracks, insert FX, app routing, and sessions — without treating system sound as a second-class panel.
 
-Close the window to **hide to tray**. Quit from the tray (or Settings) to tear the graph down and restore desktop audio.
+Route apps onto buses, stack builtins and LADSPA / LV2 / CLAP / VST3, expose virtual system I/O, drive Master HW from your bar, and save named layouts. Closing the window minimizes to the tray; right-click the icon → **Open BusChain Control** for the full mixer. Quit from the tray (or Settings) tears the graph down and restores hardware audio.
 
----
-
-## Project state
-
-BusChain Control is a **working daily driver** on PipeWire (Hyprland / Wayland primary). The graph is owned **in-process** by the tray app: dual-lane control plane (interactive / supervisor / observer), sealed wet FX path, sticky virtual system defaults with reclaim on reopen, and IPC for `ctl` / Waybar / Quickshell / GTK.
-
-| Area | Status |
-|------|--------|
-| Mixer tracks, gain / mute / solo / listen | Stable |
-| App → track routing + playback reclaim | Stable |
-| Virtual system output / input sinks | Stable |
-| Built-in DSP + LADSPA / LV2 / CLAP / VST3 inserts | Usable daily; host APIs still deepening |
-| Native VST3 floating editors (surface helper) | Working (XWayland float on Hyprland) |
-| Sessions + soft HW rebind | Stable |
-| Tray + QS / GTK / egui popup stack | Stable |
-| MIDI learn → insert params | Working |
-| Distro packages (Arch/Debian repos) | Not yet — Nix flake or build from source |
-| Crash / `kill -9` audio restore | Still open (Quit path is solid) |
-
-Deep reference: [`docs/TECHNICAL.md`](docs/TECHNICAL.md) · architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · roadmap: [`docs/ROADMAP.md`](docs/ROADMAP.md)
+**TLDR:** mixer tracks · playback / capture racks · sealed wet FX · sticky virtual defaults · MIDI learn · Waybar / Quickshell / GTK shell hooks. Working daily driver on PipeWire (Hyprland primary); host APIs and crash-restore still deepening. Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
 
 ---
 
-## Features
+## Who it’s for
 
-### Mixer & graph
+- Linux users on **PipeWire** who want a real mixer for the desktop, not just a volume slider
+- Hyprland / Wayland rices (Quickshell, Waybar) and general desktops via GTK / egui popup
+- Anyone routing browsers, games, Discord, mics, and hardware through per-app buses with FX
 
-- Dynamic **tracks / buses** with mute, solo, listen, and gain
-- **Playback** rack — pin apps onto tracks; reclaim onto sticky preferred default after restart
-- **Input** rack — multi HW capture, shared with the desktop / other tracks
-- **Virtual system output** — expose a track as a PipeWire sink other apps can target
-- **Virtual system input** — post-FX track as a capture source (`buschain_vin_*`)
-- Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → hardware / Master`
-- Live hotplug: fader / Props without tearing the graph; structural FX rewire when needed
-- Warm adopt on restart when the live graph already matches the session
-
-### Insert FX
-
-- **BusChain builtins** — EQ, Theatre Drive, Room, Soft Clipper, limiter, denoiser, pitch, and more
-- **Hosted formats** — LADSPA, LV2, CLAP, VST3 (discovery + in-process DSP; optional SHM sandbox)
-- Per-insert power, wet Mix, reorder; egui param UIs and opt-in converted VST3 knobs
-- **Native VST3 editors** via `buschain-plugin-surface` (same-instance meters)
-- 3D / phosphor transfer views for dynamics (Soft Clipper, Limiter)
-
-### Sessions & MIDI
-
-- Named sessions under `~/.config/buschain-control/`
-- Soft-bind on load: missing HW rebound by description; mix + FX kept
-- Sticky `preferred_default_sink` across Quit (live default restored to HW; reopen reasserts BusChain)
-- MIDI devices, routes, and CC learn → insert parameters (session-persisted)
-
-### Desktop shell
-
-- StatusNotifier tray — left-click compact mixer; right-click Open / Hide / Quit
-- Popup order: **Quickshell → GTK layer-shell → egui `--popup`**
-- Optional Waybar volume pill + Master HW scroll strip (Quickshell or opt-in GTK)
-- CLI: `buschain-ctl` · helper: `buschain-waybar`
-
-### App tabs
-
-Mixer · Playback · Recording · Output · Input · MIDI · Sessions · Settings
-
----
-
-## Requirements
-
-- Linux with **PipeWire** (`pactl` / Pulse compatibility available)
-- Wayland session for the tray UI (Hyprland is the primary target)
-- Optional GTK mixer / scroll strip: GTK 3 + gtk-layer-shell + PyGObject (via Nix package / `nix develop`)
+**Needs:** PipeWire (+ `pactl`), Wayland session. Optional GTK mixer strip via Nix / package deps.
 
 ---
 
 ## Install
 
-No official Arch/Debian package yet. Use Nix or build from source.
+No official Arch/Debian package yet — use Nix or build from source.
 
 | Distro | Recommended |
 |--------|-------------|
@@ -190,8 +132,9 @@ cargo run -- --hidden    # tray + graph + IPC
 buschain-control --hidden
 ```
 
-- Tray icon appears — **Show** / right-click opens the full mixer.
-- Closing the window **hides**; tray → **Quit** stops audio ownership and restores HW default.
+- Closing the window minimizes to the tray.
+- Full mixer: right-click tray → **Open BusChain Control**. Left-click opens the compact popup.
+- Quit from the tray (or Settings) stops audio ownership and restores HW default.
 - CLI: `buschain-ctl status`
 
 Disable any old user systemd unit if you used one before:
@@ -202,15 +145,16 @@ systemctl --user disable --now buschain-control 2>/dev/null || true
 
 ---
 
-## Usage — tray first
+## Usage
 
-Recommend `buschain-control --hidden` everywhere: left-click the tray for the compact mixer; right-click → **Open BusChain Control** for the full window.
+Start with `buschain-control --hidden` for autostart, or open normally and close to tray.
 
 | Action | Behavior |
 |--------|----------|
-| Tray left-click | Toggle mixer popup (**QS → GTK → egui**) |
-| Tray right-click | Open full app · Hide · Quit |
-| `buschain-ctl popup` / Waybar click | Same router |
+| Left-click tray | Compact mixer popup (**QS → GTK → egui**) |
+| Right-click → **Open BusChain Control** | Full mixer window |
+| Tray → Quit | Tear down graph + restore HW audio |
+| `buschain-ctl popup` / Waybar click | Same compact popup router |
 
 ### Hyprland + Quickshell
 
@@ -227,7 +171,7 @@ Quickshell contract: [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md
 
 ### General desktop (no Quickshell)
 
-Tray + **GTK layer-shell** mixer when packaged; egui `--popup` as fallback.
+**GTK layer-shell** compact mixer when packaged; egui `--popup` as fallback.
 
 ```bash
 export BUSCHAIN_CONTROL_USE_GTK_MIXER=0   # force egui popup
@@ -238,23 +182,55 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 
 | Action | How |
 |--------|-----|
-| Compact mixer | Tray left-click or Waybar pill |
-| Full mixer | Tray → Open BusChain Control |
+| Compact mixer | Left-click tray or Waybar pill |
+| Full mixer | Right-click → Open BusChain Control |
 | Assign app → track | Playback tab or drag onto channel rack |
 | Virtual system out | Track → Create system virtual output |
 | Add FX | Channel rack → Add plugin |
 | Save layout | Sessions → Save / Save as… |
-| Quit | Tray → Quit |
+| Quit | Tray menu or Settings |
+
+### Tips
+
+- **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart the app after installing new plugins.
+- **Sticky default:** set **System default** on a virtual track once — after Quit/reopen, BusChain reasserts that sink and reclaims playback apps.
+- **Hollow desktop audio:** `buschain-ctl recover-audio`, or `systemctl --user restart wireplumber` as a blunt recovery.
 
 ---
 
-## Everyday tips
+## Features
 
-- **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart the tray after installing new plugins.
-- **VST3 editors:** open from insert chrome; on Hyprland they float automatically when possible.
-- **Sticky default:** set **System default** on a virtual track once — after Quit/reopen, BusChain reasserts that sink and reclaims playback apps (no need to click again).
-- **Offline Waybar pill:** start `buschain-control --hidden` and restart Waybar if needed.
-- **Hollow desktop audio:** `buschain-ctl recover-audio`, or `systemctl --user restart wireplumber` as a blunt recovery.
+### Mixer & graph
+
+- Dynamic **tracks / buses** with mute, solo, listen, and gain
+- **Playback** rack — pin apps onto tracks; reclaim onto sticky preferred default after restart
+- **Input** rack — multi HW capture, shared with the desktop / other tracks
+- **Virtual system output / input** — expose tracks as sinks or post-FX capture sources
+- Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → hardware / Master`
+- Live hotplug and warm adopt when the graph already matches the session
+
+### Insert FX
+
+- **BusChain builtins** — EQ, Theatre Drive, Room, Soft Clipper, limiter, denoiser, pitch, and more
+- **Hosted formats** — LADSPA, LV2, CLAP, VST3 (in-process DSP; optional SHM sandbox)
+- Per-insert power, wet Mix, reorder; egui param UIs; native VST3 editors via `buschain-plugin-surface`
+
+### Sessions, MIDI & shell
+
+- Named sessions under `~/.config/buschain-control/` with soft HW rebind
+- MIDI devices, routes, and CC learn → insert parameters
+- Waybar pill; compact popup order Quickshell → GTK → egui
+- Tabs: Mixer · Playback · Recording · Output · Input · MIDI · Sessions · Settings
+
+### Project state
+
+| Area | Status |
+|------|--------|
+| Mixer, routing, virtual I/O, sessions | Stable |
+| Built-in + hosted inserts / VST3 editors | Usable daily; host APIs still deepening |
+| Compact popup (QS / GTK / egui) | Stable |
+| Distro packages (Arch/Debian repos) | Not yet — Nix or source |
+| Crash / `kill -9` audio restore | Still open (Quit path is solid) |
 
 ---
 
@@ -262,7 +238,7 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 
 | Doc | Audience |
 |-----|----------|
-| [`docs/TECHNICAL.md`](docs/TECHNICAL.md) | Features detail, binaries, Waybar, env reference, architecture notes |
+| [`docs/TECHNICAL.md`](docs/TECHNICAL.md) | Features detail, binaries, Waybar, env reference |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Live graph / engine contract |
 | [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md) | Quickshell rice contract |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Done / planned work |
