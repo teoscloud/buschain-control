@@ -1,6 +1,6 @@
 //! Background PipeWire worker — never block the UI thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -550,23 +550,64 @@ fn control_plane_router(
 
 fn observer_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     // Topology observation only — never mutates the graph / ENGINE mute path.
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Command::Shutdown => break,
-            Command::Refresh => {
+    //
+    // Sink-input refresh is event-driven off the native registry generation
+    // (streams appear/move → generation bumps → refresh within one tick).
+    // Pulse-only fallback keeps a ~1.5s cadence; a slow max interval catches
+    // volume-only drift the generation counter does not see.
+    const TICK: Duration = Duration::from_millis(300);
+    const PULSE_CADENCE: Duration = Duration::from_millis(1500);
+    const MAX_INTERVAL: Duration = Duration::from_secs(5);
+    let lat_trace = matches!(
+        std::env::var("BUSCHAIN_CONTROL_LAT_TRACE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    );
+    let mut last_gen: Option<u64> = None;
+    let mut last_refresh = Instant::now();
+    loop {
+        match rx.recv_timeout(TICK) {
+            Ok(Command::Shutdown) => break,
+            Ok(Command::Refresh) => {
                 let t0 = Instant::now();
                 let snap = graph::refresh_snapshot();
                 graph::publish_observer_snapshot(snap.clone());
                 let ms = t0.elapsed().as_millis();
-                if matches!(
-                    std::env::var("BUSCHAIN_CONTROL_LAT_TRACE").as_deref(),
-                    Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-                ) {
+                if lat_trace {
                     eprintln!("[lat] C observer_snapshot {ms}ms");
                 }
                 let _ = tx.send(Event::Snapshot(snap));
+                last_gen = buschain_engine::backend::native_graph_generation();
+                last_refresh = Instant::now();
             }
-            _ => {}
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let gen = buschain_engine::backend::native_graph_generation();
+                let due = match gen {
+                    Some(g) => last_gen != Some(g) || last_refresh.elapsed() >= MAX_INTERVAL,
+                    None => last_refresh.elapsed() >= PULSE_CADENCE,
+                };
+                if !due {
+                    continue;
+                }
+                let t0 = Instant::now();
+                match graph::refresh_sink_inputs_only() {
+                    Ok(inputs) => {
+                        if lat_trace {
+                            let ms = t0.elapsed().as_millis();
+                            eprintln!("[lat] C observer_sink_inputs {ms}ms");
+                        }
+                        let _ = tx.send(Event::SinkInputs(inputs));
+                    }
+                    Err(e) => {
+                        if lat_trace {
+                            eprintln!("[lat] C observer_sink_inputs FAIL {e:#}");
+                        }
+                    }
+                }
+                last_gen = gen;
+                last_refresh = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -784,6 +825,7 @@ struct PlaceRetry {
     after: Instant,
     attempts: u8,
     last_err: String,
+    want_wet: bool,
 }
 
 fn flush_place_retries(
@@ -806,6 +848,9 @@ fn flush_place_retries(
                     retry.sink
                 )));
                 if n > 0 {
+                    if retry.want_wet {
+                        let _ = crate::audio::engine_handle::arm_track_egress(&retry.sink, true);
+                    }
                     if let Ok(inputs) = graph::refresh_sink_inputs_only() {
                         let _ = tx.send(Event::SinkInputs(inputs));
                     }
@@ -820,6 +865,7 @@ fn flush_place_retries(
                             + Duration::from_millis(80 + u64::from(retry.attempts) * 40),
                         attempts: retry.attempts + 1,
                         last_err: format!("{e:#}"),
+                        want_wet: retry.want_wet,
                     },
                 );
             }
@@ -942,8 +988,12 @@ fn interactive_loop(
     // Interactive never ForceRespawns — blackhole FX job channel.
     let (fx_job_tx, fx_job_rx) = mpsc::channel::<FxEnsureJob>();
     drop(fx_job_rx);
-    // Do not tear down BusChain on launch — leave buses / FX running across UI restart.
-    // Always sweep pre-rebrand Shadow Audio leftovers (wrong media.name escaped teardown).
+    // Clear hollow linger leftovers from older OBJECT_LINGER builds, then legacy shadow.
+    // New nodes are non-linger — process exit drops the graph; cold Apply recreates.
+    let sweep = graph::sweep_orphan_buschain_at_startup();
+    if !sweep.is_empty() {
+        let _ = tx.send(Event::Status(sweep));
+    }
     match graph::teardown_legacy_shadow_graph() {
         Ok(msg) if !msg.is_empty() => {
             let _ = tx.send(Event::Status(msg));
@@ -1801,16 +1851,45 @@ fn process_command_batch(
                     app_key,
                     sink,
                 } => {
-                    // Patch bus_playback only — never full Desired rebuild.
-                    *last_session = Some(session.clone());
-                    if let Some(tid) = session
+                    // Chromium/Electron freeze on Audio/Sink/Internal — promote to VO
+                    // (Pulse-visible Audio/Sink) before any retarget/pactl move.
+                    let mut session = session;
+                    let place_track_id = session
                         .tracks
                         .iter()
-                        .find(|t| t.expected_sink_name() == sink)
-                        .map(|t| t.id)
-                    {
-                        crate::audio::engine_handle::patch_bus_playback(&session, tid);
+                        .find(|t| {
+                            t.expected_sink_name() == sink
+                                || t.sink_name.as_deref() == Some(sink.as_str())
+                        })
+                        .map(|t| t.id);
+                    if let Some(tid) = place_track_id {
+                        let need_vo = session
+                            .tracks
+                            .iter()
+                            .find(|t| t.id == tid)
+                            .is_some_and(|t| !t.kind.is_master() && !t.virtual_output);
+                        if need_vo {
+                            if let Some(t) = session.tracks.iter_mut().find(|t| t.id == tid) {
+                                t.virtual_output = true;
+                            }
+                            let _ = session.save();
+                            if let Err(e) = graph::ensure_live_track(&mut session, tid) {
+                                let _ = tx.send(Event::Error(format!(
+                                    "expose track for apps: {e:#}"
+                                )));
+                            }
+                        }
                     }
+                    // Patch bus_playback only — never full Desired rebuild.
+                    *last_session = Some(session.clone());
+                    let place_track = session
+                        .tracks
+                        .iter()
+                        .find(|t| t.expected_sink_name() == sink || t.sink_name.as_deref() == Some(sink.as_str()));
+                    if let Some(t) = place_track {
+                        crate::audio::engine_handle::patch_bus_playback(&session, t.id);
+                    }
+                    let want_wet = place_track.is_some_and(|t| !t.inserts.is_empty());
                     match graph::place_app_on_sink(&app_key, &sink) {
                         Ok(0) => {
                             let _ = tx.send(Event::Status(format!(
@@ -1822,6 +1901,10 @@ fn process_command_batch(
                             let _ = tx.send(Event::Status(format!(
                                 "Placed {n} stream(s) → {sink}"
                             )));
+                            // Sealed chain: drop dry parallel when the track has FX.
+                            if want_wet {
+                                let _ = crate::audio::engine_handle::arm_track_egress(&sink, true);
+                            }
                             if let Ok(inputs) = graph::refresh_sink_inputs_only() {
                                 let _ = tx.send(Event::SinkInputs(inputs));
                             }
@@ -1835,6 +1918,7 @@ fn process_command_batch(
                                     after: Instant::now() + Duration::from_millis(80),
                                     attempts: 1,
                                     last_err: format!("{e:#}"),
+                                    want_wet,
                                 },
                             );
                         }

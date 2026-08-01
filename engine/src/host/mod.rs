@@ -17,6 +17,7 @@ mod surface;
 mod ui_bridge;
 mod vst3;
 
+pub mod dry_meter;
 pub mod node;
 pub mod node_latency;
 pub mod orphan;

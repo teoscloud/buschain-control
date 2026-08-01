@@ -43,20 +43,30 @@ fn ensure_post_bus(backend: &mut dyn AudioBackend, clock: &GraphClock, plan: &Wi
             description: format!("BusChainControl_Post_{suffix}"),
             role: NodeRole::PostBus,
             start_muted: false,
+            pulse_export: false,
         },
         clock,
     )?;
     if !already {
-        let _ = std::process::Command::new("pactl")
-            .args(["set-sink-mute", post, "0"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = std::process::Command::new("pactl")
-            .args(["set-sink-volume", post, "100%"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Open the fresh post at unity, unmuted — native SPA Props first;
+        // pactl only when the registry is down (cold create is off the RT path,
+        // but two extra forks per bus still hurt ArmSession bring-up).
+        if crate::backend::native_ready()
+            && crate::backend::native_set_levels(post, 0.0, false).is_ok()
+        {
+            // done natively
+        } else {
+            let _ = std::process::Command::new("pactl")
+                .args(["set-sink-mute", post, "0"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::process::Command::new("pactl")
+                .args(["set-sink-volume", post, "100%"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
     Ok(())
 }

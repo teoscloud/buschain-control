@@ -158,6 +158,11 @@ pub fn post_name_for_bus(bus: &str) -> String {
     format!("buschain_post_{}", bus_suffix(bus))
 }
 
+/// In-process dry-bus peak tap (`{bus}.monitor` → meter → hold).
+pub fn mtr_name_for_bus(bus: &str) -> String {
+    format!("buschain_mtr_{}", bus_suffix(bus))
+}
+
 /// Normalize LADSPA labels the same way the app catalog does.
 /// Rewrites pre-rebrand `shadow_*` labels to `buschain_*`.
 pub fn normalize_ladspa_label(id: &str) -> String {

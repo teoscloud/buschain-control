@@ -7,10 +7,19 @@ use anyhow::{anyhow, Result};
 use crate::plan::DesiredState;
 
 /// Move pinned apps onto their buses; reclaim unassigned user apps to preferred default.
-/// Single `pactl list sink-inputs` pass — never N× per-key list storms.
+/// Native registry pass when up (sees Internal-hosted streams); single pactl pass otherwise.
 pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
     let sinks = list_short_sinks();
-    let inputs = list_sink_inputs(&sinks)?;
+    let inputs = if super::native::native_ready() {
+        let native = list_sink_inputs_native();
+        if native.is_empty() {
+            list_sink_inputs(&sinks)?
+        } else {
+            native
+        }
+    } else {
+        list_sink_inputs(&sinks)?
+    };
     let mut moved = 0u32;
 
     let mut key_to_bus: HashMap<String, String> = HashMap::new();
@@ -24,6 +33,9 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
     }
 
     for si in &inputs {
+        if is_desktop_event_stream(&si.application, si.media_role.as_deref()) {
+            continue;
+        }
         for (key, bus) in &key_to_bus {
             if !matches_key(si, key) {
                 continue;
@@ -54,6 +66,9 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
         if si.internal && !on_hold {
             continue;
         }
+        if is_desktop_event_stream(&si.application, si.media_role.as_deref()) {
+            continue;
+        }
         if key_to_bus.keys().any(|k| matches_key(si, k)) {
             continue;
         }
@@ -79,24 +94,85 @@ struct Si {
     binary: Option<String>,
     app_id: Option<String>,
     node_name: Option<String>,
+    media_role: Option<String>,
     internal: bool,
+}
+
+/// Desktop event / notify streams — pavucontrol "System Sounds" + friends.
+/// Must not be reclaimed onto BusChain preferred sinks (strands corked copies).
+fn is_desktop_event_stream(application: &str, media_role: Option<&str>) -> bool {
+    if application.eq_ignore_ascii_case("System Sounds") {
+        return true;
+    }
+    matches!(
+        media_role.map(|r| r.to_ascii_lowercase()).as_deref(),
+        Some("event" | "notify" | "notification" | "alert")
+    )
+}
+
+/// Generic runtimes whose binary is useless as an app identity.
+/// Must match the app-side `binary_is_generic` (graph.rs) so pins stored by
+/// the UI resolve to the same key here.
+fn binary_is_generic(b: &str) -> bool {
+    matches!(
+        b.to_ascii_lowercase().as_str(),
+        "electron"
+            | "chrome"
+            | "chromium"
+            | "chrome-sandbox"
+            | "java"
+            | "python"
+            | "python3"
+            | "python3.10"
+            | "python3.11"
+            | "python3.12"
+            | "python3.13"
+            | "node"
+            | "nodejs"
+            | "wine"
+            | "wine64"
+            | "mono"
+            | "dotnet"
+            | "perl"
+            | "ruby"
+    )
+}
+
+fn name_is_generic(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "chromium" | "chrome" | "electron" | "playback"
+    )
+}
+
+/// Same key cascade as app-side `StreamNode::app_key`:
+/// non-generic binary → id → non-generic name → generic binary → node → stream.
+fn si_app_key(si: &Si) -> String {
+    if let Some(b) = si.binary.as_deref().filter(|s| !s.is_empty()) {
+        if !binary_is_generic(b) {
+            return format!("bin:{b}");
+        }
+    }
+    if let Some(id) = si.app_id.as_deref().filter(|s| !s.is_empty()) {
+        return format!("id:{id}");
+    }
+    if !si.application.is_empty() && !name_is_generic(&si.application) {
+        return format!("name:{}", si.application);
+    }
+    if let Some(b) = si.binary.as_deref().filter(|s| !s.is_empty()) {
+        return format!("bin:{b}");
+    }
+    if let Some(n) = si.node_name.as_deref().filter(|s| !s.is_empty()) {
+        return format!("node:{n}");
+    }
+    format!("stream:{}", si.index)
 }
 
 fn matches_key(si: &Si, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let app_key = if let Some(b) = si.binary.as_deref().filter(|s| !s.is_empty()) {
-        format!("bin:{b}")
-    } else if let Some(id) = si.app_id.as_deref().filter(|s| !s.is_empty()) {
-        format!("id:{id}")
-    } else if !si.application.is_empty() {
-        format!("name:{}", si.application)
-    } else if let Some(n) = si.node_name.as_deref().filter(|s| !s.is_empty()) {
-        format!("node:{n}")
-    } else {
-        format!("stream:{}", si.index)
-    };
+    let app_key = si_app_key(si);
     if token == app_key {
         return true;
     }
@@ -125,19 +201,72 @@ fn matches_key(si: &Si, token: &str) -> bool {
 }
 
 fn list_short_sinks() -> Vec<(u32, String)> {
-    let Ok(out) = std::process::Command::new("pactl")
+    let mut v = Vec::new();
+    if let Ok(out) = std::process::Command::new("pactl")
         .args(["list", "short", "sinks"])
         .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
             let mut p = line.split('\t');
-            let idx = p.next()?.parse().ok()?;
-            let name = p.next()?.to_string();
-            Some((idx, name))
+            let Some(idx) = p.next().and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            let Some(name) = p.next().map(|s| s.to_string()) else {
+                continue;
+            };
+            v.push((idx, name));
+        }
+    }
+    // Non-exported / helper buses may be absent from pactl — merge registry names
+    // so PlaceApp/reclaim can still target non-VO tracks.
+    if super::native::native_ready() {
+        for name in super::native::list_sink_names() {
+            if name.starts_with("buschain_") && !v.iter().any(|(_, n)| n == &name) {
+                v.push((0, name));
+            }
+        }
+    }
+    v
+}
+
+/// Streams from the native registry — sees Internal-hosted streams pactl hides.
+fn list_sink_inputs_native() -> Vec<Si> {
+    super::native::list_playback_streams()
+        .into_iter()
+        .map(|s| {
+            let application = s
+                .app_name
+                .clone()
+                .or_else(|| {
+                    s.media_name.clone().filter(|m| {
+                        let ml = m.to_lowercase();
+                        ml != "playback" && ml != "buschain-control"
+                    })
+                })
+                .unwrap_or_else(|| format!("Stream {}", s.serial));
+            let media_role = s.media_role.clone();
+            let internal = s.node_virtual
+                || s.sink.starts_with("buschain_fx_")
+                || s.sink.starts_with("buschain_post_")
+                || s.sink.starts_with("buschain_rs_")
+                || s.sink.starts_with("buschain_mtr_")
+                || s.node_name.starts_with("buschain_")
+                || s.node_name.contains("filter-chain")
+                || s.media_name
+                    .as_deref()
+                    .is_some_and(|m| m.eq_ignore_ascii_case("buschain-control"))
+                || application.to_lowercase().contains("buschain")
+                || is_desktop_event_stream(&application, media_role.as_deref());
+            Si {
+                index: s.serial,
+                sink: s.sink,
+                application,
+                binary: s.binary,
+                app_id: s.app_id,
+                node_name: Some(s.node_name).filter(|n| !n.is_empty()),
+                media_role,
+                internal,
+            }
         })
         .collect()
 }
@@ -175,8 +304,10 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
         let app_id = g("application.id").filter(|s| !s.is_empty());
         let node_name = g("node.name").filter(|s| !s.is_empty());
         let media = g("media.name").unwrap_or_default();
+        let media_role = g("media.role").filter(|s| !s.is_empty());
         // Hold is parking/keepalive — user streams there must be reclaimable.
         // FX/post/rs + BusChain-owned media stay internal.
+        // Event/notify roles are desktop "System Sounds" — never PlaceApp/reclaim.
         let internal = sink.starts_with("buschain_fx_")
             || sink.starts_with("buschain_post_")
             || sink.starts_with("buschain_rs_")
@@ -184,7 +315,8 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
                 n.starts_with("buschain_") || n.contains("filter-chain")
             })
             || media.eq_ignore_ascii_case("buschain-control")
-            || application.to_lowercase().contains("buschain");
+            || application.to_lowercase().contains("buschain")
+            || is_desktop_event_stream(&application, media_role.as_deref());
         items.push(Si {
             index,
             sink,
@@ -192,6 +324,7 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
             binary,
             app_id,
             node_name,
+            media_role,
             internal,
         });
     };
@@ -220,9 +353,11 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
 }
 
 fn move_si(index: u32, sink: &str) -> bool {
-    std::process::Command::new("pactl")
-        .args(["move-sink-input", &index.to_string(), sink])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // Chromium/Electron pause on every retarget — never rewrite when already on sink.
+    if super::native::native_ready() {
+        if let Ok(true) = super::native::stream_targets_sink(index, sink) {
+            return false;
+        }
+    }
+    super::pulse_compat::move_sink_input(index, sink).unwrap_or(false)
 }

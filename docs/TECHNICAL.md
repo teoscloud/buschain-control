@@ -399,11 +399,46 @@ command -v buschain-plugin-surface
 - Desired `buschain_rs_*` kept during capture purge; sink-side dual-path prune when bridging
 - `relink_routes` never ArmSession / ForceRespawn (soft-arm latch only)
 - **Mic Pulse flap sealed:** `link_is_live` / `ensure_link` treat live `module-loopback` as already-ok (no unload→reload silence); wait for `buschain_rs_*` ports after create
-- **Apps rack:** PlaceApp / `Intent::SyncPlayback` only (no ApplyLevels HOL); one-shot placement list; light `SinkInputs` UI refresh
+- **Apps rack:** PlaceApp / `Intent::SyncPlayback` only (no ApplyLevels HOL); **move/retarget** onto the track bus (never clone/loopback). **Discovery is native-first**: `list_sink_inputs` reads `Stream/Output/Audio` nodes + app props from the native registry (`list_playback_streams`) so streams on `Audio/Sink/Internal` buses stay visible even when pipewire-pulse hides them; pactl only enriches volume/mute. Observer Class C is generation-driven (registry bump → refresh within ~300ms; 5s max interval; 1.5s cadence only in Pulse-fallback mode). Engine reclaim (`enforce_desired_playback`) uses the same native list and the same `app_key` cascade (`binary_is_generic` shared semantics). Streams parked on Hold stay user-visible for reclaim. PlaceApp goes through `pulse_compat::move_sink_input` (native `target.object` retarget first — required for `Audio/Sink/Internal` non-VO tracks); after a successful place on an FX track, one-shot wet `arm_track_egress`.
+- **Null-sink exposure:** Master / VO use `media.class = Audio/Sink` (Pulse-visible). Helpers (Hold, Post, rate-bridge, vin feed, non-VO tracks) use standard **`Audio/Sink/Internal`** — ports work (unlike custom `BusChain/Internal`, which is forbidden) and stay out of pavucontrol. Also stamp `buschain.pulse.export` + optional WirePlumber rules (`pipewire/wireplumber/…` / `scripts/install-wireplumber-rules.sh`). PlaceApp/reclaim prefer native `target.node` retarget. Pulse `module-loopback` onto Hold/helpers is forbidden; Apply sweeps leftover BusChain loopbacks.
+- **Meters:** wet strips use in-process FX host peaks; dry strips use a native `{bus}.monitor → buschain_mtr_*` peak tap. Pulse `meter-*` streams stay opt-in only (`BUSCHAIN_PULSE_METERS=1`).
+- **VO toggle** flips `pulse_export` → recreate null-sink as `Audio/Sink` ↔ `Audio/Sink/Internal` (stream remount) without ArmSession / ForceRespawn. RT path hop count unchanged.
+- **Non-linger graph:** native null sinks + links set `object.linger = false` so process exit/crash drops BusChain nodes. Create proxies are **retained for the process lifetime** (dropping them with linger=false removed VO/Master from the graph). Quit still restores HW + module unload + `pw-cli` destroy; `recover-audio` destroys Pulse-invisible helpers; startup only sweeps broken `BusChain/*` leftovers (never a full wipe — that raced Apply).
+- **Wet egress heal:** never prune `post.monitor→dest` while an FX host/gen is live; idle/prune re-arms missing post→Master/HW (half-up wet left meters alive and speakers silent).
+- **Sealed track chain:** when FX is Desired/host-up, `arm_track_egress` must soft-cutover (keep `bus→fx`) — never fall through to dry unlink that strips the FX feed (that sent apps/mics dry into Master and left track inserts silent).
+
+- **Apps require a Pulse-visible track (`virtual_output` / `Audio/Sink`).** Chromium and Electron (Equibop, Vesktop, Cider, …) talk through `pipewire-pulse` and **hang forever** when retargeted onto `Audio/Sink/Internal` — the client never finishes the move and cannot switch devices until the pin is removed. Assigning an app auto-enables System virtual output and recreates the bus as `Audio/Sink` before place. Native-only clients (e.g. Brave) can survive Internal, which is why some apps "worked" and others froze.
+- **Electron identity:** `application.name = "Chromium"` is treated as generic; keys prefer real `application.process.binary` / `application.id` so Equibop ≠ Brave. Retarget is a no-op when the stream is already linked (Chromium pauses on every rewrite).
+- **`target.object` must be the node NAME (or `object.serial`), never the node id.** WirePlumber resolves `target.object` by matching `node.name`/`object.serial` and it takes precedence over the legacy `target.node` (which *is* the node id). Writing the node id into `target.object` made every target unresolvable, so WirePlumber silently fell back to the default sink — apps appeared to ignore their track assignment and stayed on the system default. `set_stream_target_node` now writes `target.object` = name (`Spa:String`) plus `target.node` = id (`Spa:Id`).
+- **Filter nodes must not declare a `media.class`.** `PwFxNode` (FX hosts and `buschain_mtr_*` taps) sets only `media.type/category/role` + `node.virtual`. Stamping `media.class = Audio/Duplex` made pipewire-pulse register every filter as a device that never reports sample/map/volume, logging `sink not ready` in a hot loop (700k+ lines/day) and wedging the whole Pulse layer: `pactl list sink-inputs` returned empty, `parec` produced zero bytes, and new Pulse clients were never routed. That single property was the real cause of "no apps show" / "apps not placed on tracks".
+- **Non-finite guard:** the FX host scrubs NaN/Inf on both sides of the rack. Non-finite state in an IIR/delay never decays, so one bad block would silence a bus permanently.
+
+- **Output to… may omit Master.** Empty destinations mean hold-only (intermediate bus / track→track without a master send). New tracks still default to Master; Listen (AFL) still forces Master. Desired `bus_egress` empty is authoritative — it must not fall through to a Master default.
+- **System virtual input does not imply Master.** The vin-feed sink (`buschain_vinf_*`) is a remap-source only — its monitor must stay hold-only (plus Pulse `input.buschain_vin_*` capture). Idle heal used to default helper buses to Master (`vinf.monitor → buschain_master`), so toggling virtual input re-audibled DualMic on Master even with Output empty. Helpers never get a Master egress default; reconcile surgically unlinks feed→Master/track leaks only (never wipe-all — that stripped remap capture and silenced `buschain_vin_*`). `ensure_virtual_input` bounces the remap module if feed.monitor→input.vin hops are missing.
+
+### Standard track wiring contract
+
+Canonical per-bus node set and the only legal links. Anything else is pruned; nothing here may be stripped by any other path.
+
+| Link | When | Owner |
+|------|------|-------|
+| `{bus}.monitor → buschain_hold` | **always** (keepalive; hard-protected in unlink) | arm/reconcile |
+| `{bus}.monitor → buschain_fx_X` | FX Desired (kept through mid-build holds) | arm / ensure_fx_chain |
+| `{bus}.monitor → buschain_mtr_X` | no live FX host (dry strip meter; hard-protected in unlink) | `host::dry_meter` only |
+| `{bus}.monitor → dest` | dry, or soft-cutover **per dest** while that dest's wet hop is down | arm |
+| `buschain_fx_X → buschain_post_X` | FX Desired | ensure_fx_chain |
+| `{post}.monitor → dest` | wet | arm |
+
+Cutover rules:
+
+- **Per-dest exclusivity:** once `post.monitor→dest` is live, the dry `{bus}.monitor→dest` for *that* dest is dropped; dests still waiting keep dry (no all-or-nothing silence, no double audio).
+- **Never prune dry before wet lands:** idle prune drops a dry `bus→dest` only when that dest's `post→dest` is live (`prune_parallel_fx_routes`).
+- **Master mid-build hold keeps the FX feed** (fx + mtr allow-listed) — a hold-only allow-list is the historical sealed-chain bug.
+- **`buschain_mtr_*` lifecycle:** created only by `host::dry_meter` when no host is live; torn down when a host comes up (including the ensure-race re-check), on track delete / orphan prune / Teardown / Quit, and when the UI hides (`sleep_visualization` — no RT peak-scanning while nothing renders).
+- **Dry egress heal (`heal_dry_egress`):** `prune_parallel_fx_routes` only walks `fx_chains`, and a track with zero inserts never gets a chain spec, so nothing re-armed `bus→dest` for it after a sweep / WirePlumber restart / device recreate. The strip kept metering (mtr tap and hold are separate links) while being silent to Master. The heal runs each idle tick over every non-Master bus that is dry, unmuted, and missing a configured dest.
 
 **Still open:**
 
-- Hard `kill -9` / crash (no atexit watchdog)
 - Thin-client `--daemon-client` quit leaves external graph alone
 - Automated smoke: Quit → HW default unmuted + no orphan `buschain_track_*`; +Track / mic assign → Master→HW link count never zero; Add In / Delete track → take effect &lt; ~1s
 
@@ -426,10 +461,18 @@ Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
 | Re-Add mic after × | Audible &lt;~200ms; `capture live …` (never empty SyncCapture); no ghost In |
 | Idle 10s while muted | Stays muted (no open_bus_gain undo) |
 | Apps Add during In edit | PlaceApp completes; mute still Class A priority |
+| Start player after BusChain up | App appears in Apps Add ≤2s (native registry generation-driven; no Apply) |
+| Pin Chromium to non-VO FX track | Stream on that Internal bus **and still listed in Apps** (native discovery); pitch/EQ audible; no dry `track.monitor→master` |
+| App on Internal track after restart | Reclaim/pin still sees it (native `enforce_desired_playback`) |
+| Dry track with mic/app, no inserts | Strip meter moves (native `buschain_mtr_*`; Pulse meters still off by default) |
+| Hide → show mixer window | Dry-meter filters torn down while hidden (no RT cost); meters move again on show |
+| Sealed wet path after PlaceApp | App → track → fx → post → Master; inserts hear the stream |
+| Add first insert to a busy dry track | No silence gap and no double audio during soft-cutover (per-dest exclusivity) |
 
 | Step | Expect |
 |------|--------|
-| Quit from tray | Default sink/source = HW, unmuted; no `buschain_*` sinks |
+| Quit from tray / kill process | Default sink/source = HW, unmuted; no `buschain_*` nodes in `pw-cli ls Node` |
+| pavucontrol Output Devices | HW + Master + VO tracks only (no Hold / Post / RateBridge) |
 | +Track with live Master | Master→HW stays linked; desktop playback continues |
 | Add Scarlett mic to track while Discord captures | Discord keeps the mic; track meters show signal |
 | Same mic on two tracks | Both tracks get signal; no exclusive steal |
@@ -439,6 +482,20 @@ Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
 | Delete track feeding Master | Master stops that feed immediately (silence-first prune) |
 | Assign app to track (Apps rack) | Stream on target bus within ~1s; no ApplyLevels HOL |
 | Unpin app from track | Leaves track quickly (preferred default / Master) |
+| pavucontrol Output | HW + Master + VO tracks only (no Post/Hold/RS/non-VO) |
+| pavucontrol Playback/Recording | No `loopback-*` / `buschain-control-meters`; event/"System Sounds" not reclaimed onto BusChain |
+| VO toggle | No ArmSession; streams remount; FX edit latency unchanged |
+
+### Structural edit latency budget
+
+| Edit | Severity | Rule |
+|------|----------|------|
+| Fader / mute / Props | Class A | Never Ensure/Arm; SPA Props |
+| PlaceApp | Class B | SyncPlayback + native retarget; no ApplyLevels HOL |
+| Route / Capture | Surgical | Idempotent links; no ArmSession |
+| FX add/remove/reorder | FxRewire | Async gen-swap; UI stays live |
+| VO / vin toggle | Surgical | media.class flip + remount; no Arm |
+| Clock / Full Apply | Heavy | Explicit Apply / Reconcile only |
 
 ---
 
@@ -464,6 +521,7 @@ Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
 | `BUSCHAIN_CONTROL_USE_DAEMON` | Thin-client debug |
 | `BUSCHAIN_CONTROL_LAT_TRACE` | `1` → Class A/B/C latency lines (`OK`/`SLOW`/`FAIL`) |
 | `BUSCHAIN_ALLOW_PULSE_CAPTURE` | Escape hatch: allow Pulse loopback when native registry is up |
+| `BUSCHAIN_PULSE_METERS` | `1` enables Pulse dry-bus meter streams (default off — host wet + native dry taps) |
 | `VST3_PATH` / `CLAP_PATH` / `LV2_PATH` / `LADSPA_PATH` | Plugin scan roots |
 | `HYPRLAND_INSTANCE_SIGNATURE` | Enables Hyprland float dispatch for editors |
 
@@ -477,12 +535,13 @@ One `buschain-control` process owns the graph via a **dual-thread control plane*
 |------|--------|------|
 | **Interactive** | `buschain-interactive` | Mute/fader/Props, `SyncCaptureDelta`, PlaceApp (Class A/B) |
 | **Supervisor** | `buschain-supervisor` | Route/Ensure/Prune/ArmSession/FxRewire, idle reconcile (Class C) |
-| **Observer** | `buschain-observer` | `refresh_snapshot` only — never ENGINE mute path |
+| **Observer** | `buschain-observer` | Generation-driven `SinkInputs` (native registry bump; 1.5s Pulse fallback) + on-demand `refresh_snapshot` — never ENGINE mute path |
 
 Sealed FX pillars stay unchanged: `pipeline/arm` disarm/arm, gen-swap ForceRespawn
-(Supervisor/FxRewire only), `speakers_armed` / ArmSession barrier, ControlQueue Props,
-never-cork app sinks, PruneTrack silence-first. Capture hops verify native-live before
-`last_applied` updates (`Intent::SyncCaptureDelta`).
+(Supervisor/FxRewire only — in-process rack swap; the old A/B `__stg` staging null-sinks
+are **retired**, remaining `__stg` destroys are leftover hygiene only), `speakers_armed`
+/ ArmSession barrier, ControlQueue Props, never-cork app sinks, PruneTrack silence-first.
+Capture hops verify native-live before `last_applied` updates (`Intent::SyncCaptureDelta`).
 
 The engine insert rack (`PwFxNode` + `AudioProcessor` host) is the DSP path;
 PipeWire is mixer I/O. Helpers (`plugin-surface` / `plugin-dsp`) run only when

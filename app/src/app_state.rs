@@ -11,11 +11,6 @@ use crate::session::Session;
 use egui::TextureHandle;
 use uuid::Uuid;
 
-/// Post-FX meter sink for a bus — live A/B generation (canonical or `__stg`).
-fn post_meter_sink(bus: &str) -> String {
-    buschain_engine::live_post_name(bus)
-}
-
 /// In-app plugin editor (never a separate OS/viewport window).
 #[derive(Debug, Clone)]
 pub struct PluginWindow {
@@ -985,6 +980,9 @@ impl AppState {
         self.viz_live = false;
         self.meters.set_paused(true);
         crate::audio::engine_handle::host_spectrum_clear_watches();
+        // Dry-meter filter taps peak-scan every quantum — stop them while hidden.
+        crate::audio::engine_handle::sync_dry_meters(&[]);
+        self.meter_targets_sig = 0;
     }
 
     /// Show window — resume meters and retarget taps immediately.
@@ -1000,9 +998,10 @@ impl AppState {
         if !self.viz_live {
             return;
         }
-        // Pulse only for buses without a live in-process host (dry / fallback).
+        // Wet: host peaks. Dry: native `{bus}.monitor` tap. Pulse only if env opt-in.
         let rate = self.session.performance.sample_rate.max(8_000);
         let mut taps: Vec<MeterTap> = Vec::new();
+        let mut dry_buses: Vec<String> = Vec::new();
         let mut sig: u64 = 0;
         for t in &self.session.tracks {
             let bus = t
@@ -1017,25 +1016,27 @@ impl AppState {
                 }
                 continue;
             }
-            let post = post_meter_sink(&bus);
-            let post_live = self.snapshot.sinks.iter().any(|s| s.name == post)
-                || crate::audio::engine_handle::chain_is_wet_cached(&bus);
+            dry_buses.push(bus.clone());
             for b in bus.as_bytes() {
                 sig = sig.wrapping_mul(16777619) ^ (*b as u64);
             }
-            sig = sig.wrapping_mul(16777619) ^ (rate as u64);
-            taps.push(MeterTap {
-                key: bus.clone(),
-                tap: bus.clone(),
-                sample_rate: rate,
-            });
-            if !t.inserts.is_empty() && post_live && post != bus {
-                for b in post.as_bytes() {
-                    sig = sig.wrapping_mul(16777619) ^ (*b as u64);
+            sig = sig.wrapping_mul(16777619) ^ 0x4452_5954u64; // "DRYT"
+        }
+        crate::audio::engine_handle::sync_dry_meters(&dry_buses);
+        // Skip Pulse taps when native dry meters cover the bus (default).
+        let pulse_meters = matches!(
+            std::env::var("BUSCHAIN_PULSE_METERS").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        );
+        if pulse_meters {
+            for bus in &dry_buses {
+                if crate::audio::engine_handle::dry_meter_is_live(bus) {
+                    continue;
                 }
+                sig = sig.wrapping_mul(16777619) ^ (rate as u64);
                 taps.push(MeterTap {
-                    key: bus,
-                    tap: post,
+                    key: bus.clone(),
+                    tap: bus.clone(),
                     sample_rate: rate,
                 });
             }

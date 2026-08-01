@@ -352,6 +352,7 @@ fn capture_peer_allowed(
         || peer.starts_with("buschain_master")
         || peer.starts_with("buschain_post_")
         || peer.starts_with("buschain_fx_")
+        || peer.starts_with("buschain_mtr_")
         || peer == "buschain_hold"
         || peer.starts_with("meter-")
     {
@@ -509,6 +510,19 @@ fn ensure_link_inner(source: &str, sink: &str, force: bool) -> Result<()> {
     if dst.starts_with("buschain_fx_") || pw_node(source).starts_with("buschain_fx_") {
         return Err(last_err.unwrap_or_else(|| {
             anyhow!("pw-link ports not ready for host FX `{source}` → `{sink}`")
+        }));
+    }
+
+    // Never Pulse-loopback onto Hold / internal helpers — that dumps loopback-*
+    // into pavucontrol Playback/Recording.
+    let sink_node = pw_node(sink);
+    if sink_node == "buschain_hold"
+        || sink_node.starts_with("buschain_post_")
+        || sink_node.starts_with("buschain_rs_")
+        || sink_node.starts_with("buschain_vinf_")
+    {
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow!("native hop required for internal sink `{sink}` (Pulse loopback forbidden)")
         }));
     }
 
@@ -692,6 +706,15 @@ fn maybe_disconnect(out_p: &str, in_p: &str, allow_sinks: &[&str]) -> u32 {
     if in_p.starts_with("meter-") {
         return 0;
     }
+    // Native dry-meter taps are lifecycle-owned by host::dry_meter — hard-protect
+    // like hold so allow-list drift in arm/heal paths can never strip them.
+    if in_p.starts_with("buschain_mtr_") {
+        return 0;
+    }
+    // System virtual input remap capture (feed.monitor → input.buschain_vin_*).
+    if in_p.starts_with("buschain_vin_") || in_p.starts_with("input.buschain_vin_") {
+        return 0;
+    }
     if port_targets_allowed(in_p, allow_sinks) {
         return 0;
     }
@@ -744,6 +767,64 @@ pub fn unload_legacy_from_source_except(source: &str, allow_sinks: &[&str]) {
             super::cli::CLI_TIMEOUT,
         );
     }
+}
+
+/// Unload leftover Pulse `module-loopback` modules owned by BusChain (desktop clutter).
+/// Safe to call during Apply — does not tear native PW links.
+///
+/// Debounced: BusChain never creates Pulse loopbacks anymore, so once a sweep
+/// finds nothing, skip the `pactl list modules` fork for a while (idle reconcile
+/// was forking pactl every pass even on a clean system).
+pub fn unload_buschain_pulse_loopbacks() -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CLEAN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+    const CLEAN_TTL_MS: u64 = 60_000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now_ms < CLEAN_UNTIL_MS.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let n = unload_buschain_pulse_loopbacks_inner();
+    if n == 0 {
+        CLEAN_UNTIL_MS.store(now_ms + CLEAN_TTL_MS, Ordering::Relaxed);
+    } else {
+        CLEAN_UNTIL_MS.store(0, Ordering::Relaxed);
+    }
+    n
+}
+
+fn unload_buschain_pulse_loopbacks_inner() -> u32 {
+    let Ok(out) = Command::new("pactl")
+        .args(["list", "short", "modules"])
+        .output()
+    else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut n = 0u32;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(idx) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let args = parts.next().unwrap_or("");
+        if name != "module-loopback" {
+            continue;
+        }
+        let owned = args.contains("media.name=buschain-control")
+            || args.contains("media.name=buschain-keepalive")
+            || args.contains("media.name=shadow-audio")
+            || args.contains("sink=buschain_")
+            || args.contains("source=buschain_");
+        if !owned {
+            continue;
+        }
+        if run_status("pactl", &["unload-module", idx]).is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 pub fn teardown_buschain_links() {

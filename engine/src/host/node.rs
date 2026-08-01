@@ -186,8 +186,13 @@ unsafe impl Send for PwFxNode {}
 
 impl PwFxNode {
     pub fn start(bus: &str, sample_rate: u32, quantum: u32) -> Result<Self> {
+        Self::start_named(bus, &crate::domain::fx_name_for_bus(bus), sample_rate, quantum)
+    }
+
+    /// Start a filter with an explicit `node.name` (FX host or dry-meter tap).
+    pub fn start_named(bus: &str, fx_name: &str, sample_rate: u32, quantum: u32) -> Result<Self> {
         ensure_pw_init();
-        let fx_name = crate::domain::fx_name_for_bus(bus);
+        let fx_name = fx_name.to_string();
         let state = HostRtState::new();
         state.sample_rate.store(sample_rate.max(1), Ordering::Relaxed);
         let loop_ptr: Arc<Mutex<Option<MainLoopPtr>>> = Arc::new(Mutex::new(None));
@@ -294,8 +299,12 @@ fn run_filter_loop(
             name_c.as_ptr(),
             c"node.description".as_ptr(),
             desc_c.as_ptr(),
-            c"media.class".as_ptr(),
-            c"Audio/Duplex".as_ptr(),
+            // NO media.class here. `Audio/Duplex` made pipewire-pulse register
+            // every FX/mtr filter as a device that never reports sample/map/
+            // volume ("sink not ready" ×700k/day) — wedging the whole Pulse
+            // layer: empty sink-input lists, dead record streams, new Pulse
+            // clients never routed. Plain type/category/role = invisible to
+            // Pulse, exactly like pipewire's own filter nodes.
             c"node.virtual".as_ptr(),
             c"true".as_ptr(),
             c"node.passive".as_ptr(),
@@ -490,6 +499,11 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
             ud.scratch_r[i] = 0.0;
         }
     }
+    // NaN/Inf entering an IIR or delay rack poisons its state permanently
+    // (non-finite never decays), so the bus would output silence-at-the-DAC
+    // forever. Scrub at the boundary instead.
+    scrub_non_finite(&mut ud.scratch_l[..ns]);
+    scrub_non_finite(&mut ud.scratch_r[..ns]);
 
     // Pre-insert meter peak (atomic f32 bits).
     let mut pre_peak = 0.0f32;
@@ -564,7 +578,20 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut spa_sys::spa_i
         ud.spectrum_rt.process_pending(&ud.state.spectrum);
     }
 
+    // A blown-up plugin must not poison the rest of the graph.
+    scrub_non_finite(&mut ud.scratch_l[..ns]);
+    scrub_non_finite(&mut ud.scratch_r[..ns]);
     ptr::copy_nonoverlapping(ud.scratch_l.as_ptr(), out_l, ns);
     ptr::copy_nonoverlapping(ud.scratch_r.as_ptr(), out_r, ns);
     ud.state.process_calls.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Replace NaN/Inf samples with silence (RT-safe, branch-per-sample).
+#[inline]
+fn scrub_non_finite(buf: &mut [f32]) {
+    for v in buf.iter_mut() {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+    }
 }

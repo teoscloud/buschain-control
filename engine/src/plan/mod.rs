@@ -129,10 +129,11 @@ impl DesiredState {
     }
 
     pub fn egress_dests(&self, bus: &str) -> Vec<String> {
+        // Key present (even empty) is authoritative — empty = hold-only / no Master
+        // send. Falling through on empty used to re-inject Master after the UI
+        // removed it, so track→track routing could never silence the master bus.
         if let Some(d) = self.bus_egress.get(bus) {
-            if !d.is_empty() {
-                return d.clone();
-            }
+            return d.clone();
         }
         if let Some(spec) = self.fx_chains.get(bus) {
             if !spec.dest.is_empty() {
@@ -143,7 +144,16 @@ impl DesiredState {
             if let Some(hw) = &self.master_hw {
                 return vec![hw.clone()];
             }
-        } else {
+            return Vec::new();
+        }
+        // Helpers (vin feed, post, fx, rate-bridge, hold) must NEVER default to
+        // Master — that made System virtual input force DualMic audio onto Master
+        // via buschain_vinf_*.monitor → buschain_master even with Output empty.
+        if crate::domain::NodeName::new(bus).is_buschain_helper() {
+            return Vec::new();
+        }
+        // Pre-sync track bus only — safe default until session sync pins egress.
+        if bus.starts_with("buschain_track_") {
             return vec!["buschain_master".into()];
         }
         Vec::new()

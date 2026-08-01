@@ -1,7 +1,7 @@
-//! Live track peak meters — sample sink monitors as float audio and compute peaks.
+//! Live track peak meters — Pulse monitor taps (opt-in via `BUSCHAIN_PULSE_METERS`).
 //!
-//! Strip meters tap the heard end of each channel: `buschain_post_*` when the
-//! insert chain is wet, otherwise the track/master bus. Never meter `buschain_fx_*`.
+//! Default path: wet strips use in-process FX host peaks; dry strips use native
+//! `buschain_mtr_*` taps. Never meter `buschain_fx_*`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -460,9 +460,21 @@ fn recreate_one(
         None => return,
     };
     let _ = spl.set_str(proplist::properties::APPLICATION_NAME, "BusChain Control Meters");
+    let _ = spl.set_str(proplist::properties::APPLICATION_ID, "org.buschain.control.meters");
     let _ = spl.set_str(proplist::properties::MEDIA_NAME, &stream_name);
-    let _ = spl.set_str(proplist::properties::MEDIA_ROLE, "abstract");
+    let _ = spl.set_str(proplist::properties::MEDIA_ROLE, "filter");
+    let _ = spl.set_str("media.category", "Filter");
     let _ = spl.set_str("node.name", &stream_name);
+    let _ = spl.set_str("node.virtual", "true");
+    // Pulse record streams clutter pavucontrol Recording. Default OFF — wet path
+    // uses host pre/post peaks. Set BUSCHAIN_PULSE_METERS=1 to force Pulse taps.
+    let pulse_meters = matches!(
+        std::env::var("BUSCHAIN_PULSE_METERS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    );
+    if !pulse_meters {
+        return;
+    }
 
     ml.lock();
     let mut stream = match Stream::new_with_proplist(ctx, &stream_name, &spec, None, &mut spl) {

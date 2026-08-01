@@ -26,9 +26,9 @@ pub use clock::{
 };
 pub use contract::{ApplyReport, ClockProps, Intent};
 pub use domain::{
-    bus_suffix, fx_name_for_bus, normalize_ladspa_label, post_name_for_bus, ChainEnsureMode,
-    ChainSpec, ChainState, DeviceNode, GraphSnapshot, InsertFormat, InsertSlot, LinkSpec, NodeName,
-    NodeRole, NodeSpec, Props, WirePlan,
+    bus_suffix, fx_name_for_bus, mtr_name_for_bus, normalize_ladspa_label, post_name_for_bus,
+    ChainEnsureMode, ChainSpec, ChainState, DeviceNode, GraphSnapshot, InsertFormat, InsertSlot,
+    LinkSpec, NodeName, NodeRole, NodeSpec, Props, WirePlan,
 };
 pub use plan::{BusLevel, DesiredState};
 pub use pipeline::{

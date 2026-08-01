@@ -359,7 +359,12 @@ impl Engine {
                         description: format!("{description}_VinFeed"),
                         role: NodeRole::VirtualInputFeed,
                         start_muted: false,
+                        pulse_export: false,
                     });
+                    // Feed monitor is for remap-source only — never Master/track egress.
+                    // Do NOT wipe all hops (that killed Pulse remap capture links).
+                    self.desired.set_bus_egress(&feed, Vec::new());
+                    self.strip_virtual_input_feed_leaks(&feed);
                     let mut dests = self.desired.egress_dests(bus.as_str());
                     if !dests.iter().any(|d| d == &feed) {
                         dests.push(feed.clone());
@@ -387,11 +392,12 @@ impl Engine {
                 self.backend.teardown_links();
                 let _ = self.backend.teardown_rate_bridges();
                 self.fx.stop_all();
-                // Tear down in-process hosts for every known bus.
+                // Tear down in-process hosts + dry-meter taps for every known bus.
                 let buses: Vec<String> = self.desired.fx_chains.keys().cloned().collect();
                 for bus in buses {
                     let _ = crate::host::registry::teardown_host(&bus);
                 }
+                crate::host::dry_meter::teardown_all_dry_meters();
                 let vins: Vec<String> = self.desired.virtual_inputs.keys().cloned().collect();
                 for bus in vins {
                     let _ = crate::backend::teardown_virtual_input(&bus);
@@ -548,6 +554,7 @@ impl Engine {
         self.prune_orphan_track_buses(&mut report);
         // Every idle tick: kill parallel dry+post paths (chorus/echo).
         self.prune_parallel_fx_routes(&mut report);
+        self.heal_dry_egress(&mut report);
         // Skip full capture purge when Desired bus_inputs unchanged.
         self.reconcile_bus_inputs(&mut report, true);
         self.idle_fx_ticks = self.idle_fx_ticks.wrapping_add(1);
@@ -595,15 +602,20 @@ impl Engine {
                 continue;
             }
             let dests = self.desired.egress_dests(&bus);
-            let wet = pipeline::arm::spine_instant_ready(&bus);
-            if !self.egress_to_dests_live(&bus, wet, &dests)
+            // Prefer wet whenever FX is Desired / host is up — never idle-force dry
+            // (that stripped bus→fx and left apps/mics skipping the track chain).
+            let want_wet = self.desired.fx_chains.contains_key(&bus)
+                || crate::host::registry::host_running(&bus)
+                || pipeline::arm::spine_instant_ready(&bus);
+            if !self.egress_to_dests_live(&bus, want_wet, &dests)
                 && !self.egress_to_dests_live(&bus, false, &dests)
             {
-                let _ = self.arm_track_egress(&bus, wet, &dests);
-                if !self.egress_to_dests_live(&bus, true, &dests)
-                    && !self.egress_to_dests_live(&bus, false, &dests)
-                {
-                    let _ = self.arm_track_egress(&bus, false, &dests);
+                let _ = self.arm_track_egress(&bus, want_wet, &dests);
+            } else if want_wet {
+                // Dry parallel still up beside a settling spine — push exclusive wet.
+                let from = format!("{bus}.monitor");
+                if dests.iter().any(|d| !d.is_empty() && link_is_live(&from, d)) {
+                    let _ = self.arm_track_egress(&bus, true, &dests);
                 }
             }
             self.applied_monitor_mute.insert(bus, false);
@@ -650,6 +662,7 @@ impl Engine {
                 bus: NodeName::new(&name),
             });
             let _ = self.teardown_fx_chain(&name);
+            crate::host::dry_meter::teardown_dry_meter(&name);
             pipeline::arm::disarm_track_egress(&mut self.backend, &name, false);
             crate::backend::unload_legacy_loopbacks_into_sink_except(&name, &[]);
             let _ = crate::backend::unlink_capture_into_sink_except(&name, &[]);
@@ -1070,13 +1083,28 @@ impl Engine {
                         report.push(format!("prune dry {bus}→{d} (wet exclusive)"));
                     }
                 }
-                // Mixer-muted: strip all egress (hold only). Else keep Desired dests.
+                // Mixer-muted: strip all egress (hold only). Else keep Desired dests
+                // and re-arm any missing post→dest (half-up wet was silencing Master).
                 if self.mixer_muted(bus) {
                     let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
-                } else {
+                } else if allow_egress {
                     let mut allow: Vec<&str> = dest_refs.clone();
                     allow.push("buschain_hold");
                     let _ = self.backend.unlink_from_source_except(&post_mon, &allow);
+                    let mut missing = false;
+                    for d in &dests {
+                        if !d.is_empty() && sink_exists(d) && !link_is_live(&post_mon, d) {
+                            missing = true;
+                            break;
+                        }
+                    }
+                    if missing {
+                        wake_sink_for_egress(&dests);
+                        match self.arm_track_egress(bus, true, &dests) {
+                            Ok(()) => report.push(format!("re-arm wet egress {bus}")),
+                            Err(e) => report.push(format!("re-arm {bus}: {e:#}")),
+                        }
+                    }
                 }
             } else if !spec.inserts.is_empty() {
                 // Feed restore first: spine_ok requires bus→fx. After restart the
@@ -1122,10 +1150,15 @@ impl Engine {
                         report.push(format!("prune orphan post {post}"));
                     }
                 } else {
-                    // FX present but spine still settling — keep existing egress;
-                    // only drop dry parallel bus→dest.
+                    // FX present but spine still settling — keep existing egress.
+                    // Only drop a dry bus→dest when that dest's WET hop is live;
+                    // stripping dry before post→dest exists silences the bus
+                    // (races arm_wet_soft, which keeps dry until wet lands).
                     for d in &dests {
-                        if link_is_live(&from, &fx) && link_is_live(&from, d) {
+                        if link_is_live(&from, &fx)
+                            && link_is_live(&post_mon, d)
+                            && link_is_live(&from, d)
+                        {
                             let _ = self.backend.unlink_raw(&from, d);
                             report.push(format!("prune dry during FX build {bus}→{d}"));
                         }
@@ -1135,6 +1168,46 @@ impl Engine {
                 // No inserts Desired but post linger — strip post outs.
                 let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
                 report.push(format!("prune orphan post {post}"));
+            }
+        }
+    }
+
+    /// Re-arm `bus→dest` for dry buses whose egress link went missing.
+    ///
+    /// `prune_parallel_fx_routes` only walks `fx_chains`, and a track with zero
+    /// inserts never gets a chain spec — so nothing re-armed its egress after a
+    /// sweep / WirePlumber restart / device recreate. The strip kept metering
+    /// (mtr tap + hold are separate links) while being silent to Master.
+    fn heal_dry_egress(&mut self, report: &mut ApplyReport) {
+        // Master has its own heal (HW + speakers_armed barrier) below.
+        // Only real track buses — never vin-feed / helpers (their monitor must
+        // not be routed to Master; remap-source is the only consumer).
+        let buses: Vec<String> = self
+            .desired
+            .buses
+            .iter()
+            .filter(|(name, spec)| {
+                name.as_str() != "buschain_master"
+                    && matches!(spec.role, crate::domain::NodeRole::TrackBus)
+                    && !crate::domain::NodeName::new(name.as_str()).is_buschain_helper()
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for bus in buses {
+            if self.chain_is_wet(&bus) || any_gen_live(&bus) || self.mixer_muted(&bus) {
+                continue;
+            }
+            if !sink_exists(&bus) {
+                continue;
+            }
+            let from = format!("{bus}.monitor");
+            for d in self.desired.egress_dests(&bus) {
+                if d.is_empty() || !sink_exists(&d) || link_is_live(&from, &d) {
+                    continue;
+                }
+                if self.backend.ensure_link_raw(&from, &d).is_ok() {
+                    report.push(format!("heal dry egress {bus}→{d}"));
+                }
             }
         }
     }
@@ -1166,11 +1239,18 @@ impl Engine {
         let mut report = ApplyReport::default();
         let clock = self.desired.clock.clone();
 
+        // Desktop hygiene: drop leftover Pulse loopbacks (Playback/Recording clutter).
+        let n = crate::backend::unload_buschain_pulse_loopbacks();
+        if n > 0 {
+            report.push(format!("unloaded {n} Pulse loopback module(s)"));
+        }
+
         let hold = NodeSpec {
             name: crate::domain::NodeName::new("buschain_hold"),
             description: "BusChainControl_Hold".into(),
             role: NodeRole::Hold,
             start_muted: true,
+            pulse_export: false,
         };
         let _ = self.backend.ensure_node(&hold, &clock);
 
@@ -1208,6 +1288,23 @@ impl Engine {
         Ok(report)
     }
 
+    /// Remove heal-injected Master/track hops from a vin feed monitor.
+    /// Preserves hold + Pulse `input.buschain_vin_*` remap capture links.
+    fn strip_virtual_input_feed_leaks(&mut self, feed: &str) {
+        let feed_mon = format!("{feed}.monitor");
+        let _ = self.backend.unlink_raw(&feed_mon, "buschain_master");
+        let tracks: Vec<String> = self
+            .desired
+            .buses
+            .keys()
+            .filter(|k| k.starts_with("buschain_track_"))
+            .cloned()
+            .collect();
+        for t in tracks {
+            let _ = self.backend.unlink_raw(&feed_mon, &t);
+        }
+    }
+
     /// Ensure / prune remap-sources for Desired virtual inputs.
     fn reconcile_virtual_inputs(&mut self, report: &mut ApplyReport) {
         let clock = ClockProps::from(&self.desired.clock);
@@ -1220,6 +1317,11 @@ impl Engine {
         for (bus, desc) in &want {
             if let Err(e) = crate::backend::ensure_virtual_input(bus, desc, &clock) {
                 report.push(format!("virtual input {bus}: {e:#}"));
+            }
+            if let Some((_, feed)) = crate::backend::virtual_input_names_for_bus(bus) {
+                self.desired.set_bus_egress(&feed, Vec::new());
+                // Remap owns the feed monitor — strip Master/track leaks only.
+                self.strip_virtual_input_feed_leaks(&feed);
             }
         }
         // Drop orphan feeds/sources for track buses no longer flagged.
@@ -1240,6 +1342,7 @@ impl Engine {
             }
             let _ = crate::backend::teardown_virtual_input(&bus);
             self.desired.buses.remove(&feed);
+            self.desired.bus_egress.remove(&feed);
             report.push(format!("virtual input pruned {bus}"));
         }
     }
@@ -1324,22 +1427,29 @@ impl Engine {
         }
     }
 
-    /// Drop post.monitor→* when the spine is actually down. Never strip when the
-    /// FX→post path is healthy — missing dest is a re-arm case, not a prune case.
+    /// Drop post.monitor→* only when the FX host is gone (true orphan).
+    /// Never strip while a gen/host is live or the spine is settling — that left
+    /// track→fx→post half-up with no post→Master/HW (meters alive, speakers dead).
     fn prune_orphan_post(&mut self, bus: &str, dest: &str) {
-        if pipeline::arm::spine_instant_ready(bus) {
+        if pipeline::arm::spine_instant_ready(bus) || any_gen_live(bus) {
             return;
         }
-        // Post sink for this bus — never strip when spine is healthy.
         let post = live_post_name(bus);
-        let post_mon = format!("{post}.monitor");
-        if dest.is_empty() {
-            let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+        if !sink_exists(&post) {
             return;
         }
-        if link_is_live(&post_mon, dest) || sink_exists(&post) {
-            let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
+        let post_mon = format!("{post}.monitor");
+        let has_egress = dest.is_empty()
+            || link_is_live(&post_mon, dest)
+            || self
+                .desired
+                .egress_dests(bus)
+                .iter()
+                .any(|d| !d.is_empty() && link_is_live(&post_mon, d));
+        if !has_egress {
+            return;
         }
+        let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
     }
 
     fn reconcile_master_and_default(&mut self, report: &mut ApplyReport) -> Result<()> {
@@ -1453,9 +1563,15 @@ impl Engine {
                         }
                         let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                     } else {
-                        let _ = self
-                            .backend
-                            .unlink_from_source_except(&from, &["buschain_hold"]);
+                        // Mid-build hold: keep the FX feed (and dry-meter tap) —
+                        // a hold-only allow-list here stripped bus→fx for up to
+                        // ~2s every build (historical sealed-chain bug pattern).
+                        let fx = live_fx_name(master);
+                        let mtr = crate::domain::mtr_name_for_bus(master);
+                        let _ = self.backend.unlink_from_source_except(
+                            &from,
+                            &[fx.as_str(), "buschain_hold", mtr.as_str()],
+                        );
                         let _ = self.backend.ensure_link_raw(&from, "buschain_hold");
                         if link_is_live(&from, &hw) {
                             let _ = self.backend.unlink_raw(&from, &hw);
@@ -1941,6 +2057,7 @@ impl Engine {
         let mut report = self.reconcile_buses_and_levels()?;
         self.prune_stale_rate_bridges(&mut report);
         self.prune_parallel_fx_routes(&mut report);
+        self.heal_dry_egress(&mut report);
         self.reconcile_master_and_default(&mut report)?;
         if report.messages.is_empty() {
             report.push("reconcile light (no fx) ok");
@@ -1993,6 +2110,7 @@ impl Engine {
         }
         self.reconcile_virtual_inputs(&mut report);
         self.prune_parallel_fx_routes(&mut report);
+        self.heal_dry_egress(&mut report);
         self.reconcile_master_and_default(&mut report)?;
         if report.messages.is_empty() {
             report.push("relink routes ok");
@@ -2067,6 +2185,7 @@ impl Engine {
     pub fn stop_all_fx(&mut self) {
         self.fx.stop_all();
         self.desired.fx_chains.clear();
+        crate::host::dry_meter::teardown_all_dry_meters();
     }
 
     /// Convenience: ensure null-sink with current clock (used by graph shim).
@@ -2083,6 +2202,7 @@ impl Engine {
                 description: description.into(),
                 role,
                 start_muted,
+                pulse_export: role.default_pulse_export(),
             },
         })?;
         Ok(())
@@ -2236,14 +2356,19 @@ impl Engine {
                 return Ok(());
             }
             let dests = self.desired.egress_dests(bus);
-            // Only claim wet when post spine can carry; otherwise dry bus→Master.
-            let wet = pipeline::arm::spine_instant_ready(bus);
-            let _ = self.arm_track_egress(bus, wet, &dests);
-            // Never stick hold-only after unmute (wet half-up used to swallow this).
+            let want_wet = self.desired.fx_chains.contains_key(bus)
+                || crate::host::registry::host_running(bus)
+                || pipeline::arm::spine_instant_ready(bus);
+            let _ = self.arm_track_egress(bus, want_wet, &dests);
+            // Hold-only after unmute: retry wet, then true-dry only if no FX Desired.
             if !self.egress_to_dests_live(bus, true, &dests)
                 && !self.egress_to_dests_live(bus, false, &dests)
             {
-                let _ = self.arm_track_egress(bus, false, &dests);
+                if want_wet {
+                    let _ = self.arm_track_egress(bus, true, &dests);
+                } else {
+                    let _ = self.arm_track_egress(bus, false, &dests);
+                }
             }
         }
         self.applied_monitor_mute.insert(bus.to_string(), muted);

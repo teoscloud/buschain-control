@@ -315,22 +315,14 @@ impl Session {
     /// Returns true when the session was mutated (caller should persist).
     pub fn normalize(&mut self) -> bool {
         let mut dirty = false;
-        let master_id = self
-            .tracks
-            .iter()
-            .find(|t| t.kind.is_master())
-            .map(|t| t.id);
         for t in &mut self.tracks {
             if matches!(t.kind, TrackKind::Input) {
                 t.kind = TrackKind::Bus;
                 dirty = true;
             }
-            if !t.kind.is_master() && t.output_targets.is_empty() {
-                if let Some(mid) = master_id {
-                    t.output_targets.push(mid);
-                    dirty = true;
-                }
-            }
+            // Empty output_targets is intentional (hold-only / track→track without
+            // a Master send). New tracks still default to Master in add_track;
+            // normalize must not re-inject Master after the user removes it.
             // Migrate legacy single input → input rack.
             if t.inputs.is_empty() {
                 if let Some(src) = t.input_source.clone().filter(|s| !s.is_empty() && s != "(none)")

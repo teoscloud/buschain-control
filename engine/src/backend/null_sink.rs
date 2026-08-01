@@ -50,6 +50,7 @@ pub fn migrate_recreate_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result
         description: "BusChainControl_Hold".into(),
         role: NodeRole::Hold,
         start_muted: true,
+        pulse_export: false,
     };
     if !sink_exists("buschain_hold") {
         let _ = create_null_sink(&hold_spec, clock);
@@ -92,9 +93,16 @@ fn create_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
     let name = spec.name.as_str();
     let is_app_bus = matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus);
     let is_vin_feed = matches!(spec.role, NodeRole::VirtualInputFeed);
+    // Prefer native for non-exported helpers (`Audio/Sink/Internal` — not in pactl).
+    if !spec.pulse_export && super::native::native_ready() {
+        return super::native::session_ensure_null_sink(spec, clock);
+    }
+    let export = if spec.pulse_export { "true" } else { "false" };
     let props = format!(
-        "sink_properties=device.description={} media.name=buschain-control session.suspend-timeout-seconds={} node.virtual=true node.latency={} audio.rate={} node.force-quantum={} node.lock-quantum={}",
+        "sink_properties=device.description={} media.name=buschain-control media.class={} buschain.pulse.export={} session.suspend-timeout-seconds={} node.virtual=true node.latency={} audio.rate={} node.force-quantum={} node.lock-quantum={}",
         sanitize_desc(&spec.description),
+        spec.media_class(),
+        export,
         clock.suspend_timeout,
         clock.node_latency,
         clock.sample_rate,

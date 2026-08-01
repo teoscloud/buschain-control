@@ -125,6 +125,12 @@
           install -m644 packaging/waybar/style.css \
             $out/share/buschain-control/waybar/style.css
 
+          mkdir -p $out/share/buschain-control/wireplumber/wireplumber.conf.d
+          install -m644 pipewire/wireplumber/wireplumber.conf.d/51-buschain-seal-helpers.conf \
+            $out/share/buschain-control/wireplumber/wireplumber.conf.d/
+          install -m755 scripts/install-wireplumber-rules.sh \
+            $out/share/buschain-control/install-wireplumber-rules.sh
+
           install -m644 packaging/wayland/buschain-control.desktop $out/share/applications/
           if [ -f assets/icons/buschain-control.png ]; then
             cp assets/icons/buschain-control.png $out/share/icons/hicolor/256x256/apps/buschain-control.png

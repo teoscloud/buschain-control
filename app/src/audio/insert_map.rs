@@ -244,6 +244,8 @@ pub fn controls_only_slots(track: &Track) -> Vec<InsertSlot> {
 }
 
 /// Primary wet egress for a track's FX chain (Master→HW or first output target).
+/// Empty when the track has no Output to… (hold-only); FX spine still builds,
+/// but post→dest is not armed until a destination is added.
 pub fn primary_fx_dest(session: &Session, track_id: uuid::Uuid, hw_sink: &str) -> String {
     let Some(track) = session.tracks.iter().find(|t| t.id == track_id) else {
         return "buschain_master".into();
@@ -254,7 +256,7 @@ pub fn primary_fx_dest(session: &Session, track_id: uuid::Uuid, hw_sink: &str) -
     let master_id = session.master_id();
     let bus = track.expected_sink_name();
     let mut targets = track.output_targets.clone();
-    if targets.is_empty() || track.listen {
+    if track.listen {
         if let Some(mid) = master_id {
             if !targets.contains(&mid) {
                 targets.push(mid);
@@ -274,7 +276,7 @@ pub fn primary_fx_dest(session: &Session, track_id: uuid::Uuid, hw_sink: &str) -
             }
         }
     }
-    "buschain_master".into()
+    String::new()
 }
 
 pub fn chain_spec_for_track(session: &Session, track_id: uuid::Uuid, dest: &str) -> Option<ChainSpec> {

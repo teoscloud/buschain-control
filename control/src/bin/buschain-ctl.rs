@@ -116,15 +116,61 @@ fn recover_desktop_audio() -> i32 {
         }
     }
 
+    // Native / Internal helpers are invisible to pactl — destroy via pw-cli.
+    let destroyed = destroy_buschain_pw_nodes();
     println!("recover-audio: default sink → {hw_sink} (unmuted)");
     if !hw_src.is_empty() {
         println!("recover-audio: default source → {hw_src} (unmuted)");
+    }
+    if destroyed > 0 {
+        println!("recover-audio: destroyed {destroyed} PipeWire buschain/shadow node(s)");
     }
     println!(
         "If still silent: systemctl --user restart wireplumber\n\
          (NixOS rebuild that restarts wireplumber.service has cleared hollow state.)"
     );
     0
+}
+
+/// Destroy every `buschain_*` / `shadow_*` PipeWire node by global id.
+fn destroy_buschain_pw_nodes() -> u32 {
+    use std::process::Command;
+    let Ok(out) = Command::new("pw-cli").args(["ls", "Node"]).output() else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_id: Option<u32> = None;
+    let mut kill: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("id ") {
+            current_id = rest
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("node.name = \"") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix('"') else {
+            continue;
+        };
+        if name.starts_with("buschain_") || name.starts_with("shadow_") {
+            if let Some(id) = current_id {
+                kill.push(id);
+            }
+        }
+    }
+    kill.sort_unstable();
+    kill.dedup();
+    let n = kill.len() as u32;
+    for id in kill {
+        let _ = Command::new("pw-cli")
+            .args(["destroy", &id.to_string()])
+            .status();
+    }
+    n
 }
 
 fn print_status_waybar(st: &buschain_control::ipc::Status) {

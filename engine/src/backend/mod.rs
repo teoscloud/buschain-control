@@ -22,8 +22,8 @@ pub use cli::{
 };
 pub use link::{
     ensure_link_force, pulse_loopback_owned, unlink_capture_into_sink_except,
-    unlink_capture_into_sink_except_with_bridges, unload_legacy_from_source_except,
-    unload_legacy_loopback, unload_legacy_loopback_force,
+    unlink_capture_into_sink_except_with_bridges, unload_buschain_pulse_loopbacks,
+    unload_legacy_from_source_except, unload_legacy_loopback, unload_legacy_loopback_force,
     unload_legacy_loopbacks_into_sink_except, unload_orphan_hw_to_rs_loopbacks,
     wait_sink_playback_ports,
 };
@@ -33,7 +33,11 @@ pub use fx_chain::{
     FilterChainRuntime,
 };
 
-pub use native::{list_midi_nodes, native_ready, PipewireNativeBackend};
+pub use native::{
+    graph_generation as native_graph_generation, list_midi_nodes, list_playback_streams,
+    native_ready, native_set_levels, stream_targets_sink, PipewireNativeBackend,
+    PlaybackStreamInfo,
+};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -91,7 +95,11 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
             Err(e) => {
                 let dst = sink.strip_suffix(".monitor").unwrap_or(sink);
                 let src = source.strip_suffix(".monitor").unwrap_or(source);
-                if dst.starts_with("buschain_fx_") || src.starts_with("buschain_fx_") {
+                if dst.starts_with("buschain_fx_")
+                    || src.starts_with("buschain_fx_")
+                    || dst.starts_with("buschain_mtr_")
+                    || src.starts_with("buschain_mtr_")
+                {
                     return Err(e);
                 }
                 if !allow_pulse_capture_fallback() {
@@ -125,7 +133,11 @@ pub fn ensure_link_force_pair(source: &str, sink: &str) -> Result<()> {
             Err(e) => {
                 let dst = sink.strip_suffix(".monitor").unwrap_or(sink);
                 let src = source.strip_suffix(".monitor").unwrap_or(source);
-                if dst.starts_with("buschain_fx_") || src.starts_with("buschain_fx_") {
+                if dst.starts_with("buschain_fx_")
+                    || src.starts_with("buschain_fx_")
+                    || dst.starts_with("buschain_mtr_")
+                    || src.starts_with("buschain_mtr_")
+                {
                     return Err(e);
                 }
                 if !allow_pulse_capture_fallback() {
@@ -537,6 +549,7 @@ fn ensure_clocked_route_inner(
         description: format!("BusChainControl_RateBridge_{src_rate}_to_{dst_rate}"),
         role: NodeRole::RateBridge,
         start_muted: false,
+        pulse_export: false,
     };
     backend.ensure_node(&spec, clock)?;
     desired.ensure_bus(spec);

@@ -103,6 +103,8 @@ pub fn ensure_host(
         teardown_host(bus);
         return Err(anyhow!("empty rack"));
     }
+    // Wet host owns the bus — drop dry peak tap so arm allow-lists stay clean.
+    crate::host::dry_meter::teardown_dry_meter(bus);
     let fx_name = crate::domain::fx_name_for_bus(bus);
     let want_fp = crate::domain::inserts_signature(inserts);
     let sr = clock_sr(clock);
@@ -184,6 +186,9 @@ pub fn ensure_host(
         },
     );
     drop(reg);
+    // UI dry-meter sync may have recreated the tap while the host was spawning
+    // (host_is_live was still false) — tear it again now that the host owns the bus.
+    crate::host::dry_meter::teardown_dry_meter(&bus_owned);
     crate::host::node_latency::publish_bus_latency(&bus_owned);
     Ok(fx_name)
 }

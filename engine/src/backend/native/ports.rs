@@ -164,6 +164,7 @@ mod tests {
             media_class: "Audio/Sink".into(),
             description: String::new(),
             rate: None,
+            serial: None,
         });
         view.insert_port(PortRec {
             id: id * 10,
@@ -228,6 +229,7 @@ mod tests {
             media_class: "Audio/Source".into(),
             description: String::new(),
             rate: None,
+            serial: None,
         });
         g.insert_port(PortRec {
             id: 11,

@@ -3,8 +3,8 @@
 mod insert;
 
 pub use insert::{
-    bus_suffix, fx_name_for_bus, inserts_signature, normalize_ladspa_label, post_name_for_bus,
-    ChainEnsureMode, ChainSpec, ChainState, InsertFormat, InsertSlot, WirePlan,
+    bus_suffix, fx_name_for_bus, inserts_signature, mtr_name_for_bus, normalize_ladspa_label,
+    post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertFormat, InsertSlot, WirePlan,
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ impl NodeName {
         self.0.starts_with("buschain_fx_")
             || self.0.starts_with("buschain_post_")
             || self.0.starts_with("buschain_mid_")
+            || self.0.starts_with("buschain_mtr_")
             || self.0.starts_with("buschain_rs_")
             || self.0.starts_with("buschain_vinf_")
             || self.0.starts_with("buschain_vin_")
@@ -58,6 +59,14 @@ impl AsRef<str> for NodeName {
     }
 }
 
+/// Pulse-visible null-sink class (Master / virtual outputs).
+pub const MEDIA_CLASS_PUBLIC_SINK: &str = "Audio/Sink";
+
+/// Sealed helper class — standard PipeWire (same as ALSA `*/Internal` nodes).
+/// Creates ports on `support.null-audio-sink` and stays out of `pactl`/pavucontrol.
+/// Never use a custom class like `BusChain/Internal` (that yields portless nodes).
+pub const MEDIA_CLASS_INTERNAL_SINK: &str = "Audio/Sink/Internal";
+
 /// Role of a BusChain-owned node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeRole {
@@ -72,6 +81,15 @@ pub enum NodeRole {
     External,
 }
 
+impl NodeRole {
+    /// Default Pulse export when the caller does not pass an explicit flag.
+    /// Master is public; tracks need explicit `virtual_output` (see session sync).
+    /// Helpers stay sealed (`Audio/Sink/Internal`).
+    pub fn default_pulse_export(self) -> bool {
+        matches!(self, Self::MasterBus)
+    }
+}
+
 /// Desired null-sink / helper specification.
 #[derive(Debug, Clone)]
 pub struct NodeSpec {
@@ -80,6 +98,25 @@ pub struct NodeSpec {
     pub role: NodeRole,
     /// When true, start muted at 0% (app-facing buses).
     pub start_muted: bool,
+    /// Expose in desktop Output lists (Master / VO). When false, create as
+    /// [`MEDIA_CLASS_INTERNAL_SINK`] so Pulse/pavucontrol omit the node while
+    /// ports remain linkable. Also stamped as `buschain.pulse.export`.
+    pub pulse_export: bool,
+}
+
+impl NodeSpec {
+    pub fn media_class(&self) -> &'static str {
+        if self.pulse_export {
+            MEDIA_CLASS_PUBLIC_SINK
+        } else {
+            MEDIA_CLASS_INTERNAL_SINK
+        }
+    }
+
+    pub fn with_pulse_export(mut self, export: bool) -> Self {
+        self.pulse_export = export;
+        self
+    }
 }
 
 /// Stereo route hop (Pulse-style source → sink names).

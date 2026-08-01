@@ -79,6 +79,19 @@ pub enum Rpc {
         entries: Vec<(String, String)>,
         reply: SyncSender<Result<()>>,
     },
+    /// Retarget Stream/Output/Audio nodes currently linked into `from_sink`
+    /// onto `to_sink` via metadata `target.node` (no Pulse move-sink-input).
+    RetargetStreams {
+        from_sink: String,
+        to_sink: String,
+        reply: SyncSender<Result<usize>>,
+    },
+    /// Retarget one stream by PipeWire object.serial (Pulse sink-input index).
+    RetargetStreamSerial {
+        serial: u32,
+        to_sink: String,
+        reply: SyncSender<Result<bool>>,
+    },
     #[allow(dead_code)]
     Shutdown {
         reply: SyncSender<()>,
@@ -290,6 +303,7 @@ pub fn cache_node_id(name: &str, id: u32) {
         media_class: String::new(),
         description: String::new(),
         rate: None,
+        serial: None,
     });
 }
 
@@ -345,7 +359,9 @@ fn run_loop(
 
     let local_view = Rc::new(RefCell::new(GraphView::default()));
     let shared = view.clone();
-    // Keep linger proxies briefly so create_object isn't GC'd before sync.
+    // Own create proxies for the process lifetime. With object.linger=false,
+    // dropping a Node/Link proxy removes the object from the graph (VO/Master
+    // sinks were vanishing right after ensure).
     let linger: Rc<RefCell<HashMap<u32, Box<dyn pw::proxy::ProxyT>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let after_sync: Rc<RefCell<Option<Box<dyn FnOnce(&CtrlState)>>>> =
@@ -472,16 +488,45 @@ fn on_global(
             let rate = props
                 .get(*pw::keys::AUDIO_RATE)
                 .and_then(|s| s.parse().ok());
+            let serial = props
+                .get("object.serial")
+                .and_then(|s| s.parse().ok());
+            let stream_props = if media_class == "Stream/Output/Audio" {
+                let get = |k: &str| {
+                    props
+                        .get(k)
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty())
+                };
+                Some(crate::backend::native::cache::StreamProps {
+                    app_name: get("application.name"),
+                    binary: get("application.process.binary"),
+                    app_id: get("application.id"),
+                    media_name: get("media.name"),
+                    icon_name: get("application.icon_name"),
+                    media_role: get("media.role"),
+                    node_virtual: props.get("node.virtual") == Some("true"),
+                })
+            } else {
+                None
+            };
             let rec = NodeRec {
                 id: global.id,
                 name,
                 media_class,
                 description,
                 rate,
+                serial,
             };
             local.borrow_mut().insert_node(rec.clone());
+            if let Some(sp) = stream_props.clone() {
+                local.borrow_mut().insert_stream_props(global.id, sp);
+            }
             if let Ok(mut g) = shared.write() {
                 g.insert_node(rec);
+                if let Some(sp) = stream_props {
+                    g.insert_stream_props(global.id, sp);
+                }
             }
         }
         ObjectType::Port => {
@@ -648,6 +693,20 @@ fn handle_rpc(st: &Rc<CtrlState>, rpc: Rpc) {
         } => {
             let _ = reply.send(do_set_node_props(st, &node, &entries));
         }
+        Rpc::RetargetStreams {
+            from_sink,
+            to_sink,
+            reply,
+        } => {
+            let _ = reply.send(do_retarget_streams(st, &from_sink, &to_sink));
+        }
+        Rpc::RetargetStreamSerial {
+            serial,
+            to_sink,
+            reply,
+        } => {
+            let _ = reply.send(do_retarget_stream_serial(st, serial, &to_sink));
+        }
         Rpc::Shutdown { reply } => {
             let _ = reply.send(());
             st.mainloop.quit();
@@ -729,10 +788,13 @@ fn begin_ensure_link(
                 *pw::keys::LINK_OUTPUT_PORT => out_port.to_string(),
                 *pw::keys::LINK_INPUT_NODE => dst_id.to_string(),
                 *pw::keys::LINK_INPUT_PORT => in_port.to_string(),
-                *pw::keys::OBJECT_LINGER => "true",
+                *pw::keys::OBJECT_LINGER => "false",
             },
         ) {
-            Ok(link) => drop(link),
+            Ok(link) => {
+                let proxy_id = link.upcast_ref().id();
+                st.linger.borrow_mut().insert(proxy_id, Box::new(link));
+            }
             Err(e) => {
                 let _ = reply.send(Err(anyhow!("create Link: {e}")));
                 return;
@@ -753,28 +815,61 @@ fn begin_ensure_null_sink(
     reply: SyncSender<Result<()>>,
 ) {
     let name = spec.name.as_str().to_string();
+    let want_class = spec.media_class();
     {
         let view = st.local.borrow();
-        if view.null_sink_ready(&name) {
-            let _ = reply.send(Ok(()));
-            return;
-        }
-        if view.node_id(&name).is_some() {
-            drop(view);
-            schedule_after_sync(st, move |_st| {
+        if let Some(n) = view.node(&name) {
+            // Exact class match required so VO toggle (Audio/Sink ↔ Audio/Sink/Internal)
+            // and portless BusChain/Internal leftovers recreate correctly.
+            let broken_class = n.media_class == "BusChain/Internal"
+                || (n.media_class.starts_with("BusChain/") && n.media_class != want_class);
+            let class_ok = !broken_class && n.media_class == want_class;
+            let ready = view.null_sink_ready(&name);
+            if ready && class_ok {
                 let _ = reply.send(Ok(()));
-            });
-            return;
+                return;
+            }
+            if class_ok && !ready {
+                // Node exists but ports not in registry yet — wait one sync.
+                drop(view);
+                schedule_after_sync(st, move |_st| {
+                    let _ = reply.send(Ok(()));
+                });
+                return;
+            }
+            // Wrong / portless class: park app streams, destroy, recreate.
+            drop(view);
+            let parked = stream_ids_on_sink(st, &name);
+            if let Some(hold_id) = st.local.borrow().node_id("buschain_hold") {
+                for sid in &parked {
+                    let _ = set_stream_target_node(st, *sid, hold_id, "buschain_hold");
+                }
+            }
+            let _ = do_destroy_node(st, &name);
+            return begin_ensure_null_sink_create(st, spec, clock, reply, parked);
         }
     }
 
+    begin_ensure_null_sink_create(st, spec, clock, reply, Vec::new());
+}
+
+fn begin_ensure_null_sink_create(
+    st: &CtrlState,
+    spec: NodeSpec,
+    clock: ClockProps,
+    reply: SyncSender<Result<()>>,
+    remount: Vec<u32>,
+) {
+    let name = spec.name.as_str().to_string();
+    let media_class = spec.media_class();
+    let pulse_export = if spec.pulse_export { "true" } else { "false" };
     let node = match st.core.create_object::<pw::node::Node>(
         "adapter",
         &properties! {
             "factory.name" => "support.null-audio-sink",
             *pw::keys::NODE_NAME => name.as_str(),
             *pw::keys::NODE_DESCRIPTION => spec.description.as_str(),
-            *pw::keys::MEDIA_CLASS => "Audio/Sink",
+            *pw::keys::MEDIA_CLASS => media_class,
             *pw::keys::AUDIO_CHANNELS => "2",
             "audio.position" => "FL,FR",
             *pw::keys::AUDIO_RATE => clock.sample_rate.to_string(),
@@ -783,9 +878,11 @@ fn begin_ensure_null_sink(
             *pw::keys::NODE_LOCK_QUANTUM => if clock.soft_quantum { "false" } else { "true" },
             *pw::keys::NODE_VIRTUAL => "true",
             *pw::keys::MEDIA_NAME => "buschain-control",
-            *pw::keys::OBJECT_LINGER => "true",
+            // Drop with the BusChain client — crash/Quit must not leave hollow sinks.
+            *pw::keys::OBJECT_LINGER => "false",
             "session.suspend-timeout-seconds" => clock.suspend_timeout.to_string(),
             "device.description" => spec.description.as_str(),
+            "buschain.pulse.export" => pulse_export,
         },
     ) {
         Ok(n) => n,
@@ -800,7 +897,14 @@ fn begin_ensure_null_sink(
         .insert(proxy_id, Box::new(node));
 
     schedule_after_sync(st, move |st| {
-        st.linger.borrow_mut().remove(&proxy_id);
+        // Do not drop the create proxy — object.linger=false ties lifetime to it.
+        if !remount.is_empty() {
+            if let Some(new_id) = st.local.borrow().node_id(&name) {
+                for sid in remount {
+                    let _ = set_stream_target_node(st, sid, new_id, &name);
+                }
+            }
+        }
         let _ = reply.send(Ok(()));
     });
 }
@@ -848,6 +952,17 @@ fn do_unlink_except(st: &CtrlState, source: &str, allow_sinks: &[&str]) -> u32 {
         if in_node.name.starts_with("meter-") {
             continue;
         }
+        // Dry-meter taps: lifecycle-owned by host::dry_meter — never strip here.
+        if in_node.name.starts_with("buschain_mtr_") {
+            continue;
+        }
+        // Pulse remap-source capture for system virtual input. Anti-Master feed
+        // strips used to wipe these and leave vin permanently silent.
+        if in_node.name.starts_with("buschain_vin_")
+            || in_node.name.starts_with("input.buschain_vin_")
+        {
+            continue;
+        }
         let allowed = allow_sinks.iter().any(|s| {
             let sn = pw_node(s);
             in_node.name == sn || port_on_node(&format!("{}:{}", in_node.name, in_port.name), sn)
@@ -876,7 +991,218 @@ fn do_destroy_node(st: &CtrlState, name: &str) -> Result<()> {
         .destroy_global(id)
         .into_result()
         .map_err(|e| anyhow!("destroy `{name}`: {e}"))?;
+    st.linger.borrow_mut().remove(&id);
     Ok(())
+}
+
+/// Stream nodes currently feeding `sink_name` playback ports.
+fn stream_ids_on_sink(st: &CtrlState, sink_name: &str) -> Vec<u32> {
+    let view = st.local.borrow();
+    let Some(sink_id) = view.node_id(sink_name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for link in view.links_by_id.values() {
+        if link.in_node != sink_id {
+            continue;
+        }
+        let Some(src) = view.nodes_by_id.get(&link.out_node) else {
+            continue;
+        };
+        if src.media_class == "Stream/Output/Audio"
+            || src.media_class.ends_with("/Output/Audio")
+        {
+            if !out.contains(&src.id) {
+                out.push(src.id);
+            }
+        }
+    }
+    out
+}
+
+/// Pin a stream onto `sink_name` via session metadata.
+///
+/// `target.object` takes precedence over the legacy `target.node` and is resolved
+/// by matching `node.name` **or** `object.serial` — never the node id. Writing the
+/// node id there made every target unresolvable, so WirePlumber silently fell back
+/// to the default sink and app placement appeared to do nothing.
+fn set_stream_target_node(
+    st: &CtrlState,
+    stream_id: u32,
+    sink_id: u32,
+    sink_name: &str,
+) -> bool {
+    let meta = st.metadata.borrow();
+    let Some(meta) = meta.as_ref() else {
+        return false;
+    };
+    meta.set_property(
+        stream_id,
+        "target.object",
+        Some("Spa:String"),
+        Some(sink_name),
+    );
+    // Legacy key for older session managers — this one really is the node id.
+    let id_str = sink_id.to_string();
+    meta.set_property(stream_id, "target.node", Some("Spa:Id"), Some(&id_str));
+    true
+}
+
+fn do_retarget_streams(st: &CtrlState, from_sink: &str, to_sink: &str) -> Result<usize> {
+    let to_id = st
+        .local
+        .borrow()
+        .node_id(to_sink)
+        .ok_or_else(|| anyhow!("retarget: sink `{to_sink}` not in registry"))?;
+    let streams = stream_ids_on_sink(st, from_sink);
+    let mut n = 0usize;
+    for sid in streams {
+        if set_stream_target_node(st, sid, to_id, to_sink) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn do_retarget_stream_serial(st: &CtrlState, serial: u32, to_sink: &str) -> Result<bool> {
+    let view = st.local.borrow();
+    let to_id = view
+        .node_id(to_sink)
+        .ok_or_else(|| anyhow!("retarget: sink `{to_sink}` not in registry"))?;
+    let Some(stream) = view.node_by_serial(serial) else {
+        return Ok(false);
+    };
+    if !(stream.media_class == "Stream/Output/Audio"
+        || stream.media_class.ends_with("/Output/Audio"))
+    {
+        // Still try — Pulse serial may map before class is cached.
+    }
+    let sid = stream.id;
+    // Already linked — Chromium/Electron freeze if we rewrite target.* every tick.
+    let already = view
+        .links_by_id
+        .values()
+        .any(|l| l.out_node == sid && l.in_node == to_id);
+    drop(view);
+    if already {
+        return Ok(true);
+    }
+    Ok(set_stream_target_node(st, sid, to_id, to_sink))
+}
+
+pub fn retarget_streams(from_sink: &str, to_sink: &str) -> Result<usize> {
+    call(
+        |reply| Rpc::RetargetStreams {
+            from_sink: from_sink.to_string(),
+            to_sink: to_sink.to_string(),
+            reply,
+        },
+        RPC_TIMEOUT,
+    )?
+}
+
+pub fn retarget_stream_serial(serial: u32, to_sink: &str) -> Result<bool> {
+    call(
+        |reply| Rpc::RetargetStreamSerial {
+            serial,
+            to_sink: to_sink.to_string(),
+            reply,
+        },
+        RPC_TIMEOUT,
+    )?
+}
+
+/// One live playback stream from the native registry (Apps discovery).
+#[derive(Debug, Clone)]
+pub struct PlaybackStreamInfo {
+    /// PipeWire `object.serial` — equals the Pulse sink-input index.
+    pub serial: u32,
+    pub node_name: String,
+    /// Sink node the stream currently feeds (via links); empty while settling.
+    pub sink: String,
+    pub app_name: Option<String>,
+    pub binary: Option<String>,
+    pub app_id: Option<String>,
+    pub media_name: Option<String>,
+    pub icon_name: Option<String>,
+    pub media_role: Option<String>,
+    pub node_virtual: bool,
+}
+
+/// List `Stream/Output/Audio` nodes with app props + current sink (registry, no forks).
+/// Sees streams on `Audio/Sink/Internal` buses that pipewire-pulse hides.
+pub fn list_playback_streams() -> Vec<PlaybackStreamInfo> {
+    let Some(view) = shared_view() else {
+        return Vec::new();
+    };
+    let Ok(g) = view.read() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in g.nodes_by_id.values() {
+        if node.media_class != "Stream/Output/Audio" {
+            continue;
+        }
+        let Some(serial) = node.serial else {
+            continue;
+        };
+        // Current target: prefer an Audio/Sink-class peer over filters/monitors.
+        let mut sink = String::new();
+        let mut sink_is_audio = false;
+        for link in g.links_by_id.values() {
+            if link.out_node != node.id {
+                continue;
+            }
+            let Some(peer) = g.nodes_by_id.get(&link.in_node) else {
+                continue;
+            };
+            let is_audio_sink = peer.media_class.starts_with("Audio/Sink");
+            if sink.is_empty() || (is_audio_sink && !sink_is_audio) {
+                sink = peer.name.clone();
+                sink_is_audio = is_audio_sink;
+            }
+        }
+        let sp = g.stream_props_by_id.get(&node.id).cloned().unwrap_or_default();
+        out.push(PlaybackStreamInfo {
+            serial,
+            node_name: node.name.clone(),
+            sink,
+            app_name: sp.app_name,
+            binary: sp.binary,
+            app_id: sp.app_id,
+            media_name: sp.media_name,
+            icon_name: sp.icon_name,
+            media_role: sp.media_role,
+            node_virtual: sp.node_virtual,
+        });
+    }
+    out.sort_by_key(|s| s.serial);
+    out
+}
+
+/// Registry change counter — bumps on node/port/link/stream changes.
+pub fn graph_generation() -> Option<u64> {
+    let view = shared_view()?;
+    view.read().ok().map(|g| g.generation)
+}
+
+/// True when a stream (`object.serial`) is already linked into `sink` playback.
+pub fn stream_targets_sink(serial: u32, sink: &str) -> Result<bool> {
+    let Some(view) = shared_view() else {
+        return Ok(false);
+    };
+    let g = view
+        .read()
+        .map_err(|_| anyhow!("native graph view poisoned"))?;
+    let Some(stream) = g.node_by_serial(serial) else {
+        return Ok(false);
+    };
+    let Some(sink_id) = g.node_id(sink) else {
+        return Ok(false);
+    };
+    Ok(g.links_by_id
+        .values()
+        .any(|l| l.out_node == stream.id && l.in_node == sink_id))
 }
 
 fn do_set_default_sink(st: &CtrlState, name: &str) -> Result<bool> {

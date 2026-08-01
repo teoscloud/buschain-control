@@ -17,6 +17,21 @@ pub struct NodeRec {
     pub media_class: String,
     pub description: String,
     pub rate: Option<u32>,
+    /// PipeWire `object.serial` — matches Pulse sink-input / sink index.
+    pub serial: Option<u32>,
+}
+
+/// Application props captured for `Stream/Output/Audio` nodes (Apps discovery).
+#[derive(Debug, Clone, Default)]
+pub struct StreamProps {
+    pub app_name: Option<String>,
+    pub binary: Option<String>,
+    pub app_id: Option<String>,
+    pub media_name: Option<String>,
+    pub icon_name: Option<String>,
+    /// `media.role` — event/notify/alert must not be reclaimed onto BusChain.
+    pub media_role: Option<String>,
+    pub node_virtual: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +62,8 @@ pub struct GraphView {
     pub links_by_id: HashMap<u32, LinkRec>,
     /// (out_port_id, in_port_id) → link global id
     pub links_by_ports: HashMap<(u32, u32), u32>,
+    /// node id → application props (Stream/Output/Audio only).
+    pub stream_props_by_id: HashMap<u32, StreamProps>,
     pub link_factory: Option<String>,
     /// Cached `default.audio.sink` name from Metadata.
     pub default_audio_sink: Option<String>,
@@ -70,12 +87,33 @@ impl GraphView {
         let mut v: Vec<String> = self
             .nodes_by_id
             .values()
-            .filter(|n| n.media_class == "Audio/Sink" || n.media_class.ends_with("/Sink"))
+            .filter(|n| {
+                n.media_class == "Audio/Sink"
+                    || n.media_class.ends_with("/Sink")
+                    || n.name.starts_with("buschain_")
+            })
             .map(|n| n.name.clone())
             .collect();
         v.sort();
         v.dedup();
         v
+    }
+
+    /// Pulse-exported sinks only (exact `Audio/Sink`) — Internal helpers omitted.
+    pub fn pulse_sink_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .nodes_by_id
+            .values()
+            .filter(|n| n.media_class == "Audio/Sink")
+            .map(|n| n.name.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    pub fn node_by_serial(&self, serial: u32) -> Option<&NodeRec> {
+        self.nodes_by_id.values().find(|n| n.serial == Some(serial))
     }
 
     pub fn source_names(&self) -> Vec<(String, String)> {
@@ -147,12 +185,18 @@ impl GraphView {
         self.bump();
     }
 
+    pub fn insert_stream_props(&mut self, node_id: u32, props: StreamProps) {
+        self.stream_props_by_id.insert(node_id, props);
+        self.bump();
+    }
+
     pub fn remove_global(&mut self, id: u32) {
         if let Some(n) = self.nodes_by_id.remove(&id) {
             if self.nodes_by_name.get(&n.name) == Some(&id) {
                 self.nodes_by_name.remove(&n.name);
             }
         }
+        self.stream_props_by_id.remove(&id);
         if self.ports_by_id.remove(&id).is_some() {
             for ports in self.ports_by_node.values_mut() {
                 ports.retain(|p| *p != id);
@@ -205,6 +249,7 @@ mod tests {
             media_class: "Audio/Sink".into(),
             description: String::new(),
             rate: Some(48_000),
+            serial: None,
         });
         assert!(!g.null_sink_ready("buschain_post_x"));
         g.insert_port(PortRec {

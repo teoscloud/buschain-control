@@ -328,9 +328,17 @@ fn is_equalizer_label(label: &str) -> bool {
     n == "buschain_equalizer"
 }
 
-/// Prefer host post peak when FX host is live; Pulse fallback for dry buses.
+/// Host wet → native dry tap → Pulse only when `BUSCHAIN_PULSE_METERS=1`.
 fn strip_peak_db(state: &AppState, bus: &str) -> f32 {
     if let Some((_pre, post)) = crate::audio::engine_handle::host_meter_peaks(bus) {
+        if post > 1e-8 {
+            return (20.0 * post.log10()).clamp(-90.0, 12.0);
+        }
+        if _pre > 1e-8 {
+            return (20.0 * _pre.log10()).clamp(-90.0, 12.0);
+        }
+    }
+    if let Some((_pre, post)) = crate::audio::engine_handle::dry_meter_peaks(bus) {
         if post > 1e-8 {
             return (20.0 * post.log10()).clamp(-90.0, 12.0);
         }
@@ -842,7 +850,6 @@ fn draw_output_rack(
         return;
     }
 
-    let master_id = state.session.master_id();
     let candidates: Vec<(Uuid, String)> = state
         .session
         .tracks
@@ -887,17 +894,25 @@ fn draw_output_rack(
     }
 
     if let Some(id) = remove_id {
-        let targets = &mut state.session.tracks[track_idx].output_targets;
-        targets.retain(|x| *x != id);
-        if targets.is_empty() {
-            if let Some(mid) = master_id {
-                targets.push(mid);
-            }
-        }
+        // Empty Output to… is intentional: hold-only / route via other tracks,
+        // no forced Master (DAW-style bus without a master send).
+        state.session.tracks[track_idx]
+            .output_targets
+            .retain(|x| *x != id);
         state.mark_routing_dirty();
     }
 
     let assigned_now = state.session.tracks[track_idx].output_targets.clone();
+    if assigned_now.is_empty() {
+        mini_rack_row(ui, &theme, content_w, |ui| {
+            ui.label(
+                RichText::new("No outputs (hold only)")
+                    .size(11.0)
+                    .color(theme.text_muted()),
+            );
+        });
+        ui.add_space(3.0);
+    }
     let choices: Vec<(Uuid, String)> = candidates
         .into_iter()
         .filter(|(id, _)| !assigned_now.contains(id))
@@ -1336,6 +1351,14 @@ fn draw_apps_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
 
     if let Some(key) = pick {
         let tid = state.session.tracks[track_idx].id;
+        // Chromium/Electron (Equibop, Vesktop, …) hang forever when retargeted onto
+        // Audio/Sink/Internal — pipewire-pulse never finishes the move. Apps require
+        // a Pulse-visible sink, so assign auto-enables System virtual output.
+        let need_vo = !state.session.tracks[track_idx].kind.is_master()
+            && !state.session.tracks[track_idx].virtual_output;
+        if need_vo {
+            state.session.tracks[track_idx].virtual_output = true;
+        }
         let sink = state.session.tracks[track_idx]
             .sink_name
             .clone()
@@ -1352,15 +1375,22 @@ fn draw_apps_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
         }
         state.dirty = true;
         let _ = state.session.save();
-        if !state.snapshot.sinks.iter().any(|s| s.name == sink) {
-            state.ensure_new_track(tid);
+        if need_vo || !state.snapshot.sinks.iter().any(|s| s.name == sink) {
+            // EnsureTrack recreates Internal → Audio/Sink, then SyncPlayback places.
+            state.commit(crate::audio::LiveChange::EnsureTrack { track_id: tid });
+            state.status = if need_vo {
+                "Exposing track for apps, then placing…".into()
+            } else {
+                "Placing app streams…".into()
+            };
+        } else {
+            state.worker.send(crate::audio::worker::Command::PlaceApp {
+                session: state.session.clone(),
+                app_key: key,
+                sink,
+            });
+            state.status = "Placing app streams…".into();
         }
-        state.worker.send(crate::audio::worker::Command::PlaceApp {
-            session: state.session.clone(),
-            app_key: key,
-            sink,
-        });
-        state.status = "Placing app streams…".into();
     }
 }
 

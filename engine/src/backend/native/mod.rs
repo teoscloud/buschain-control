@@ -32,8 +32,10 @@ pub fn list_midi_nodes() -> Vec<(String, String)> {
 pub use session::{
     cache_node_id as native_cache_node_id, ensure_link as native_ensure_link,
     ensure_null_sink as session_ensure_null_sink, find_node_id as native_find_node_id,
-    is_ready as native_ready, link_is_live as native_link_is_live,
-    set_levels as native_set_levels, sink_exists as native_sink_exists, unlink as native_unlink,
+    graph_generation, is_ready as native_ready, link_is_live as native_link_is_live,
+    list_playback_streams, list_sink_names, retarget_stream_serial, retarget_streams,
+    set_levels as native_set_levels, sink_exists as native_sink_exists, stream_targets_sink,
+    unlink as native_unlink, PlaybackStreamInfo,
 };
 
 /// Default engine backend: native registry/links/sinks; Pulse CLI for levels.
@@ -86,20 +88,8 @@ impl AudioBackend for PipewireNativeBackend {
     fn ensure_node(&mut self, spec: &NodeSpec, clock: &GraphClock) -> Result<NodeId> {
         let clock = ClockProps::from(clock);
         if session::is_ready() {
-            // Match CLI ensure semantics for app buses: soft props if present.
-            if session::sink_exists(spec.name.as_str()) {
-                let is_app = matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus);
-                if is_app {
-                    return Ok(NodeId(spec.name.0.clone()));
-                }
-                if session::shared_view()
-                    .and_then(|v| v.read().ok().map(|g| g.null_sink_ready(spec.name.as_str())))
-                    .unwrap_or(false)
-                {
-                    return Ok(NodeId(spec.name.0.clone()));
-                }
-                let _ = session::destroy_node(spec.name.as_str());
-            }
+            // Always go through session ensure — it recreates on media.class /
+            // pulse_export flips (VO toggle) without ArmSession.
             session::ensure_null_sink(spec, &clock)?;
             let is_app = matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus);
             if is_app || spec.start_muted {

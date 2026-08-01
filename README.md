@@ -194,7 +194,8 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 
 - **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart the app after installing new plugins.
 - **Sticky default:** set **System default** on a virtual track once — after Quit/reopen, BusChain reasserts that sink and reclaims playback apps.
-- **Hollow desktop audio:** `buschain-ctl recover-audio`, or `systemctl --user restart wireplumber` as a blunt recovery.
+- **Hollow desktop audio:** `buschain-ctl recover-audio` (restores HW + destroys leftover `buschain_*` PipeWire nodes), or `systemctl --user restart wireplumber` as a blunt recovery.
+- **Seal helpers in pavucontrol:** helpers are `Audio/Sink/Internal` by default; optional WirePlumber stamp via `scripts/install-wireplumber-rules.sh`.
 
 ---
 
@@ -239,6 +240,7 @@ Force-rate and quantum live on the **Output** and **Input** tabs (same per-devic
 - **Playback** rack — pin apps onto tracks; reclaim onto sticky preferred default after restart
 - **Input** rack — multi HW capture, shared with the desktop / other tracks
 - **Virtual system output / input** — expose tracks as sinks or post-FX capture sources
+- **Desktop lists** — only Master + System virtual outputs / inputs in pavucontrol; helpers use `Audio/Sink/Internal` (sealed, still ported). Optional: `scripts/install-wireplumber-rules.sh`
 - Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → hardware / Master`
 - **Device clocks** — sample rate / quantum per HW output and input (see above)
 - Live hotplug and warm adopt when the graph already matches the session

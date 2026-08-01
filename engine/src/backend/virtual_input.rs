@@ -92,6 +92,50 @@ fn sanitize_desc(d: &str) -> String {
     d.replace(' ', "_").replace('=', "_")
 }
 
+/// True when `feed.monitor` is linked into the remap capture stream.
+fn remap_hears_feed(feed: &str, vin: &str) -> bool {
+    let feed_mon = format!("{feed}.monitor");
+    let input = format!("input.{vin}");
+    if super::native::native_ready() {
+        if super::native::native_link_is_live(&feed_mon, &input)
+            || super::native::native_link_is_live(&feed_mon, vin)
+        {
+            return true;
+        }
+        // Native registry is authoritative when up — missing hop means bounce.
+        return false;
+    }
+    // Pulse-only fallback: require an explicit monitor→input.vin adjacency.
+    let Ok(out) = std::process::Command::new("pw-link")
+        .args(["-l"])
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mon_fl = format!("{feed}:monitor_FL");
+    let mut under_mon = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with(&mon_fl) && !t.contains("|->") && !t.contains("|<-") {
+            under_mon = true;
+            continue;
+        }
+        if under_mon {
+            if t.starts_with("|->") {
+                if t.contains(&input) || t.contains(vin) {
+                    return true;
+                }
+                continue;
+            }
+            if !t.starts_with("|") {
+                under_mon = false;
+            }
+        }
+    }
+    false
+}
+
 /// Ensure feed null-sink + remap-source for `bus` (`buschain_track_*`).
 pub fn ensure_virtual_input(bus: &str, description: &str, clock: &ClockProps) -> Result<()> {
     let Some((vin, feed)) = names_for_bus(bus) else {
@@ -103,20 +147,29 @@ pub fn ensure_virtual_input(bus: &str, description: &str, clock: &ClockProps) ->
         description: format!("{description}_VinFeed"),
         role: NodeRole::VirtualInputFeed,
         start_muted: false,
+        pulse_export: false,
     };
     ensure_null_sink(&feed_spec, clock)?;
-    // Feed must pass audio (null-sink helpers may start muted).
-    let _ = run_ok("pactl", &["set-sink-mute", &feed, "0"]);
-    let _ = run_ok("pactl", &["set-sink-volume", &feed, "100%"]);
+    // Feed must pass audio. Internal feeds are absent from pactl — use native.
+    if super::native::native_ready() {
+        let _ = super::native::native_set_levels(&feed, 0.0, false);
+    } else {
+        let _ = run_ok("pactl", &["set-sink-mute", &feed, "0"]);
+        let _ = run_ok("pactl", &["set-sink-volume", &feed, "100%"]);
+    }
 
     let master = format!("{feed}.monitor");
     let desc = sanitize_desc(description);
 
     if source_exists(&vin) {
-        let _ = push_description(&vin, &desc);
-        // Remap already present — master is fixed to feed.monitor; egress rewire
-        // updates what lands in the feed.
-        return Ok(());
+        // Remap module can stay loaded while feed.monitor→input.vin links were
+        // stripped (anti-Master wipe). Bounce so WirePlumber reattaches capture.
+        if remap_hears_feed(&feed, &vin) {
+            let _ = push_description(&vin, &desc);
+            return Ok(());
+        }
+        let _ = unload_remap_source(&vin);
+        std::thread::sleep(std::time::Duration::from_millis(40));
     }
 
     let props = format!(

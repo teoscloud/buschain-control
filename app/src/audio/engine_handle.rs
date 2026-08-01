@@ -151,11 +151,14 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             } else {
                 NodeRole::TrackBus
             };
+            // Master always public; tracks only when System virtual output is on.
+            let pulse_export = track.kind.is_master() || track.virtual_output;
             eng.desired_mut().ensure_bus(NodeSpec {
                 name: NodeName::new(&bus),
                 description: desc.clone(),
                 role,
                 start_muted: true,
+                pulse_export,
             });
             let mixer_mute =
                 track.mute || (any_solo && !track.solo && !track.kind.is_master());
@@ -173,7 +176,9 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                 dests.push(hw_sink.to_string());
             } else {
                 let mut targets = track.output_targets.clone();
-                if targets.is_empty() || track.listen {
+                // Listen (AFL) always adds Master. Empty Output to… stays empty —
+                // hold-only / intermediate bus (do not force Master).
+                if track.listen {
                     if let Some(mid) = master_id {
                         if !targets.contains(&mid) {
                             targets.push(mid);
@@ -192,9 +197,6 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                         }
                     }
                 }
-                if dests.is_empty() {
-                    dests.push("buschain_master".into());
-                }
                 // System virtual input: arm post/bus into feed sink (remap masters .monitor).
                 if track.virtual_input {
                     let feed = track.expected_virtual_input_feed_name();
@@ -204,7 +206,10 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                         description: format!("{desc}_VinFeed"),
                         role: NodeRole::VirtualInputFeed,
                         start_muted: false,
+                        pulse_export: false,
                     });
+                    // Explicit empty egress — heal must not default vinf→Master.
+                    eng.desired_mut().set_bus_egress(&feed, Vec::new());
                     eng.desired_mut()
                         .set_virtual_input(&bus, Some(vin_desc));
                     if !dests.iter().any(|d| d == &feed) {
@@ -507,7 +512,7 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
     let master_id = session.master_id();
     let mut dests = Vec::new();
     let mut targets = track.output_targets.clone();
-    if targets.is_empty() || track.listen {
+    if track.listen {
         if let Some(mid) = master_id {
             if !targets.contains(&mid) {
                 targets.push(mid);
@@ -525,9 +530,6 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
                 dests.push(dest);
             }
         }
-    }
-    if dests.is_empty() {
-        dests.push("buschain_master".into());
     }
     if track.virtual_input {
         let feed = track.expected_virtual_input_feed_name();
@@ -596,7 +598,22 @@ pub fn ensure_bus(name: &str, description: &str) -> anyhow::Result<()> {
     let role = role_for_name(name);
     let start_muted = matches!(role, NodeRole::TrackBus | NodeRole::MasterBus);
     with_engine(|eng| {
-        eng.ensure_bus(name, description, role, start_muted)?;
+        // Prefer Desired.pulse_export (VO flag from session sync) over role default.
+        let pulse_export = eng
+            .desired()
+            .buses
+            .get(name)
+            .map(|s| s.pulse_export)
+            .unwrap_or_else(|| role.default_pulse_export());
+        eng.apply(Intent::EnsureBus {
+            spec: NodeSpec {
+                name: NodeName::new(name),
+                description: description.into(),
+                role,
+                start_muted,
+                pulse_export,
+            },
+        })?;
         // Immediately open — never leave create-mute@0 for the UI / apps.
         let level = eng
             .desired()
@@ -612,8 +629,8 @@ pub fn ensure_bus(name: &str, description: &str) -> anyhow::Result<()> {
             description: description.into(),
             role,
             start_muted,
+            pulse_export,
         });
-        // open via reconcile helpers on backend
         let _ = eng.apply(Intent::SetLevels {
             sink: name.into(),
             gain_db: level.gain_db,
@@ -778,6 +795,23 @@ pub fn host_meter_peaks(bus: &str) -> Option<(f32, f32)> {
 /// In-process FX host is live for this bus (prefer host meters over Pulse).
 pub fn host_is_live(bus: &str) -> bool {
     buschain_engine::host::registry::host_is_live(bus)
+}
+
+/// Native dry-bus monitor peaks (no Pulse meter streams).
+pub fn dry_meter_peaks(bus: &str) -> Option<(f32, f32)> {
+    buschain_engine::host::dry_meter::dry_meter_peaks(bus)
+}
+
+pub fn dry_meter_is_live(bus: &str) -> bool {
+    buschain_engine::host::dry_meter::dry_meter_is_live(bus)
+}
+
+/// Ensure dry peak taps for buses without a live FX host.
+pub fn sync_dry_meters(buses: &[String]) {
+    with_engine(|eng| {
+        let clock = eng.clock().clone();
+        buschain_engine::host::dry_meter::sync_dry_meters(buses, &clock);
+    });
 }
 
 /// Keep FFT running for `bus` and return a spectrum snapshot (post-FX when `post`).

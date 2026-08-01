@@ -55,6 +55,9 @@ fn binary_is_generic(b: &str) -> bool {
     matches!(
         b.to_ascii_lowercase().as_str(),
         "electron"
+            | "chrome"
+            | "chromium"
+            | "chrome-sandbox"
             | "java"
             | "python"
             | "python3"
@@ -73,6 +76,14 @@ fn binary_is_generic(b: &str) -> bool {
     )
 }
 
+/// Electron/Chromium hardcode `application.name = "Chromium"` — useless as identity.
+fn name_is_generic(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "chromium" | "chrome" | "electron" | "playback"
+    ) || looks_like_stream_id_label(s)
+}
+
 fn looks_like_stream_id_label(s: &str) -> bool {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("Stream ") {
@@ -83,18 +94,19 @@ fn looks_like_stream_id_label(s: &str) -> bool {
 
 impl StreamNode {
     /// Stable assignment key — survives stream-index churn.
-    /// Prefer real process binary; for Electron/etc. prefer application name.
+    /// Prefer real process binary; for Electron/Chromium skip the shared "Chromium"
+    /// label and use application.id / real name so Equibop ≠ Brave ≠ Cider.
     pub fn app_key(&self) -> String {
         if let Some(b) = self.binary.as_deref().filter(|s| !s.is_empty()) {
             if !binary_is_generic(b) {
                 return format!("bin:{b}");
             }
         }
-        if !self.application.is_empty() && !looks_like_stream_id_label(&self.application) {
-            return format!("name:{}", self.application);
-        }
         if let Some(id) = self.app_id.as_deref().filter(|s| !s.is_empty()) {
             return format!("id:{id}");
+        }
+        if !self.application.is_empty() && !name_is_generic(&self.application) {
+            return format!("name:{}", self.application);
         }
         if let Some(b) = self.binary.as_deref().filter(|s| !s.is_empty()) {
             return format!("bin:{b}");
@@ -106,6 +118,16 @@ impl StreamNode {
     }
 
     pub fn display_name(&self) -> String {
+        // Electron hardcodes application.name="Chromium" — show the real binary/id.
+        if name_is_generic(&self.application) {
+            if let Some(b) = self.binary.as_deref().filter(|s| !s.is_empty() && !binary_is_generic(s))
+            {
+                return b.to_string();
+            }
+            if let Some(id) = self.app_id.as_deref().filter(|s| !s.is_empty()) {
+                return id.to_string();
+            }
+        }
         if !self.application.is_empty() && !looks_like_stream_id_label(&self.application) {
             if let Some(b) = self.binary.as_deref().filter(|s| !s.is_empty()) {
                 if binary_is_generic(b)
@@ -480,8 +502,17 @@ fn stream_from_props(index: u32, props: &[(String, String)], sink_key: &str) -> 
         .unwrap_or_else(|| format!("Stream {index}"));
 
     let name = media.clone().unwrap_or_else(|| application.clone());
+    let media_role = prop_key(props, "media.role").map(clean_pw_str);
+    // Desktop event streams — pavucontrol "System Sounds"; never Apps/reclaim bait.
+    let desktop_event = application.eq_ignore_ascii_case("System Sounds")
+        || restore == "sink-input-by-media-role:event"
+        || matches!(
+            media_role.as_deref().map(|r| r.to_ascii_lowercase()).as_deref(),
+            Some("event" | "notify" | "notification" | "alert")
+        );
 
     let internal = virtual_node
+        || desktop_event
         || node_name.as_deref().is_some_and(|n| {
             let nl = n.to_lowercase();
             n.starts_with("buschain_")
@@ -505,11 +536,12 @@ fn stream_from_props(index: u32, props: &[(String, String)], sink_key: &str) -> 
         || node_group.contains("filter-chain")
         || {
             let dest = prop(props, sink_key);
+            // Hold is migrate parking — keep user streams visible/reclaimable in Apps.
             dest.starts_with("buschain_fx_")
                 || dest.starts_with("buschain_post_")
                 || dest.starts_with("buschain_mid_")
                 || dest.starts_with("buschain_rs_")
-                || dest == "buschain_hold"
+                || dest.starts_with("buschain_mtr_")
         }
         || (media_class.contains("Stream/") && app_name.is_none() && binary.is_none() && virtual_node);
 
@@ -528,7 +560,36 @@ fn stream_from_props(index: u32, props: &[(String, String)], sink_key: &str) -> 
     }
 }
 
+/// Playback streams — native registry first (sees streams on `Audio/Sink/Internal`
+/// buses that pipewire-pulse hides), Pulse enrich for volume/mute + any stragglers.
 pub fn list_sink_inputs() -> Result<Vec<StreamNode>> {
+    if !buschain_engine::backend::native_ready() {
+        return list_sink_inputs_pulse();
+    }
+    let native = buschain_engine::backend::list_playback_streams();
+    if native.is_empty() {
+        // Registry warm-up or genuinely no streams — Pulse list is authoritative.
+        return list_sink_inputs_pulse();
+    }
+    let mut out: Vec<StreamNode> = native.iter().map(stream_node_from_native).collect();
+    if let Ok(pulse) = list_sink_inputs_pulse() {
+        for p in pulse {
+            if let Some(n) = out.iter_mut().find(|s| s.index == p.index) {
+                n.volume_pct = p.volume_pct;
+                n.mute = p.mute;
+                if n.sink_or_source.is_empty() {
+                    n.sink_or_source = p.sink_or_source;
+                }
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Pulse-only stream list (fallback / volume source).
+fn list_sink_inputs_pulse() -> Result<Vec<StreamNode>> {
     let sinks = list_sinks().unwrap_or_default();
     let blocks = parse_pactl_list("sink-inputs")?;
     Ok(blocks
@@ -544,6 +605,33 @@ pub fn list_sink_inputs() -> Result<Vec<StreamNode>> {
             s
         })
         .collect())
+}
+
+/// Build a StreamNode from the native registry via the same classification
+/// rules as the Pulse path (`stream_from_props`).
+fn stream_node_from_native(si: &buschain_engine::backend::PlaybackStreamInfo) -> StreamNode {
+    let mut props: Vec<(String, String)> = Vec::new();
+    let mut push = |k: &str, v: &Option<String>| {
+        if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
+            props.push((k.to_string(), v.to_string()));
+        }
+    };
+    push("application.name", &si.app_name);
+    push("application.process.binary", &si.binary);
+    push("application.id", &si.app_id);
+    push("media.name", &si.media_name);
+    push("application.icon_name", &si.icon_name);
+    push("media.role", &si.media_role);
+    if !si.node_name.is_empty() {
+        props.push(("node.name".into(), si.node_name.clone()));
+    }
+    if si.node_virtual {
+        props.push(("node.virtual".into(), "true".into()));
+    }
+    if !si.sink.is_empty() {
+        props.push(("Sink".into(), si.sink.clone()));
+    }
+    stream_from_props(si.serial, &props, "Sink")
 }
 
 pub fn list_source_outputs() -> Result<Vec<StreamNode>> {
@@ -689,10 +777,12 @@ pub fn set_sink_input_mute(index: u32, mute: bool) -> Result<()> {
 }
 
 pub fn move_sink_input(index: u32, sink: &str) -> Result<()> {
-    run_ok(
-        "pactl",
-        &["move-sink-input", &index.to_string(), sink],
-    )
+    // Native target.node first (works for Audio/Sink/Internal); Pulse fallback.
+    match buschain_engine::backend::pulse_compat::move_sink_input(index, sink) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(anyhow!("move sink-input {index} → {sink} failed")),
+        Err(e) => Err(e),
+    }
 }
 
 /// Move only when the stream is not already on `sink`.
@@ -714,6 +804,12 @@ pub fn move_sink_input_if_needed(index: u32, sink: &str, current: &str) -> Resul
                     return Ok(false);
                 }
             }
+        }
+    }
+    // Native registry: stream already targeting this node (Internal may lack Pulse name).
+    if buschain_engine::backend::native_ready() {
+        if let Ok(true) = buschain_engine::backend::stream_targets_sink(index, sink) {
+            return Ok(false);
         }
     }
     move_sink_input(index, sink)?;
@@ -788,6 +884,7 @@ fn is_buschain_sink_name(name: &str) -> bool {
         || name.starts_with("buschain_track_")
         || name.starts_with("buschain_fx_")
         || name.starts_with("buschain_mid_")
+        || name.starts_with("buschain_mtr_")
         || name.starts_with("buschain_post_")
         || name.starts_with("buschain_rs_")
         || name == "buschain_hold"
@@ -1051,7 +1148,7 @@ fn resolve_restore_hw_source() -> Option<String> {
         .map(|s| s.name)
 }
 
-/// Best-effort destroy for linger native nodes pactl unload missed.
+/// Best-effort destroy for BusChain nodes pactl unload missed (incl. Internal).
 /// Never pass Pulse sink indices to `pw-cli` — they are not PipeWire global ids.
 fn destroy_remaining_buschain_nodes() {
     let mut names: Vec<String> = list_sinks()
@@ -1067,6 +1164,7 @@ fn destroy_remaining_buschain_nodes() {
             .map(|s| s.name)
             .filter(|n| n.starts_with("buschain_") || n.starts_with("shadow_")),
     );
+    names.extend(buschain_pw_node_names());
     names.sort();
     names.dedup();
     for name in names {
@@ -1075,6 +1173,130 @@ fn destroy_remaining_buschain_nodes() {
             let _ = run_ok("pw-cli", &["destroy", &id.to_string()]);
         }
     }
+    // Second pass: destroy by id from a fresh pw-cli listing (Internal / hollow).
+    destroy_buschain_nodes_via_pw_cli();
+}
+
+/// All `buschain_*` / `shadow_*` node names from the PipeWire registry (Pulse-invisible too).
+fn buschain_pw_node_names() -> Vec<String> {
+    let Ok(out) = Command::new("pw-cli").args(["ls", "Node"]).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("node.name = \"") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix('"') else {
+            continue;
+        };
+        if name.starts_with("buschain_") || name.starts_with("shadow_") {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Destroy every BusChain/Shadow PipeWire node by global id (pw-cli).
+fn destroy_buschain_nodes_via_pw_cli() {
+    let Ok(out) = Command::new("pw-cli").args(["ls", "Node"]).output() else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_id: Option<u32> = None;
+    let mut kill: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("id ") {
+            current_id = rest
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("node.name = \"") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix('"') else {
+            continue;
+        };
+        if name.starts_with("buschain_") || name.starts_with("shadow_") {
+            if let Some(id) = current_id {
+                kill.push(id);
+            }
+        }
+    }
+    kill.sort_unstable();
+    kill.dedup();
+    for id in kill {
+        let _ = run_ok("pw-cli", &["destroy", &id.to_string()]);
+    }
+}
+
+/// Startup watchdog: destroy only *broken* leftovers (custom `BusChain/*` class
+/// or portless null sinks). Never wipe a healthy graph — a full destroy raced
+/// Supervisor Apply and deleted Master/VO right after create.
+pub fn sweep_orphan_buschain_at_startup() -> String {
+    let Ok(out) = Command::new("pw-cli").args(["ls", "Node"]).output() else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_id: Option<u32> = None;
+    let mut current_name = String::new();
+    let mut current_class = String::new();
+    let mut kill: Vec<(u32, String)> = Vec::new();
+    let flush = |id: Option<u32>,
+                 name: &str,
+                 class: &str,
+                 kill: &mut Vec<(u32, String)>| {
+        let Some(id) = id else { return };
+        if !name.starts_with("buschain_") && !name.starts_with("shadow_") {
+            return;
+        }
+        let broken_class = class == "BusChain/Internal" || class.starts_with("BusChain/");
+        if broken_class {
+            kill.push((id, name.to_string()));
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("id ") {
+            flush(current_id, &current_name, &current_class, &mut kill);
+            current_id = rest
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            current_name.clear();
+            current_class.clear();
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("node.name = \"") {
+            if let Some(n) = rest.strip_suffix('"') {
+                current_name = n.to_string();
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("media.class = \"") {
+            if let Some(c) = rest.strip_suffix('"') {
+                current_class = c.to_string();
+            }
+        }
+    }
+    flush(current_id, &current_name, &current_class, &mut kill);
+    if kill.is_empty() {
+        return String::new();
+    }
+    for (id, _) in &kill {
+        let _ = run_ok("pw-cli", &["destroy", &id.to_string()]);
+    }
+    format!(
+        "startup sweep: destroyed {} broken BusChain node(s)",
+        kill.len()
+    )
 }
 
 /// Hand PipeWire back to real hardware and destroy linger BusChain nodes.
@@ -1082,6 +1304,9 @@ fn destroy_remaining_buschain_nodes() {
 pub fn restore_system_audio(preferred_hw: Option<&str>) -> Result<String> {
     let hw_sink = resolve_restore_hw_sink(preferred_hw);
     let hw_src = resolve_restore_hw_source();
+
+    // Drop Pulse loopback clutter before moving apps off BusChain sinks.
+    let _ = buschain_engine::backend::unload_buschain_pulse_loopbacks();
 
     let mut moved = 0u32;
     if let Some(ref hw) = hw_sink {
@@ -1496,6 +1721,7 @@ fn teardown_track_bus(
         });
         let _ = eng.teardown_fx_chain(bus);
     });
+    buschain_engine::host::dry_meter::teardown_dry_meter(bus);
     let keep: std::collections::HashSet<String> = session
         .tracks
         .iter()
@@ -1766,10 +1992,12 @@ pub fn place_app_on_sink_with(
         &owned
     };
     let mut moved = 0u32;
+    let mut touched: Vec<u32> = Vec::new();
     for si in inputs {
         if !stream_matches_app_key(si, app_key) {
             continue;
         }
+        touched.push(si.index);
         if si.sink_or_source == sink {
             continue;
         }
@@ -1777,6 +2005,12 @@ pub fn place_app_on_sink_with(
             moved += 1;
         }
     }
+    // Soft verify: after a successful retarget, sink must exist in the native registry
+    // (Internal tracks are absent from pactl). Link settle is async — PlaceRetry covers miss.
+    if moved > 0 && !sink_exists(sink) {
+        return Err(anyhow!("place verify: sink `{sink}` missing after retarget"));
+    }
+    let _ = touched;
     Ok(moved)
 }
 
@@ -1943,8 +2177,6 @@ pub fn apply_session(
         }
     }
 
-    pin_session_buses(session)?;
-
     let hw_sink = resolve_hardware_output(session)?;
     crate::audio::engine_handle::remember_master_hw(&hw_sink);
     if let Ok(all_sinks) = list_sinks() {
@@ -1960,6 +2192,21 @@ pub fn apply_session(
         session.master_output = Some(hw_sink.clone());
     }
 
+    let mut warnings: Vec<String> = Vec::new();
+    // Sticky preferred + Desired (incl. VO pulse_export) *before* pin so ensure
+    // creates Master/VO as Audio/Sink and helpers as Audio/Sink/Internal.
+    if session.ensure_buschain_preferred_default() {
+        warnings.push(
+            session
+                .preferred_default_sink
+                .as_deref()
+                .map(|p| format!("preferred default restored → {p}"))
+                .unwrap_or_else(|| "preferred default restored".into()),
+        );
+    }
+    crate::audio::engine_handle::sync_desired_from_session(session, &hw_sink);
+    pin_session_buses(session)?;
+
     // Orphans only — never touches live session buses / streams on them.
     prune_orphan_buschain_track_sinks(session, fx);
 
@@ -1974,22 +2221,6 @@ pub fn apply_session(
     let mut kept = 0u32;
     let mut rebuilt = 0u32;
     let mut fx_count = 0u32;
-    let mut warnings: Vec<String> = Vec::new();
-
-    // Full: light prepare only — ArmSession owns FX + egress. The old path called
-    // rewire_track_route → fx_path_audible (engine + pw-link storms) per track and
-    // burned ~minute before the first ForceRespawn log line appeared.
-    // Sticky BusChain preferred before Desired sync so Arm/reclaim never targets HW.
-    if session.ensure_buschain_preferred_default() {
-        warnings.push(
-            session
-                .preferred_default_sink
-                .as_deref()
-                .map(|p| format!("preferred default restored → {p}"))
-                .unwrap_or_else(|| "preferred default restored".into()),
-        );
-    }
-    crate::audio::engine_handle::sync_desired_from_session(session, &hw_sink);
 
     // Hotplug/Route: one-shot Desired capture + egress — NEVER N× per-track
     // reconcile/ensure_loopback (that was the ~30s Add In lag).
