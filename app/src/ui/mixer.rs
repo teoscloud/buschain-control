@@ -521,6 +521,7 @@ fn draw_strip(
                     &mut gain,
                     design::STRIP_DB_MIN..=design::STRIP_DB_MAX,
                     Vec2::new(20.0, fader_draw_h),
+                    design::FaderStyle::Track,
                 )
                 .changed()
                 {
@@ -3468,6 +3469,7 @@ fn draw_equalizer_panel(
                         &mut out_gain,
                         -24.0..=24.0,
                         Vec2::new(30.0, 140.0),
+                        design::FaderStyle::Panel,
                     )
                     .changed()
                     {
@@ -3531,6 +3533,7 @@ fn draw_equalizer_panel(
                             &mut g,
                             -24.0..=24.0,
                             Vec2::new(28.0, 120.0),
+                            design::FaderStyle::Panel,
                         )
                         .changed()
                         {

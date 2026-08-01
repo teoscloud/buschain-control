@@ -216,41 +216,31 @@ impl AudioBackend for PipewireNativeBackend {
     }
 
     fn default_sink_name(&mut self) -> Option<String> {
-        if let Some(n) = session::default_sink_name() {
+        // Prefer Pulse truth — native metadata cache can claim success before WP/Pulse switch.
+        if let Some(n) = pulse_default_sink() {
             return Some(n);
         }
-        let out = std::process::Command::new("pactl")
-            .args(["info"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("Default Sink:") {
-                let name = rest.trim();
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
-        }
-        None
+        session::default_sink_name()
     }
 
     fn set_default_sink(&mut self, name: &str) -> Result<bool> {
-        if self.default_sink_name().as_deref() == Some(name) {
+        // Never short-circuit on engine cache alone while Pulse still shows HW.
+        if pulse_default_sink().as_deref() == Some(name) {
             return Ok(true);
         }
         if session::is_ready() {
-            if let Ok(true) = session::set_default_sink(name) {
+            // Metadata write is provisional — only succeed when Pulse agrees.
+            let _ = session::set_default_sink(name);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if pulse_default_sink().as_deref() == Some(name) {
                 return Ok(true);
             }
+            // Fall through to pactl/wpctl.
         }
         match run_ok("pactl", &["set-default-sink", name]) {
             Ok(()) => {
                 std::thread::sleep(std::time::Duration::from_millis(40));
-                Ok(self.default_sink_name().as_deref() == Some(name))
+                Ok(pulse_default_sink().as_deref() == Some(name))
             }
             Err(_) => Ok(false),
         }
@@ -297,6 +287,27 @@ fn list_devices_cli(kind: &str) -> Result<Vec<DeviceNode>> {
         });
     }
     Ok(v)
+}
+
+/// Live Pulse default sink (`pactl info`) — not the native metadata cache.
+fn pulse_default_sink() -> Option<String> {
+    let out = std::process::Command::new("pactl")
+        .args(["info"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Default Sink:") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn run_ok(bin: &str, args: &[&str]) -> Result<()> {

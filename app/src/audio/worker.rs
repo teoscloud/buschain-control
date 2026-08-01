@@ -288,7 +288,8 @@ impl AudioWorker {
         let (int_tx, int_rx) = mpsc::channel::<Command>();
         let (sup_tx, sup_rx) = mpsc::channel::<Command>();
         let (obs_tx, obs_rx) = mpsc::channel::<Command>();
-        let shared_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
+        let shared_session: Arc<Mutex<SharedSessionSlot>> =
+            Arc::new(Mutex::new(SharedSessionSlot::new()));
 
         let int_session = Arc::clone(&shared_session);
         let sup_session = Arc::clone(&shared_session);
@@ -832,21 +833,79 @@ fn flush_place_retries(
     }
 }
 
-fn publish_shared_session(shared: &Arc<Mutex<Option<Session>>>, session: &Option<Session>) {
-    if let Ok(mut g) = shared.lock() {
-        *g = session.clone();
+/// Cross-lane session mirror with monotonic generation so Interactive cannot
+/// clobber a newer Supervisor Apply (preferred default / virtual_output).
+struct SharedSessionSlot {
+    session: Option<Session>,
+    gen: u64,
+}
+
+impl SharedSessionSlot {
+    fn new() -> Self {
+        Self {
+            session: None,
+            gen: 0,
+        }
+    }
+}
+
+/// Non-authoritative publish: write session only when `local_gen` is not behind
+/// the shared slot (never overwrite a newer Supervisor Apply).
+fn publish_shared_session(
+    shared: &Arc<Mutex<SharedSessionSlot>>,
+    session: &Option<Session>,
+    local_gen: u64,
+) {
+    let Ok(mut g) = shared.lock() else {
+        return;
+    };
+    if g.gen > local_gen {
+        return;
+    }
+    g.session = session.clone();
+}
+
+/// Authoritative publish (Full Apply / SetDefaultSink preferred): bump gen.
+fn publish_shared_session_authority(
+    shared: &Arc<Mutex<SharedSessionSlot>>,
+    session: &Option<Session>,
+    local_gen: &mut u64,
+) {
+    let Ok(mut g) = shared.lock() else {
+        return;
+    };
+    let next = g.gen.saturating_add(1).max(local_gen.saturating_add(1));
+    g.gen = next;
+    g.session = session.clone();
+    *local_gen = next;
+}
+
+/// Adopt shared session when it is newer than `local_gen`.
+fn pull_shared_session_if_newer(
+    shared: &Arc<Mutex<SharedSessionSlot>>,
+    last_session: &mut Option<Session>,
+    local_gen: &mut u64,
+) {
+    let Ok(g) = shared.lock() else {
+        return;
+    };
+    if g.gen > *local_gen {
+        *last_session = g.session.clone();
+        *local_gen = g.gen;
     }
 }
 
 fn interactive_loop(
     rx: Receiver<Command>,
     tx: Sender<Event>,
-    shared_session: Arc<Mutex<Option<Session>>>,
+    shared_session: Arc<Mutex<SharedSessionSlot>>,
 ) {
     // Interactive: Class A/B only (mute/fader/Props/Capture/PlaceApp).
     let mut fx = FilterChainRuntime::new();
     let mut last_session: Option<Session> = None;
+    let mut session_gen: u64 = 0;
     let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
+    let mut default_reclaim_until: Option<Instant> = None;
     let midi_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
     let ms_sink = Arc::clone(&midi_session);
     let ms_bus = Arc::clone(&midi_session);
@@ -907,10 +966,11 @@ fn interactive_loop(
     loop {
         flush_props_retries(&mut props_retry);
         flush_place_retries(&mut place_retry, &tx);
+        pull_shared_session_if_newer(&shared_session, &mut last_session, &mut session_gen);
         if let Ok(mut g) = midi_session.lock() {
             *g = last_session.clone();
         }
-        publish_shared_session(&shared_session, &last_session);
+        publish_shared_session(&shared_session, &last_session, session_gen);
         poll_midi_actions(&tx, &last_session, &mut muted_buses);
 
         let first = match rx.recv_timeout(Duration::from_millis(250)) {
@@ -928,17 +988,20 @@ fn interactive_loop(
                         batch,
                         &mut fx,
                         &mut last_session,
+                        &mut session_gen,
+                        &shared_session,
                         &mut muted_buses,
                         &mut props_retry,
                         &mut place_retry,
+                        &mut default_reclaim_until,
                         &tx,
                         &fx_job_tx,
                         true,
                     ) {
-                        publish_shared_session(&shared_session, &last_session);
+                        publish_shared_session(&shared_session, &last_session, session_gen);
                         return;
                     }
-                    publish_shared_session(&shared_session, &last_session);
+                    publish_shared_session(&shared_session, &last_session, session_gen);
                     continue;
                 }
                 // Interactive idle: retries only. Supervisor = reconcile; Observer = snapshot.
@@ -957,27 +1020,31 @@ fn interactive_loop(
             batch,
             &mut fx,
             &mut last_session,
+            &mut session_gen,
+            &shared_session,
             &mut muted_buses,
             &mut props_retry,
             &mut place_retry,
+            &mut default_reclaim_until,
             &tx,
             &fx_job_tx,
             true,
         ) {
-            publish_shared_session(&shared_session, &last_session);
+            publish_shared_session(&shared_session, &last_session, session_gen);
             return;
         }
-        publish_shared_session(&shared_session, &last_session);
+        publish_shared_session(&shared_session, &last_session, session_gen);
     }
 }
 
 fn supervisor_loop(
     rx: Receiver<Command>,
     tx: Sender<Event>,
-    shared_session: Arc<Mutex<Option<Session>>>,
+    shared_session: Arc<Mutex<SharedSessionSlot>>,
 ) {
     let mut fx = FilterChainRuntime::new();
     let mut last_session: Option<Session> = None;
+    let mut session_gen: u64 = 0;
     let mut muted_buses: HashMap<String, bool> = HashMap::new();
     let mut props_retry: HashMap<String, PropsRetry> = HashMap::new();
     let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
@@ -986,21 +1053,19 @@ fn supervisor_loop(
     spawn_fx_ensure_thread(fx_job_rx, fx_done_tx);
     let mut idle_ticks: u32 = 0;
     let mut last_cmd_at = Instant::now();
+    // After Full Apply, reclaim a few more times while buschain sinks finish registering.
+    let mut default_reclaim_until: Option<Instant> = None;
     let _ = tx.send(Event::Status(
         "Worker ready — supervisor lane online".into(),
     ));
 
     loop {
-        if let Ok(g) = shared_session.lock() {
-            if g.is_some() {
-                last_session = g.clone();
-            }
-        }
+        pull_shared_session_if_newer(&shared_session, &mut last_session, &mut session_gen);
         while let Ok(done) = fx_done_rx.try_recv() {
             match done.result {
                 Ok(message) => {
                     merge_ensure_track(&mut last_session, &done.session, done.track_id);
-                    publish_shared_session(&shared_session, &last_session);
+                    publish_shared_session(&shared_session, &last_session, session_gen);
                     let bus = done
                         .session
                         .tracks
@@ -1039,16 +1104,19 @@ fn supervisor_loop(
                         batch,
                         &mut fx,
                         &mut last_session,
+                        &mut session_gen,
+                        &shared_session,
                         &mut muted_buses,
                         &mut props_retry,
                         &mut place_retry,
+                        &mut default_reclaim_until,
                         &tx,
                         &fx_job_tx,
                         false,
                     ) {
                         return;
                     }
-                    publish_shared_session(&shared_session, &last_session);
+                    publish_shared_session(&shared_session, &last_session, session_gen);
                     continue;
                 }
                 idle_ticks = idle_ticks.wrapping_add(1);
@@ -1073,7 +1141,35 @@ fn supervisor_loop(
                             });
                         }
                     }
-                    if idle_ticks % 120 == 0 && rx.try_recv().is_err() {
+                    let burst_reclaim = default_reclaim_until
+                        .is_some_and(|until| Instant::now() < until);
+                    if default_reclaim_until.is_some_and(|until| Instant::now() >= until) {
+                        default_reclaim_until = None;
+                    }
+                    let reclaim_now = if burst_reclaim {
+                        idle_ticks % 4 == 0
+                    } else {
+                        idle_ticks % 120 == 0
+                    };
+                    if reclaim_now && rx.try_recv().is_err() {
+                        // Burst: reassert Pulse default + reclaim apps onto sticky preferred.
+                        if burst_reclaim {
+                            if let Some(pref) = session.preferred_default_sink.as_deref() {
+                                match graph::set_default_sink_if_needed(pref) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        let _ = tx.send(Event::Status(format!(
+                                            "preferred default did not stick — retrying ({pref})"
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Event::Error(format!(
+                                            "preferred default: {e:#}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
                         match crate::audio::engine_handle::sync_playback(session) {
                             Ok(msg) if msg.contains("placed") => {
                                 let _ = tx.send(Event::Status(msg));
@@ -1100,16 +1196,19 @@ fn supervisor_loop(
             batch,
             &mut fx,
             &mut last_session,
+            &mut session_gen,
+            &shared_session,
             &mut muted_buses,
             &mut props_retry,
             &mut place_retry,
+            &mut default_reclaim_until,
             &tx,
             &fx_job_tx,
             false,
         ) {
             return;
         }
-        publish_shared_session(&shared_session, &last_session);
+        publish_shared_session(&shared_session, &last_session, session_gen);
     }
 }
 
@@ -1118,9 +1217,12 @@ fn process_command_batch(
     batch: Vec<Command>,
     mut fx: &mut FilterChainRuntime,
     last_session: &mut Option<Session>,
+    session_gen: &mut u64,
+    shared_session: &Arc<Mutex<SharedSessionSlot>>,
     muted_buses: &mut HashMap<String, bool>,
     props_retry: &mut HashMap<String, PropsRetry>,
     place_retry: &mut HashMap<String, PlaceRetry>,
+    default_reclaim_until: &mut Option<Instant>,
     tx: &Sender<Event>,
     fx_job_tx: &Sender<FxEnsureJob>,
     restore_on_shutdown: bool,
@@ -1250,7 +1352,45 @@ fn process_command_batch(
                     }
                     match graph::apply_session(&mut session, &mut fx, graph::ApplyKind::Full) {
                         Ok(message) => {
-                            // Resume: reassert preferred default + pull streams off HW/Hold.
+                            // Same post-steps as SetDefaultSink: preferred can already show as
+                            // the live default in the UI while Master→HW / apps still need a kick.
+                            if let Some(pref) = session.preferred_default_sink.clone() {
+                                crate::audio::engine_handle::with_engine(|eng| {
+                                    eng.desired_mut()
+                                        .set_preferred_default(Some(pref.clone()));
+                                });
+                                let stuck = match graph::set_default_sink_if_needed(&pref) {
+                                    Ok(true) => false,
+                                    Ok(false) => {
+                                        let _ = tx.send(Event::Status(format!(
+                                            "preferred default did not stick — retrying ({pref})"
+                                        )));
+                                        true
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Event::Error(format!(
+                                            "preferred default: {e:#}"
+                                        )));
+                                        true
+                                    }
+                                };
+                                if stuck {
+                                    thread::sleep(Duration::from_millis(80));
+                                    match graph::set_default_sink_if_needed(&pref) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            let _ = tx.send(Event::Status(format!(
+                                                "preferred default still pending ({pref})"
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(Event::Error(format!(
+                                                "preferred default retry: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
                             match crate::audio::engine_handle::sync_playback(&session) {
                                 Ok(msg) if msg.contains("placed") => {
                                     let _ = tx.send(Event::Status(msg));
@@ -1260,8 +1400,31 @@ fn process_command_batch(
                                     let _ = tx.send(Event::Error(format!("place streams: {e:#}")));
                                 }
                             }
+                            // Kick Master→HW repair so a BusChain default is actually audible.
+                            crate::audio::engine_handle::with_engine(|eng| {
+                                let _ = eng.reconcile_light();
+                            });
+                            if session
+                                .preferred_default_sink
+                                .as_deref()
+                                .is_some_and(|s| s.starts_with("buschain_"))
+                            {
+                                // Preferred sink / clients may appear a beat after Arm.
+                                *default_reclaim_until =
+                                    Some(Instant::now() + Duration::from_secs(10));
+                            }
                             *last_session = Some(session.clone());
-                            let _ = tx.send(Event::SessionApplied { session, message, kind: SessionAppliedKind::Other });
+                            // Authoritative: Interactive must not overwrite preferred/VO.
+                            publish_shared_session_authority(
+                                shared_session,
+                                last_session,
+                                session_gen,
+                            );
+                            let _ = tx.send(Event::SessionApplied {
+                                session,
+                                message,
+                                kind: SessionAppliedKind::Full,
+                            });
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                         }
                         Err(e) => {
@@ -1437,6 +1600,11 @@ fn process_command_batch(
                                 }
                             }
                             *last_session = Some(session.clone());
+                            publish_shared_session_authority(
+                                shared_session,
+                                last_session,
+                                session_gen,
+                            );
                             let _ = tx.send(Event::SessionApplied {
                                 session,
                                 message,
@@ -1690,6 +1858,7 @@ fn process_command_batch(
                     if let Some(ref mut s) = last_session {
                         s.preferred_default_sink = Some(name.clone());
                     }
+                    publish_shared_session_authority(shared_session, last_session, session_gen);
                     crate::audio::engine_handle::with_engine(|eng| {
                         eng.desired_mut()
                             .set_preferred_default(Some(name.clone()));
@@ -1702,6 +1871,8 @@ fn process_command_batch(
                             let _ = tx.send(Event::Status(format!(
                                 "default did not stick — retrying ({name})"
                             )));
+                            thread::sleep(Duration::from_millis(80));
+                            let _ = graph::set_default_sink_if_needed(&name);
                         }
                         Err(e) => {
                             let _ = tx.send(Event::Error(format!("set-default-sink: {e:#}")));
@@ -1723,6 +1894,10 @@ fn process_command_batch(
                     crate::audio::engine_handle::with_engine(|eng| {
                         let _ = eng.reconcile_light();
                     });
+                    if name.starts_with("buschain_") {
+                        *default_reclaim_until =
+                            Some(Instant::now() + Duration::from_secs(10));
+                    }
                     let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
                 }
                 Command::SetDefaultSource(name) => {
@@ -1763,7 +1938,17 @@ fn process_command_batch(
                     let _ = tx.send(Event::MidiSnapshot(snap));
                 }
                 Command::ApplyMidiConfig(session) => {
-                    *last_session = Some(session.clone());
+                    // MIDI-only merge — never replace preferred/VO with a pre-Ensure clone.
+                    match last_session.as_mut() {
+                        Some(local) => {
+                            local.midi_devices = session.midi_devices.clone();
+                            local.midi_routes = session.midi_routes.clone();
+                            local.midi_maps = session.midi_maps.clone();
+                        }
+                        None => {
+                            *last_session = Some(session.clone());
+                        }
+                    }
                     buschain_engine::midi::apply_intent_global(
                         buschain_engine::MidiIntent::ApplyConfig {
                             devices: session.midi_devices.clone(),

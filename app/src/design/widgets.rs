@@ -419,6 +419,18 @@ pub fn chip(ui: &mut Ui, theme: &dyn Theme, label: &str, filled: bool) {
 pub const STRIP_DB_MIN: f32 = -48.0;
 pub const STRIP_DB_MAX: f32 = 12.0;
 
+/// Cap / chrome scale for [`fader_db`] — independent of hit-rect width.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum FaderStyle {
+    /// Main mixer track strips — full console caps (even in narrow columns).
+    #[default]
+    Track,
+    /// Tray / QS popup mixer — smaller caps that fit compact strips.
+    Popup,
+    /// Plugin / EQ panel faders — medium, width-aware.
+    Panel,
+}
+
 /// Custom vertical fader (fixed rect — avoids egui Slider layout blowups).
 pub fn fader_db(
     ui: &mut Ui,
@@ -426,6 +438,7 @@ pub fn fader_db(
     value_db: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     size: Vec2,
+    style: FaderStyle,
 ) -> egui::Response {
     // Focusable drag target — steals pointer from parent strip widgets.
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
@@ -448,12 +461,20 @@ pub fn fader_db(
     };
 
     // Traditional console fader: narrow steel track, light metallic throw.
-    // Compact when the hit rect is tray-popup narrow (caps must not dominate).
-    let compact = size.x < 36.0;
-    let track_w = if compact {
-        (size.x * 0.18).clamp(3.0, 5.0)
-    } else {
-        (size.x * 0.22).clamp(4.0, 7.0)
+    // Style (not hit width) picks Track vs Popup chrome — tracks stay full-size
+    // even when the allocate rect is only ~20px wide.
+    let compact = matches!(style, FaderStyle::Popup)
+        || (matches!(style, FaderStyle::Panel) && size.x < 36.0);
+    let track_w = match style {
+        FaderStyle::Track => 5.0,
+        FaderStyle::Popup => (size.x * 0.18).clamp(3.0, 5.0),
+        FaderStyle::Panel => {
+            if compact {
+                (size.x * 0.18).clamp(3.0, 5.0)
+            } else {
+                (size.x * 0.22).clamp(4.0, 7.0)
+            }
+        }
     };
     let track = Rect::from_center_size(
         rect.center(),
@@ -468,8 +489,9 @@ pub fn fader_db(
     );
 
     // Scale ticks (behind fill/cap) — 0 dB is the major rail.
-    // Skip side ticks in compact popup strips (they skew visual centering).
+    // Popup: none. Track: unity rail only when the hit column is narrow.
     if !compact && lo < 0.0 && hi > 0.0 && track.height() > 40.0 {
+        let wide = size.x >= 36.0;
         let marks: &[(f32, bool)] = if span >= 36.0 {
             &[
                 (12.0, false),
@@ -489,13 +511,12 @@ pub fn fader_db(
             }
             let y = db_to_y(db);
             if is_zero {
-                // Full-width unity rail — easy to see on tall strips
                 painter.hline(
                     egui::Rangef::new(rect.left() + 1.0, rect.right() - 1.0),
                     y,
                     Stroke::new(2.0_f32, theme.accent()),
                 );
-                if rect.width() >= 40.0 {
+                if wide {
                     painter.text(
                         egui::pos2(rect.left() + 1.0, y),
                         egui::Align2::LEFT_CENTER,
@@ -504,7 +525,7 @@ pub fn fader_db(
                         theme.accent(),
                     );
                 }
-            } else {
+            } else if wide {
                 let tick_w = if db.abs() >= 24.0 { 3.0 } else { 4.5 };
                 painter.hline(
                     egui::Rangef::new(track.left() - tick_w, track.left() - 1.0),
@@ -534,14 +555,27 @@ pub fn fader_db(
     // Skeuomorphic console fader cap — tall rectangle, bevel + grip grooves.
     let at_zero = value_db.abs() < 0.05;
     let above_zero = *value_db > 0.05;
-    let (cap_w, cap_h) = if compact {
-        let w = (size.x * 0.50).clamp(9.0, 12.0);
-        let h = (w * 1.35).clamp(12.0, 16.0);
-        (w, h)
-    } else {
-        let w = (size.x * 0.82).clamp(15.0, 20.0);
-        let h = (w * 1.85).clamp(28.0, 38.0);
-        (w, h)
+    let (cap_w, cap_h) = match style {
+        FaderStyle::Track => {
+            // Fixed console size — not tied to narrow strip hit width.
+            (18.0, 34.0)
+        }
+        FaderStyle::Popup => {
+            let w = (size.x * 0.50).clamp(9.0, 12.0);
+            let h = (w * 1.35).clamp(12.0, 16.0);
+            (w, h)
+        }
+        FaderStyle::Panel => {
+            if compact {
+                let w = (size.x * 0.55).clamp(11.0, 14.0);
+                let h = (w * 1.45).clamp(16.0, 22.0);
+                (w, h)
+            } else {
+                let w = (size.x * 0.82).clamp(15.0, 20.0);
+                let h = (w * 1.85).clamp(28.0, 38.0);
+                (w, h)
+            }
+        }
     };
     let cap = Rect::from_center_size(egui::pos2(track.center().x, y), Vec2::new(cap_w, cap_h));
     let r = CornerRadius::same(if compact { 1 } else { 2 });
@@ -1041,6 +1075,8 @@ struct SoftclipVizState {
     dens: [f32; 48],
     /// Recent operating-point trail (input linear).
     trail: [f32; 24],
+    /// Band index for each trail sample (3D: follows live max-energy freq).
+    trail_band: [u16; 24],
     trail_i: u8,
     /// Smoothed input linear peak.
     in_smooth: f32,
@@ -1049,8 +1085,21 @@ struct SoftclipVizState {
     last_t: f64,
     mode: super::TransferVizMode,
     cam: super::Xfer3dCamera,
+    /// Bump to re-seed `cam` after default-orbit changes.
+    cam_rev: u8,
     band_smooth: [f32; super::BAND_N],
+    /// Dense log-Hz EQ curve (interpolated FFT) for 3D display.
+    curve_smooth: [f32; super::EQ_CURVE_N],
+    /// Smoothed Z of the live max-energy band (0..1).
+    peak_band_z: f32,
+    /// Per-band phosphor glow for 3D.
+    band_phos: [f32; super::BAND_N],
+    /// Per-band xin history: `band * BAND_PHOS_HIST + hist_i`.
+    band_hist: [f32; super::BAND_N * super::BAND_PHOS_HIST],
+    band_hist_i: u8,
 }
+
+const XFER_CAM_REV: u8 = 2;
 
 /// Soft-clipper transfer plot + live signal visualization.
 ///
@@ -1108,15 +1157,26 @@ pub fn softclip_transfer_plot(
         d.get_temp::<SoftclipVizState>(viz_id).unwrap_or(SoftclipVizState {
             dens: [0.0; 48],
             trail: [0.0; 24],
+            trail_band: [0; 24],
             trail_i: 0,
             in_smooth: 0.0,
             in_hold: 0.0,
             last_t: now,
             mode: super::TransferVizMode::TwoD,
             cam: super::Xfer3dCamera::default(),
+            cam_rev: XFER_CAM_REV,
             band_smooth: [0.0; super::BAND_N],
+            curve_smooth: [0.0; super::EQ_CURVE_N],
+            peak_band_z: 0.5,
+            band_phos: [0.0; super::BAND_N],
+            band_hist: [0.0; super::BAND_N * super::BAND_PHOS_HIST],
+            band_hist_i: 0,
         })
     });
+    if viz.cam_rev != XFER_CAM_REV {
+        viz.cam = super::Xfer3dCamera::default();
+        viz.cam_rev = XFER_CAM_REV;
+    }
     viz.mode = mode;
     let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
     viz.last_t = now;
@@ -1155,13 +1215,16 @@ pub fn softclip_transfer_plot(
     if in_inst > 1e-4 || viz.in_smooth > 0.02 {
         let i = viz.trail_i as usize % viz.trail.len();
         viz.trail[i] = viz.in_smooth;
+        // Band stamped in 3D once spectrum peak is known; keep last in 2D.
         viz.trail_i = viz.trail_i.wrapping_add(1);
     }
 
-    // ---- 3D frequency view (pre-FX spectrum → needles on extruded knee) ----
+    // ---- 3D frequency view (pre-FX spectrum → connected EQ on extruded knee) ----
     if matches!(viz.mode, super::TransferVizMode::ThreeD) {
         let mut band_hz = [0.0_f32; super::BAND_N];
         let mut band_raw = [0.0_f32; super::BAND_N];
+        let mut curve_hz = [0.0_f32; super::EQ_CURVE_N];
+        let mut curve_raw = [0.0_f32; super::EQ_CURVE_N];
         if let Some(frame) = spectrum {
             super::fill_log_bands_linear(
                 frame.sample_rate,
@@ -1169,10 +1232,20 @@ pub fn softclip_transfer_plot(
                 &mut band_hz,
                 &mut band_raw,
             );
+            super::fill_log_curve_linear(
+                frame.sample_rate,
+                &frame.mags,
+                &mut curve_hz,
+                &mut curve_raw,
+            );
         } else {
             for i in 0..super::BAND_N {
                 let t = (i as f32 + 0.5) / super::BAND_N as f32;
                 band_hz[i] = 20.0 * (20_000.0_f32 / 20.0).powf(t);
+            }
+            for i in 0..super::EQ_CURVE_N {
+                let t = i as f32 / (super::EQ_CURVE_N - 1) as f32;
+                curve_hz[i] = 20.0 * (20_000.0_f32 / 20.0).powf(t);
             }
         }
         let atk_b = 1.0 - (-dt * 28.0).exp();
@@ -1185,16 +1258,63 @@ pub fn softclip_transfer_plot(
                 viz.band_smooth[i] += (t - viz.band_smooth[i]) * rel_b;
             }
         }
+        let atk_c = 1.0 - (-dt * 32.0).exp();
+        let rel_c = 1.0 - (-dt * 6.5).exp();
+        for i in 0..super::EQ_CURVE_N {
+            let t = curve_raw[i];
+            if t > viz.curve_smooth[i] {
+                viz.curve_smooth[i] += (t - viz.curve_smooth[i]) * atk_c;
+            } else {
+                viz.curve_smooth[i] += (t - viz.curve_smooth[i]) * rel_c;
+            }
+        }
         let max_b = viz
             .band_smooth
             .iter()
             .copied()
             .fold(0.0_f32, f32::max)
             .max(1e-8);
+        let max_c = viz
+            .curve_smooth
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1e-8);
+        let mut peak_i = 0usize;
+        for i in 0..super::BAND_N {
+            if viz.band_smooth[i] >= viz.band_smooth[peak_i] {
+                peak_i = i;
+            }
+        }
+        let target_z = (peak_i as f32 + 0.5) / super::BAND_N as f32;
+        let follow = 1.0 - (-dt * 14.0).exp();
+        viz.peak_band_z += (target_z - viz.peak_band_z) * follow;
         let peak_scale = viz.in_smooth.max(in_inst).max(1e-4);
         let mut band_xin = [0.0_f32; super::BAND_N];
         for i in 0..super::BAND_N {
             band_xin[i] = (viz.band_smooth[i] / max_b) * peak_scale;
+        }
+        let mut curve_xin = [0.0_f32; super::EQ_CURVE_N];
+        for i in 0..super::EQ_CURVE_N {
+            curve_xin[i] = (viz.curve_smooth[i] / max_c) * peak_scale;
+        }
+        let _ = curve_hz;
+        let phos_decay = (-dt * 2.4).exp();
+        let hi = viz.band_hist_i as usize % super::BAND_PHOS_HIST;
+        for i in 0..super::BAND_N {
+            viz.band_phos[i] *= phos_decay;
+            let rel_e = viz.band_smooth[i] / max_b;
+            if rel_e > 0.015 {
+                // Boost quieter bands so phosphor is visible across the spectrum.
+                viz.band_phos[i] = (viz.band_phos[i] + 0.35 + 0.55 * rel_e).min(1.0);
+            }
+            viz.band_hist[i * super::BAND_PHOS_HIST + hi] = band_xin[i];
+        }
+        viz.band_hist_i = viz.band_hist_i.wrapping_add(1);
+        // Stamp newest trail sample with the live max band.
+        if viz.trail_i > 0 {
+            let last = viz.trail_i.wrapping_sub(1) as usize % viz.trail_band.len();
+            viz.trail_band[last] = peak_i as u16;
         }
         let thres_c = thres;
         let post_c = post;
@@ -1208,6 +1328,21 @@ pub fn softclip_transfer_plot(
             }
         };
         let past = |xin: f32| xin >= thres_c;
+        let phosphor = super::PhosphorTrail3d {
+            dens: &viz.dens,
+            trail: &viz.trail,
+            trail_band: &viz.trail_band,
+            trail_i: viz.trail_i,
+            in_smooth: viz.in_smooth,
+            in_hold: viz.in_hold,
+            silence: 1e-4,
+            peak_z: viz.peak_band_z,
+            band_xin: &band_xin,
+            curve_xin: &curve_xin,
+            band_phos: &viz.band_phos,
+            band_hist: &viz.band_hist,
+            band_hist_i: viz.band_hist_i,
+        };
         let _hover = super::paint_dynamics_xfer_3d(
             ui,
             theme,
@@ -1223,6 +1358,7 @@ pub fn softclip_transfer_plot(
             &gr,
             &past,
             false,
+            Some(&phosphor),
         );
         // Frame chrome labels outside plot
         let painter = ui.painter();
@@ -1241,8 +1377,10 @@ pub fn softclip_transfer_plot(
         );
         let mut changed = false;
         let mut resp = resp;
-        // Orbit uses plot interact; scroll still sets Threshold.
-        if apply_wheel_to_value(ui, &mut resp, threshold, 0.05..=0.999) {
+        // Scroll = camera zoom (Reverb parity); Ctrl+scroll = Threshold.
+        if ui.input(|i| i.modifiers.ctrl)
+            && apply_wheel_to_value(ui, &mut resp, threshold, 0.05..=0.999)
+        {
             changed = true;
         }
         ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));
@@ -1602,6 +1740,7 @@ fn limiter_xfer_db(level_db: f32, ceil_db: f32, knee_db: f32, makeup_db: f32) ->
 struct LimiterVizState {
     dens: [f32; 48],
     trail: [f32; 24],
+    trail_band: [u16; 24],
     trail_i: u8,
     in_smooth: f32,
     in_hold: f32,
@@ -1611,7 +1750,13 @@ struct LimiterVizState {
     last_t: f64,
     mode: super::TransferVizMode,
     cam: super::Xfer3dCamera,
+    cam_rev: u8,
     band_smooth: [f32; super::BAND_N],
+    curve_smooth: [f32; super::EQ_CURVE_N],
+    peak_band_z: f32,
+    band_phos: [f32; super::BAND_N],
+    band_hist: [f32; super::BAND_N * super::BAND_PHOS_HIST],
+    band_hist_i: u8,
 }
 
 /// Limiter transfer plot + GR history strip.
@@ -1689,6 +1834,7 @@ pub fn limiter_transfer_plot(
         d.get_temp::<LimiterVizState>(viz_id).unwrap_or(LimiterVizState {
             dens: [0.0; 48],
             trail: [0.0; 24],
+            trail_band: [0; 24],
             trail_i: 0,
             in_smooth: DB_MIN,
             in_hold: DB_MIN,
@@ -1697,9 +1843,19 @@ pub fn limiter_transfer_plot(
             last_t: now,
             mode: super::TransferVizMode::TwoD,
             cam: super::Xfer3dCamera::default(),
+            cam_rev: XFER_CAM_REV,
             band_smooth: [0.0; super::BAND_N],
+            curve_smooth: [0.0; super::EQ_CURVE_N],
+            peak_band_z: 0.5,
+            band_phos: [0.0; super::BAND_N],
+            band_hist: [0.0; super::BAND_N * super::BAND_PHOS_HIST],
+            band_hist_i: 0,
         })
     });
+    if viz.cam_rev != XFER_CAM_REV {
+        viz.cam = super::Xfer3dCamera::default();
+        viz.cam_rev = XFER_CAM_REV;
+    }
     viz.mode = mode;
     let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
     viz.last_t = now;
@@ -1749,6 +1905,8 @@ pub fn limiter_transfer_plot(
     if use_3d {
         let mut band_hz = [0.0_f32; super::BAND_N];
         let mut band_raw = [0.0_f32; super::BAND_N];
+        let mut curve_hz = [0.0_f32; super::EQ_CURVE_N];
+        let mut curve_raw = [0.0_f32; super::EQ_CURVE_N];
         if let Some(frame) = spectrum {
             super::fill_log_bands_linear(
                 frame.sample_rate,
@@ -1756,12 +1914,23 @@ pub fn limiter_transfer_plot(
                 &mut band_hz,
                 &mut band_raw,
             );
+            super::fill_log_curve_linear(
+                frame.sample_rate,
+                &frame.mags,
+                &mut curve_hz,
+                &mut curve_raw,
+            );
         } else {
             for i in 0..super::BAND_N {
                 let t = (i as f32 + 0.5) / super::BAND_N as f32;
                 band_hz[i] = 20.0 * (20_000.0_f32 / 20.0).powf(t);
             }
+            for i in 0..super::EQ_CURVE_N {
+                let t = i as f32 / (super::EQ_CURVE_N - 1) as f32;
+                curve_hz[i] = 20.0 * (20_000.0_f32 / 20.0).powf(t);
+            }
         }
+        let _ = curve_hz;
         let atk_b = 1.0 - (-dt * 28.0).exp();
         let rel_b = 1.0 - (-dt * 5.0).exp();
         for i in 0..super::BAND_N {
@@ -1772,16 +1941,60 @@ pub fn limiter_transfer_plot(
                 viz.band_smooth[i] += (t - viz.band_smooth[i]) * rel_b;
             }
         }
+        let atk_c = 1.0 - (-dt * 32.0).exp();
+        let rel_c = 1.0 - (-dt * 6.5).exp();
+        for i in 0..super::EQ_CURVE_N {
+            let t = curve_raw[i];
+            if t > viz.curve_smooth[i] {
+                viz.curve_smooth[i] += (t - viz.curve_smooth[i]) * atk_c;
+            } else {
+                viz.curve_smooth[i] += (t - viz.curve_smooth[i]) * rel_c;
+            }
+        }
         let max_b = viz
             .band_smooth
             .iter()
             .copied()
             .fold(0.0_f32, f32::max)
             .max(1e-8);
+        let max_c = viz
+            .curve_smooth
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1e-8);
+        let mut peak_i = 0usize;
+        for i in 0..super::BAND_N {
+            if viz.band_smooth[i] >= viz.band_smooth[peak_i] {
+                peak_i = i;
+            }
+        }
+        let target_z = (peak_i as f32 + 0.5) / super::BAND_N as f32;
+        let follow = 1.0 - (-dt * 14.0).exp();
+        viz.peak_band_z += (target_z - viz.peak_band_z) * follow;
         let peak_span = (viz.in_smooth - DB_MIN).max(0.0);
         let mut band_xin = [DB_MIN; super::BAND_N];
         for i in 0..super::BAND_N {
             band_xin[i] = DB_MIN + (viz.band_smooth[i] / max_b) * peak_span;
+        }
+        let mut curve_xin = [DB_MIN; super::EQ_CURVE_N];
+        for i in 0..super::EQ_CURVE_N {
+            curve_xin[i] = DB_MIN + (viz.curve_smooth[i] / max_c) * peak_span;
+        }
+        let phos_decay = (-dt * 2.4).exp();
+        let hi = viz.band_hist_i as usize % super::BAND_PHOS_HIST;
+        for i in 0..super::BAND_N {
+            viz.band_phos[i] *= phos_decay;
+            let rel_e = viz.band_smooth[i] / max_b;
+            if rel_e > 0.015 {
+                viz.band_phos[i] = (viz.band_phos[i] + 0.35 + 0.55 * rel_e).min(1.0);
+            }
+            viz.band_hist[i * super::BAND_PHOS_HIST + hi] = band_xin[i];
+        }
+        viz.band_hist_i = viz.band_hist_i.wrapping_add(1);
+        if viz.trail_i > 0 {
+            let last = viz.trail_i.wrapping_sub(1) as usize % viz.trail_band.len();
+            viz.trail_band[last] = peak_i as u16;
         }
         let ceil_c = ceil;
         let knee_c = knee;
@@ -1789,6 +2002,21 @@ pub fn limiter_transfer_plot(
         let xfer = |xin: f32| limiter_xfer_db(xin, ceil_c, knee_c, makeup_c);
         let gr = |xin: f32| limiter_gr_db(xin, ceil_c, knee_c);
         let past = |xin: f32| xin >= ceil_c - knee_c * 0.5;
+        let phosphor = super::PhosphorTrail3d {
+            dens: &viz.dens,
+            trail: &viz.trail,
+            trail_band: &viz.trail_band,
+            trail_i: viz.trail_i,
+            in_smooth: viz.in_smooth,
+            in_hold: viz.in_hold,
+            silence: DB_MIN + 0.5,
+            peak_z: viz.peak_band_z,
+            band_xin: &band_xin,
+            curve_xin: &curve_xin,
+            band_phos: &viz.band_phos,
+            band_hist: &viz.band_hist,
+            band_hist_i: viz.band_hist_i,
+        };
         let _hover = super::paint_dynamics_xfer_3d(
             ui,
             theme,
@@ -1804,6 +2032,7 @@ pub fn limiter_transfer_plot(
             &gr,
             &past,
             true,
+            Some(&phosphor),
         );
         let painter = ui.painter();
         painter.rect_stroke(
@@ -1821,7 +2050,10 @@ pub fn limiter_transfer_plot(
         );
         let mut changed = false;
         let mut resp = resp;
-        if apply_wheel_to_value(ui, &mut resp, ceiling_db, -24.0..=0.0) {
+        // Scroll = camera zoom (Reverb parity); Ctrl+scroll = Ceiling.
+        if ui.input(|i| i.modifiers.ctrl)
+            && apply_wheel_to_value(ui, &mut resp, ceiling_db, -24.0..=0.0)
+        {
             changed = true;
         }
         ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));

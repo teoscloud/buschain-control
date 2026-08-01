@@ -167,14 +167,8 @@ pub fn wait_until_show() -> HeadlessWait {
 }
 
 fn teardown_headless(mut state: AppState) {
-    // Same as window Quit — do not leave a dead buschain_* as the system default.
-    if let Some(hw) = state.session.master_output.clone() {
-        if !hw.starts_with("buschain_") {
-            state.session.preferred_default_sink = Some(hw);
-        }
-    } else {
-        state.session.preferred_default_sink = None;
-    }
+    // Same as window Quit — keep sticky buschain preferred; live restore is
+    // Shutdown → restore_system_audio (HW default + stream move-off).
     let _ = state.session.save();
     state.meters.shutdown();
     state.worker.send(WorkerCommand::Shutdown);

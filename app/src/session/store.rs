@@ -292,11 +292,18 @@ pub fn resolve_devices(
         report.push("Master HW auto-picked first hardware sink");
     }
 
-    // Preferred default — drop if gone (don't force to HW)
+    // Preferred default — drop missing HW names; keep sticky buschain_* across
+    // soft_bind gaps while the graph is still coming up after reopen.
     if let Some(pref) = session.preferred_default_sink.clone() {
         if !sink_names.iter().any(|(n, _)| n == &pref) {
-            report.push(format!("preferred default missing ({pref}) — cleared"));
-            session.preferred_default_sink = None;
+            if pref.starts_with("buschain_") {
+                report.push(format!(
+                    "preferred default ({pref}) not live yet — keeping sticky"
+                ));
+            } else {
+                report.push(format!("preferred default missing ({pref}) — cleared"));
+                session.preferred_default_sink = None;
+            }
         }
     }
 

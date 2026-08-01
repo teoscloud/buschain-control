@@ -422,6 +422,76 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// Best sticky BusChain sink to own as system default while the mixer is up.
+    /// Prefers a non-master virtual-output track, else `buschain_master`.
+    pub fn suggest_buschain_preferred(&self) -> Option<String> {
+        if let Some(t) = self
+            .tracks
+            .iter()
+            .find(|t| !t.kind.is_master() && t.virtual_output)
+        {
+            return Some(t.expected_sink_name());
+        }
+        if self.tracks.iter().any(|t| t.kind.is_master()) {
+            return Some("buschain_master".into());
+        }
+        None
+    }
+
+    /// True when `name` is a live session bus (master or any track sink).
+    pub fn is_known_buschain_sink(&self, name: &str) -> bool {
+        if !name.starts_with("buschain_") {
+            return false;
+        }
+        name == "buschain_master"
+            || self.tracks.iter().any(|t| t.expected_sink_name() == name)
+    }
+
+    /// While the session owns the mixer, preferred default must be a BusChain bus —
+    /// never leftover HW from Quit's live restore. Returns true when changed.
+    pub fn ensure_buschain_preferred_default(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(pref) = self.preferred_default_sink.clone() {
+            if self.is_known_buschain_sink(&pref) {
+                // Set-default UI also flips virtual_output — keep that sticky so the
+                // track stays a real system sink after restart (not just highlighted).
+                if pref.starts_with("buschain_track_") {
+                    if let Some(t) = self
+                        .tracks
+                        .iter_mut()
+                        .find(|t| t.expected_sink_name() == pref)
+                    {
+                        if !t.virtual_output {
+                            t.virtual_output = true;
+                            changed = true;
+                        }
+                    }
+                }
+                return changed;
+            }
+        }
+        let next = self.suggest_buschain_preferred();
+        if self.preferred_default_sink != next {
+            self.preferred_default_sink = next.clone();
+            changed = true;
+        }
+        if let Some(pref) = next {
+            if pref.starts_with("buschain_track_") {
+                if let Some(t) = self
+                    .tracks
+                    .iter_mut()
+                    .find(|t| t.expected_sink_name() == pref)
+                {
+                    if !t.virtual_output {
+                        t.virtual_output = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Whether this track exposes a system virtual input (capture source).
     pub fn is_virtual_input(&self, track_id: Uuid) -> bool {
         self.tracks

@@ -1979,6 +1979,16 @@ pub fn apply_session(
     // Full: light prepare only — ArmSession owns FX + egress. The old path called
     // rewire_track_route → fx_path_audible (engine + pw-link storms) per track and
     // burned ~minute before the first ForceRespawn log line appeared.
+    // Sticky BusChain preferred before Desired sync so Arm/reclaim never targets HW.
+    if session.ensure_buschain_preferred_default() {
+        warnings.push(
+            session
+                .preferred_default_sink
+                .as_deref()
+                .map(|p| format!("preferred default restored → {p}"))
+                .unwrap_or_else(|| "preferred default restored".into()),
+        );
+    }
     crate::audio::engine_handle::sync_desired_from_session(session, &hw_sink);
 
     // Hotplug/Route: one-shot Desired capture + egress — NEVER N× per-track

@@ -384,9 +384,11 @@ command -v buschain-plugin-surface
 
 **Mitigations in tree:**
 
-- Quit / Teardown → `restore_system_audio` + linger destroy; persist HW preferred on quit
+- Quit / Teardown → `restore_system_audio` + linger destroy; **keep sticky `preferred_default_sink` as buschain_*** across quit (live PW default still restored to HW). Reopen reasserts preferred + reclaim burst so apps rewire without clicking System default.
+- **Dual-lane preferred ownership:** Supervisor Full Apply publishes an authoritative shared-session generation after `ensure_buschain_preferred_default`. Interactive must not overwrite a newer gen (ApplyMidiConfig is MIDI-only merge). Supervisor only adopts shared when `shared.gen >= local.gen`. Reopen is not done until Pulse `Default Sink` matches sticky `buschain_*` and reclaim has run.
+- **Verify-after-set:** native metadata set-default is provisional; success requires Pulse (`pactl info`) agreement, else fall through to pactl/wpctl. Apply + ~10s reclaim burst retry both `set_default_sink_if_needed` and `sync_playback`.
 - Surgical commits (`EnsureTrack` / `Route` / `VirtualInput` / `FxRewire`) **never** escalate to Full Apply when the snapshot looks cold — only `Reconcile` may ArmSession
-- Preferred `buschain_*` default: while the session owns the graph, keep asserting preferred (e.g. Linux track virtual out) even if Master→HW is healing — do **not** force Scarlett mid-session. HW restore + stream move-off is Quit/Teardown only. Playback reclaim pulls unpinned / Hold / HW apps onto preferred when that sink exists.
+- Preferred `buschain_*` default: while the session owns the graph, keep asserting preferred (e.g. Linux track virtual out) even if Master→HW is healing — do **not** force Scarlett mid-session. HW restore + stream move-off is Quit/Teardown only. Playback reclaim pulls unpinned / Hold / HW apps onto preferred when that sink exists. soft_bind does **not** clear missing `buschain_*` preferred while the graph is coming up.
 - Capture is **shared** (`exclusive: false`); Desired `bus_inputs` reconcile + sink-side unlink
 - Wet Master hold mid-build fail-opens dry Master→HW after ~2s
 - Session load prune uses the same `teardown_track_bus` as UI delete (`destroy_node` + virtual-input teardown)

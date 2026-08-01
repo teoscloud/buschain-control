@@ -1556,14 +1556,14 @@ impl AppState {
                     kind,
                 } => {
                     // Typed policy — no message.contains for adopt vs patch.
+                    // Full Apply uses SessionAppliedKind::Full (not "Graph OK" string match).
                     let patch_sinks_only = matches!(
                         kind,
                         SessionAppliedKind::Ensure
                             | SessionAppliedKind::FxRewire
                             | SessionAppliedKind::Route
                             | SessionAppliedKind::Levels
-                    ) || message.starts_with("Graph OK")
-                        || message.contains("Removed bus")
+                    ) || message.contains("Removed bus")
                         || message.starts_with("Prune");
                     if patch_sinks_only {
                         for t in &session.tracks {
@@ -1575,12 +1575,11 @@ impl AppState {
                                 }
                             }
                         }
-                        let graph_ok = message.starts_with("Graph OK");
                         self.status = message;
                         if self.viz_live {
                             self.sync_meter_targets();
                         }
-                        if graph_ok || self.graph_is_live() {
+                        if self.graph_is_live() {
                             self.graph_loading = false;
                         }
                         continue;
@@ -1594,7 +1593,25 @@ impl AppState {
                     if structural {
                         let prev_rate = self.session.performance.sample_rate;
                         let prev_q = self.session.performance.quantum;
+                        let prev_pref = self.session.preferred_default_sink.clone();
+                        let prev_vo: HashMap<_, _> = self
+                            .session
+                            .tracks
+                            .iter()
+                            .map(|t| (t.id, t.virtual_output))
+                            .collect();
                         self.adopt_session(session);
+                        // Persist ensure-flipped preferred / virtual_output after Full Apply.
+                        let pref_changed =
+                            self.session.preferred_default_sink != prev_pref;
+                        let vo_changed = self.session.tracks.iter().any(|t| {
+                            prev_vo.get(&t.id).copied() != Some(t.virtual_output)
+                        });
+                        if matches!(kind, SessionAppliedKind::Full)
+                            && (pref_changed || vo_changed)
+                        {
+                            let _ = self.session.save();
+                        }
                         let clockish = matches!(kind, SessionAppliedKind::Clock)
                             || prev_rate != self.session.performance.sample_rate
                             || prev_q != self.session.performance.quantum;

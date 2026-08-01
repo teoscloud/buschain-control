@@ -891,10 +891,13 @@ fn do_set_default_sink(st: &CtrlState, name: &str) -> Result<bool> {
         Some("Spa:String:JSON"),
         Some(&json),
     );
+    // Optimistic cache only — callers must verify via Pulse (`pactl info`) and
+    // fall through to pactl/wpctl when metadata alone does not stick.
     st.local.borrow_mut().default_audio_sink = Some(name.to_string());
     if let Ok(mut g) = st.shared.write() {
         g.default_audio_sink = Some(name.to_string());
     }
+    // Provisional success: metadata accepted. Pulse verify lives in NativeBackend.
     Ok(true)
 }
 

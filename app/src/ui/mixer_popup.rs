@@ -269,6 +269,7 @@ fn strip_fader(
                         &mut db,
                         design::STRIP_DB_MIN..=design::STRIP_DB_MAX,
                         FADER_SIZE,
+                        design::FaderStyle::Popup,
                     );
                     if resp.changed() {
                         *ui_vol = db_to_ui(db);
