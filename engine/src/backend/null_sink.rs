@@ -98,8 +98,14 @@ fn create_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
         return super::native::session_ensure_null_sink(spec, clock);
     }
     let export = if spec.pulse_export { "true" } else { "false" };
+    // Post (and app-bus fallback): fader must affect `.monitor` egress.
+    let mon_vols = if is_app_bus || matches!(spec.role, NodeRole::PostBus) {
+        " monitor.channel-volumes=true"
+    } else {
+        ""
+    };
     let props = format!(
-        "sink_properties=device.description={} media.name=buschain-control media.class={} buschain.pulse.export={} session.suspend-timeout-seconds={} node.virtual=true node.latency={} audio.rate={} node.force-quantum={} node.lock-quantum={}",
+        "sink_properties=device.description={} media.name=buschain-control media.class={} buschain.pulse.export={} session.suspend-timeout-seconds={} node.virtual=true node.latency={} audio.rate={} node.force-quantum={} node.lock-quantum={}{}",
         sanitize_desc(&spec.description),
         spec.media_class(),
         export,
@@ -108,6 +114,7 @@ fn create_null_sink(spec: &NodeSpec, clock: &ClockProps) -> Result<()> {
         clock.sample_rate,
         clock.quantum,
         if clock.soft_quantum { "false" } else { "true" },
+        mon_vols,
     );
 
     run_ok(

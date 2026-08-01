@@ -863,6 +863,14 @@ fn begin_ensure_null_sink_create(
     let name = spec.name.as_str().to_string();
     let media_class = spec.media_class();
     let pulse_export = if spec.pulse_export { "true" } else { "false" };
+    // Fader stage is the post bus (after inserts). App buses stay unity;
+    // Track/Master also keep monitor vols for dry-before-post fallback.
+    let monitor_vols = matches!(
+        spec.role,
+        crate::domain::NodeRole::TrackBus
+            | crate::domain::NodeRole::MasterBus
+            | crate::domain::NodeRole::PostBus
+    );
     let node = match st.core.create_object::<pw::node::Node>(
         "adapter",
         &properties! {
@@ -883,6 +891,7 @@ fn begin_ensure_null_sink_create(
             "session.suspend-timeout-seconds" => clock.suspend_timeout.to_string(),
             "device.description" => spec.description.as_str(),
             "buschain.pulse.export" => pulse_export,
+            "monitor.channel-volumes" => if monitor_vols { "true" } else { "false" },
         },
     ) {
         Ok(n) => n,

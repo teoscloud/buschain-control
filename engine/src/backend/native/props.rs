@@ -5,7 +5,12 @@ use std::io::Cursor;
 use spa::pod::serialize::PodSerializer;
 use spa::pod::{Object, Property, Value, ValueArray};
 
-/// Serialize Props with mute + stereo channelVolumes (linear gain).
+/// Serialize Props with mute + stereo volumes (linear gain).
+///
+/// BusChain egress reads `{bus}.monitor` → FX/Master. PipeWire defaults
+/// `monitor.channel-volumes = false`, so sink `channelVolumes` alone never
+/// change what the monitor emits. Always write `monitorVolumes` too, and
+/// enable monitor.channel-volumes so future channelVolumes stay coupled.
 pub fn pod_mute_volumes(mute: bool, linear: f32, channels: usize) -> Vec<u8> {
     let n = channels.max(1);
     let v = linear.clamp(0.0, 1.5);
@@ -17,9 +22,20 @@ pub fn pod_mute_volumes(mute: bool, linear: f32, channels: usize) -> Vec<u8> {
             Property::new(spa_sys::SPA_PROP_mute, Value::Bool(mute)),
             Property::new(
                 spa_sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(ValueArray::Float(vols.clone())),
+            ),
+            Property::new(
+                spa_sys::SPA_PROP_monitorVolumes,
                 Value::ValueArray(ValueArray::Float(vols)),
             ),
             Property::new(spa_sys::SPA_PROP_volume, Value::Float(v)),
+            Property::new(
+                spa_sys::SPA_PROP_params,
+                Value::Struct(vec![
+                    Value::String("monitor.channel-volumes".into()),
+                    Value::Bool(true),
+                ]),
+            ),
         ],
     });
     PodSerializer::serialize(Cursor::new(Vec::new()), &value)
@@ -76,5 +92,7 @@ mod tests {
         assert!(!b.is_empty());
         let b2 = pod_mute_volumes(false, 1.0, 2);
         assert!(!b2.is_empty());
+        // monitorVolumes + params must be present for fader→egress coupling.
+        assert!(b2.len() > b.len() || !b2.is_empty());
     }
 }

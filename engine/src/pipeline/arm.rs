@@ -141,7 +141,10 @@ fn dests_linked(src: &str, dests: &[String]) -> bool {
     any
 }
 
-/// True dry: no FX host. Strips post outs and links bus.monitor → dests.
+/// True dry: no FX host.
+///
+/// When a post fader stage exists: `bus.monitor → post → dests` (volume last).
+/// Otherwise legacy `bus.monitor → dests`.
 fn arm_dry_to_dests(
     backend: &mut dyn AudioBackend,
     bus: &str,
@@ -150,6 +153,36 @@ fn arm_dry_to_dests(
     dests: &[String],
 ) -> Result<()> {
     let mtr = mtr_name_for_bus(bus);
+    let post = live_post_name(bus);
+    if sink_exists(&post) {
+        // Already correctly armed through the fader stage?
+        if dests_linked(post_mon, dests)
+            && link_is_live(from, &post)
+            && !dests
+                .iter()
+                .any(|d| !d.is_empty() && link_is_live(from, d))
+        {
+            let _ = backend.ensure_link_raw(from, "buschain_hold");
+            return Ok(());
+        }
+        let allow_bus = [post.as_str(), "buschain_hold", mtr.as_str()];
+        let _ = backend.unlink_from_source_except(from, &allow_bus);
+        let _ = backend.ensure_link_raw(from, "buschain_hold");
+        let _ = backend.ensure_link_raw(from, &post);
+        let allow_post: Vec<&str> = dests
+            .iter()
+            .map(|s| s.as_str())
+            .chain(["buschain_hold"])
+            .collect();
+        let _ = backend.unlink_from_source_except(post_mon, &allow_post);
+        for d in dests {
+            if d.is_empty() || !sink_exists(d) {
+                continue;
+            }
+            backend.ensure_link_raw(post_mon, d)?;
+        }
+        return Ok(());
+    }
     if dests_linked(from, dests)
         && !dests
             .iter()
@@ -177,6 +210,9 @@ fn arm_dry_to_dests(
 
 /// Audible dry while FX spine is settling — **must keep bus→fx** or the sealed
 /// chain can never form (dry unlink used to strip fx permanently).
+///
+/// Dry parallel prefers `bus→post→dest` (fader last) when post exists; falls
+/// back to `bus→dest` only when there is no post stage yet.
 fn arm_dry_preserving_fx(
     backend: &mut dyn AudioBackend,
     bus: &str,
@@ -186,8 +222,28 @@ fn arm_dry_preserving_fx(
     dests: &[String],
 ) -> Result<()> {
     let mtr = mtr_name_for_bus(bus);
+    let post = live_post_name(bus);
     let _ = backend.ensure_link_raw(from, fx);
     let _ = backend.ensure_link_raw(from, "buschain_hold");
+    if sink_exists(&post) {
+        // Bypass-FX dry into the fader stage until wet fx→post lands.
+        let _ = backend.ensure_link_raw(from, &post);
+        let allow: Vec<&str> = [fx, post.as_str(), "buschain_hold", mtr.as_str()]
+            .into_iter()
+            .collect();
+        let _ = backend.unlink_from_source_except(from, &allow);
+        for d in dests {
+            if d.is_empty() || !sink_exists(d) {
+                continue;
+            }
+            // Drop any pre-fader bus→dest leak.
+            if link_is_live(from, d) {
+                let _ = backend.unlink_raw(from, d);
+            }
+            let _ = backend.ensure_link_raw(post_mon, d);
+        }
+        return Ok(());
+    }
     // Don't strip post→dest if somehow live — soft path owns that.
     let allow: Vec<&str> = dests
         .iter()

@@ -310,7 +310,22 @@ impl Engine {
                 gain_db,
                 muted,
             } => {
-                self.backend.set_levels(&sink, gain_db, muted)?;
+                // Keep Desired in sync so idle reconcile cannot snap faders
+                // back to a stale/default 0 dB after a Class-A drag.
+                let mixer_mute = self
+                    .desired
+                    .bus_levels
+                    .get(&sink)
+                    .map(|l| l.mixer_mute)
+                    .unwrap_or(false);
+                self.desired.set_bus_level(
+                    &sink,
+                    crate::plan::BusLevel {
+                        gain_db,
+                        mixer_mute,
+                    },
+                );
+                self.apply_track_fader(&sink, gain_db, muted)?;
             }
             Intent::PushProps { node, props } => {
                 self.backend.set_props(&node, &props)?;
@@ -325,7 +340,16 @@ impl Engine {
                 if spec.bus.as_str() == "buschain_master" && !spec.dest.is_empty() {
                     self.remember_master_hw(&spec.dest);
                 }
+                let bus = spec.bus.as_str().to_string();
                 let state = self.ensure_fx_chain(spec, mode)?;
+                // Post may have been (re)created at unity — restore fader last.
+                let gain = self
+                    .desired
+                    .bus_levels
+                    .get(&bus)
+                    .map(|l| l.gain_db)
+                    .unwrap_or(0.0);
+                let _ = self.apply_track_fader(&bus, gain, false);
                 match &state {
                     ChainState::Wet(w) => {
                         report.push(format!(
@@ -1164,20 +1188,21 @@ impl Engine {
                         }
                     }
                 }
-            } else if sink_exists(&post) {
-                // No inserts Desired but post linger — strip post outs.
-                let _ = self.backend.unlink_from_source_except(&post_mon, &[]);
-                report.push(format!("prune orphan post {post}"));
+            } else if sink_exists(&post) && !self.mixer_muted(bus) {
+                // Empty insert rack — post is the fader stage; keep dry post→dests.
+                match self.arm_track_egress(bus, false, &dests) {
+                    Ok(()) => {}
+                    Err(e) => report.push(format!("dry post-fader arm {bus}: {e:#}")),
+                }
             }
         }
     }
 
-    /// Re-arm `bus→dest` for dry buses whose egress link went missing.
+    /// Re-arm dry egress whose link went missing.
     ///
-    /// `prune_parallel_fx_routes` only walks `fx_chains`, and a track with zero
-    /// inserts never gets a chain spec — so nothing re-armed its egress after a
-    /// sweep / WirePlumber restart / device recreate. The strip kept metering
-    /// (mtr tap + hold are separate links) while being silent to Master.
+    /// Prefers `post→dest` (fader last) when the post stage exists; otherwise
+    /// `bus→dest`. `prune_parallel_fx_routes` only walks `fx_chains`, so tracks
+    /// with zero inserts still need this heal after sweeps / device recreate.
     fn heal_dry_egress(&mut self, report: &mut ApplyReport) {
         // Master has its own heal (HW + speakers_armed barrier) below.
         // Only real track buses — never vin-feed / helpers (their monitor must
@@ -1201,7 +1226,28 @@ impl Engine {
                 continue;
             }
             let from = format!("{bus}.monitor");
-            for d in self.desired.egress_dests(&bus) {
+            let post = live_post_name(&bus);
+            let post_mon = format!("{post}.monitor");
+            let dests = self.desired.egress_dests(&bus);
+            if sink_exists(&post) {
+                let _ = self.backend.ensure_link_raw(&from, &post);
+                for d in &dests {
+                    if d.is_empty() || !sink_exists(d) {
+                        continue;
+                    }
+                    if link_is_live(&from, d) {
+                        let _ = self.backend.unlink_raw(&from, d);
+                    }
+                    if link_is_live(&post_mon, d) {
+                        continue;
+                    }
+                    if self.backend.ensure_link_raw(&post_mon, d).is_ok() {
+                        report.push(format!("heal dry egress {bus}→{d} (post-fader)"));
+                    }
+                }
+                continue;
+            }
+            for d in dests {
                 if d.is_empty() || !sink_exists(&d) || link_is_live(&from, &d) {
                     continue;
                 }
@@ -1274,15 +1320,18 @@ impl Engine {
                 .get(&name)
                 .copied()
                 .unwrap_or_default();
-            // Keep app sink open at fader gain (never cork). Mute = egress silence.
-            let _ = self.backend.open_bus_gain(&name, level.gain_db);
+            // Track/Master: fader lives on post (after inserts). App sink stays unity.
+            if matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus) {
+                let _ = self.ensure_track_fader_post(&name);
+                let _ = self.apply_track_fader(&name, level.gain_db, false);
+                self.applied_monitor_mute
+                    .insert(name.clone(), level.mixer_mute);
+            } else if !matches!(spec.role, NodeRole::PostBus) {
+                let _ = self.backend.open_bus_gain(&name, level.gain_db);
+            }
             // Idle/reconcile must NEVER call gate_track_mute here — unmute arm is
             // ~800ms/bus (CLI unlink) and was re-run every idle + after every Route,
             // starving Add In for minutes. Mute keep is reapply_muted_egress only.
-            if matches!(spec.role, NodeRole::TrackBus | NodeRole::MasterBus) {
-                self.applied_monitor_mute
-                    .insert(name.clone(), level.mixer_mute);
-            }
         }
         self.reconcile_virtual_inputs(&mut report);
         Ok(report)
@@ -2276,15 +2325,59 @@ impl Engine {
         }
     }
 
-    /// True when dry bus.monitor→dests or wet post→dests is live (native when ready).
+    /// Ensure the post-FX fader stage null-sink for a track/master bus.
+    fn ensure_track_fader_post(&mut self, bus: &str) -> Result<()> {
+        if bus != "buschain_master" && !bus.starts_with("buschain_track_") {
+            return Ok(());
+        }
+        let post = post_name_for_bus(bus);
+        let clock = self.desired.clock.clone();
+        self.backend
+            .ensure_node(
+                &NodeSpec {
+                    name: crate::domain::NodeName::new(&post),
+                    description: format!(
+                        "BusChainControl_Post_{}",
+                        crate::domain::bus_suffix(bus)
+                    ),
+                    role: NodeRole::PostBus,
+                    start_muted: false,
+                    pulse_export: false,
+                },
+                &clock,
+            )
+            .map(|_| ())
+    }
+
+    /// Apply mixer fader **after** inserts: unity on the app bus, gain on post.
+    /// Falls back to the app bus only when no post stage exists yet.
+    fn apply_track_fader(&mut self, bus: &str, gain_db: f32, muted: bool) -> Result<()> {
+        let is_app = bus == "buschain_master" || bus.starts_with("buschain_track_");
+        if !is_app {
+            return self.backend.set_levels(bus, gain_db, muted);
+        }
+        let _ = self.ensure_track_fader_post(bus);
+        let post = live_post_name(bus);
+        if sink_exists(&post) {
+            // App-facing sink stays open at unity (never cork Chromium / apps).
+            let _ = self.backend.open_bus_gain(bus, 0.0);
+            self.backend.set_levels(&post, gain_db, muted)?;
+        } else {
+            self.backend.set_levels(bus, gain_db, muted)?;
+        }
+        Ok(())
+    }
+
+    /// True when dry bus/post→dests or wet post→dests is live (native when ready).
     /// Requires **all** existing Desired dests — a live vin feed alone must not
     /// hide a missing track→Master hop (Linux silent while DualMic meters move).
     pub fn egress_to_dests_live(&self, bus: &str, wet: bool, dests: &[String]) -> bool {
         if dests.is_empty() {
             return false;
         }
-        let src = if wet {
-            format!("{}.monitor", live_post_name(bus))
+        let post = live_post_name(bus);
+        let src = if wet || sink_exists(&post) {
+            format!("{post}.monitor")
         } else {
             format!("{bus}.monitor")
         };

@@ -460,6 +460,7 @@ Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
 | In **M** / **×** | `[lat] B CaptureDelta …`; mic silent; no `RewireSessionRoutes` |
 | Re-Add mic after × | Audible &lt;~200ms; `capture live …` (never empty SyncCapture); no ghost In |
 | Idle 10s while muted | Stays muted (no open_bus_gain undo) |
+| Track fader drag | Audible level follows **after** inserts (`buschain_post_*` monitorVolumes; app bus stays unity) |
 | Apps Add during In edit | PlaceApp completes; mute still Class A priority |
 | Start player after BusChain up | App appears in Apps Add ≤2s (native registry generation-driven; no Apply) |
 | Pin Chromium to non-VO FX track | Stream on that Internal bus **and still listed in Apps** (native discovery); pitch/EQ audible; no dry `track.monitor→master` |
