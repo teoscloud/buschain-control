@@ -579,16 +579,29 @@ pub fn set_sink_volume_pct(name_or_index: &str, pct: u32) -> Result<()> {
 
 /// Cheap live Master HW read — one sink, not a full `pactl list`.
 /// Used so `status.hw_volume_pct` cannot drift from PipeWire / waybar.
+///
+/// Timed: untimeout'd `pactl get-sink-volume` blocked the daemon lock for 30s+
+/// (status/meters frozen, Master felt "disconnected").
 pub fn probe_sink_volume_mute(name: &str) -> Option<(u32, bool)> {
     if name.is_empty() {
         return None;
     }
-    let vol_out = run("pactl", &["get-sink-volume", name]).ok()?;
+    let vol_out = buschain_engine::backend::run_capture(
+        "pactl",
+        &["get-sink-volume", name],
+        buschain_engine::backend::CLI_TIMEOUT,
+    )
+    .ok()?;
     // Match waybar: first `NN%` token (channel volumes are equal for Master HW).
     let pct = vol_out
         .split_whitespace()
         .find_map(|t| t.strip_suffix('%')?.parse::<u32>().ok())?;
-    let mute_out = run("pactl", &["get-sink-mute", name]).unwrap_or_default();
+    let mute_out = buschain_engine::backend::run_capture(
+        "pactl",
+        &["get-sink-mute", name],
+        buschain_engine::backend::CLI_TIMEOUT,
+    )
+    .unwrap_or_default();
     let mute = mute_out.to_ascii_lowercase().contains("yes");
     Some((pct.min(150), mute))
 }
@@ -2061,24 +2074,12 @@ pub fn apply_session(
         track.sink_name = Some(track.expected_sink_name());
     }
 
+    // Session owns default while buses exist — never force HW here when preferred
+    // is buschain (Master→HW healing is a speaker-path concern, not ownership).
     if let Some(pref) = session.preferred_default_sink.clone() {
-        let pref_is_buschain =
-            pref.starts_with("buschain_") || is_legacy_shadow_sink(&pref);
-        let master_live = crate::audio::engine_handle::link_is_live(
-            "buschain_master.monitor",
-            &hw_sink,
-        ) || crate::audio::engine_handle::link_is_live(
-            "buschain_post_master.monitor",
-            &hw_sink,
-        );
-        let target = if pref_is_buschain && !master_live {
-            hw_sink.clone()
-        } else {
-            pref
-        };
-        match set_default_sink_if_needed(&target) {
+        match set_default_sink_if_needed(&pref) {
             Ok(true) => {}
-            Ok(false) => warnings.push(format!("preferred default did not stick: {target}")),
+            Ok(false) => warnings.push(format!("preferred default did not stick: {pref}")),
             Err(e) => warnings.push(format!("preferred default: {e:#}")),
         }
     }

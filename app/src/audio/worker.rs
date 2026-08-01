@@ -1250,6 +1250,16 @@ fn process_command_batch(
                     }
                     match graph::apply_session(&mut session, &mut fx, graph::ApplyKind::Full) {
                         Ok(message) => {
+                            // Resume: reassert preferred default + pull streams off HW/Hold.
+                            match crate::audio::engine_handle::sync_playback(&session) {
+                                Ok(msg) if msg.contains("placed") => {
+                                    let _ = tx.send(Event::Status(msg));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let _ = tx.send(Event::Error(format!("place streams: {e:#}")));
+                                }
+                            }
                             *last_session = Some(session.clone());
                             let _ = tx.send(Event::SessionApplied { session, message, kind: SessionAppliedKind::Other });
                             let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));

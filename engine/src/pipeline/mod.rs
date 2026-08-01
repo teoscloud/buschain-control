@@ -6,7 +6,8 @@ mod insert_host;
 
 pub use arm::{
     arm_master_hw, arm_track_egress, arm_track_egress_soft_cutover, disarm_master_hw,
-    disarm_track_egress, dry_spine_instant_ready, spine_instant_ready, track_path_ready,
+    disarm_track_egress, disarm_track_egress_ex, dry_spine_instant_ready, spine_instant_ready,
+    track_path_ready,
     wait_dry_spine_stable, wait_spine_stable, DRY_DWELL, WET_DWELL,
 };
 pub use insert::{

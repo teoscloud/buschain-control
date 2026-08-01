@@ -38,23 +38,20 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
     let Some(pref) = desired.preferred_default.as_deref().filter(|s| !s.is_empty()) else {
         return Ok(moved);
     };
+    if !desired.owns_system_default() {
+        return Ok(moved);
+    }
     if !sinks.iter().any(|(_, n)| n == pref) {
+        // Preferred sink missing briefly — wait; do not force HW.
         return Ok(moved);
     }
 
     let pref_is_buschain = pref.starts_with("buschain_") || pref.starts_with("shadow_");
-    if pref_is_buschain {
-        let hw = desired.master_hw.as_deref().unwrap_or("");
-        let master_live = !hw.is_empty()
-            && (super::link::link_is_live("buschain_master.monitor", hw)
-                || super::link::link_is_live("buschain_post_master.monitor", hw));
-        if !master_live {
-            return Ok(moved);
-        }
-    }
 
     for si in &inputs {
-        if si.internal {
+        // Hold is keepalive only — pull user streams off buschain_hold onto preferred.
+        let on_hold = si.sink == "buschain_hold";
+        if si.internal && !on_hold {
             continue;
         }
         if key_to_bus.keys().any(|k| matches_key(si, k)) {
@@ -65,11 +62,11 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
         }
         let on_buschain =
             si.sink.starts_with("buschain_") || si.sink.starts_with("shadow_");
-        if !on_buschain && !pref_is_buschain {
-            continue;
-        }
-        if move_si(si.index, pref) {
-            moved += 1;
+        // Reclaim HW → preferred BusChain, other buschain sinks / Hold → preferred.
+        if on_hold || on_buschain || pref_is_buschain {
+            if move_si(si.index, pref) {
+                moved += 1;
+            }
         }
     }
     Ok(moved)
@@ -178,10 +175,11 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
         let app_id = g("application.id").filter(|s| !s.is_empty());
         let node_name = g("node.name").filter(|s| !s.is_empty());
         let media = g("media.name").unwrap_or_default();
+        // Hold is parking/keepalive — user streams there must be reclaimable.
+        // FX/post/rs + BusChain-owned media stay internal.
         let internal = sink.starts_with("buschain_fx_")
             || sink.starts_with("buschain_post_")
             || sink.starts_with("buschain_rs_")
-            || sink == "buschain_hold"
             || node_name.as_deref().is_some_and(|n| {
                 n.starts_with("buschain_") || n.contains("filter-chain")
             })

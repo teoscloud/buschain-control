@@ -578,9 +578,16 @@ impl Engine {
             .collect();
         for (bus, muted) in tracks {
             if muted {
-                // Always reinforce silence — FX ensure can recreate Master hops
-                // while the mute latch still thinks we're gated.
-                pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
+                // Native-only when a leak is visible — never Pulse-sweep every idle
+                // tick (untimed pactl wedged meters / Master for 30s+).
+                if self.egress_audible_native(&bus) {
+                    pipeline::arm::disarm_track_egress_ex(
+                        &mut self.backend,
+                        &bus,
+                        true,
+                        false,
+                    );
+                }
                 self.applied_monitor_mute.insert(bus, true);
                 continue;
             }
@@ -1481,23 +1488,22 @@ impl Engine {
             }
         }
 
-        // Preferred BusChain default only when speakers are armed and Master→HW is
-        // live — otherwise reclaim would park apps on a silent hollow bus.
-        if let Some(pref) = self.desired.preferred_default.clone() {
-            let pref_is_buschain = pref.starts_with("buschain_") || pref.starts_with("shadow_");
-            let hw = self
-                .desired
-                .master_hw
-                .clone()
-                .or_else(|| self.master_hw.clone());
-            let master_ok = self.desired.speakers_armed
-                && hw.as_ref().is_some_and(|h| self.master_hw_link_live(h));
-            let target = if pref_is_buschain && !master_ok {
-                hw.filter(|h| !h.is_empty())
-            } else {
-                Some(pref)
-            };
-            if let Some(target) = target {
+        // While the session owns the graph, keep preferred BusChain as system
+        // default even if Master→HW is healing — forcing Scarlett mid-session
+        // parked Discord/new apps on HW. HW restore is Quit/Teardown only.
+        if self.desired.owns_system_default() {
+            if let Some(pref) = self.desired.preferred_default.clone() {
+                let pref_is_buschain =
+                    pref.starts_with("buschain_") || pref.starts_with("shadow_");
+                let hw = self
+                    .desired
+                    .master_hw
+                    .clone()
+                    .or_else(|| self.master_hw.clone());
+                let master_ok = self.desired.speakers_armed
+                    && hw.as_ref().is_some_and(|h| self.master_hw_link_live(h));
+                // Never retarget to HW while we own the session.
+                let target = pref;
                 let exists = self
                     .backend
                     .list_sink_names()
@@ -1516,7 +1522,7 @@ impl Engine {
                                 Ok(true) => {
                                     if pref_is_buschain && !master_ok {
                                         report.push(format!(
-                                            "default→{target} (Master HW not live — skip buschain preferred)"
+                                            "default→{target} (Master HW healing)"
                                         ));
                                     } else {
                                         report.push(format!("default→{target}"));
@@ -1530,6 +1536,7 @@ impl Engine {
                         }
                     }
                 }
+                // Preferred missing briefly — wait; do not force HW.
             }
         }
         Ok(())
@@ -1676,6 +1683,12 @@ impl Engine {
         self.reconcile_bus_inputs(&mut report, false);
         self.reapply_muted_egress(&mut report);
         self.reconcile_master_and_default(&mut report)?;
+        // Reclaim unpinned / Hold / HW streams onto preferred (session owns default).
+        match crate::backend::enforce_desired_playback(&self.desired) {
+            Ok(n) if n > 0 => report.push(format!("playback reclaim: {n} placed")),
+            Ok(_) => {}
+            Err(e) => report.push(format!("playback reclaim: {e:#}")),
+        }
         report.push("speakers armed (adopted)");
         Ok(report)
     }
@@ -1857,6 +1870,11 @@ impl Engine {
         // (common when sink_has_input flaked during the barrier window).
         crate::backend::invalidate_probe_caches();
         self.reconcile_master_and_default(&mut report)?;
+        match crate::backend::enforce_desired_playback(&self.desired) {
+            Ok(n) if n > 0 => report.push(format!("playback reclaim: {n} placed")),
+            Ok(_) => {}
+            Err(e) => report.push(format!("playback reclaim: {e:#}")),
+        }
         Ok(report)
     }
 
@@ -2115,22 +2133,32 @@ impl Engine {
     }
 
     /// Hot mute latch wins over stale session sync (async FX jobs with mute=false).
-    /// Restores Desired.mixer_mute and re-disarms egress for every latched bus.
+    /// Restores Desired.mixer_mute and re-disarms egress for every latched track.
+    /// Never latches Master (speakers_armed owns Master→HW).
     pub fn reinforce_mute_latches(&mut self) {
         let latched: Vec<String> = self
             .applied_monitor_mute
             .iter()
-            .filter(|(_, muted)| **muted)
+            .filter(|(bus, muted)| {
+                **muted
+                    && *bus != "buschain_master"
+                    && self.desired.buses.get(bus.as_str()).is_some_and(|s| {
+                        matches!(s.role, NodeRole::TrackBus)
+                    })
+            })
             .map(|(bus, _)| bus.clone())
             .collect();
         for bus in latched {
             self.desired_mut_bus_mixer_mute(&bus, true);
+            // Full sweep on sync (rare) — clears Pulse leftovers after FX rewire.
             pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
             self.applied_monitor_mute.insert(bus, true);
         }
     }
 
     /// True when dry bus.monitor→dests or wet post→dests is live (native when ready).
+    /// Requires **all** existing Desired dests — a live vin feed alone must not
+    /// hide a missing track→Master hop (Linux silent while DualMic meters move).
     pub fn egress_to_dests_live(&self, bus: &str, wet: bool, dests: &[String]) -> bool {
         if dests.is_empty() {
             return false;
@@ -2140,9 +2168,17 @@ impl Engine {
         } else {
             format!("{bus}.monitor")
         };
-        dests.iter().any(|d| {
-            !d.is_empty() && sink_exists(d) && link_is_live(&src, d)
-        })
+        let mut any = false;
+        for d in dests {
+            if d.is_empty() || !sink_exists(d) {
+                continue;
+            }
+            any = true;
+            if !link_is_live(&src, d) {
+                return false;
+            }
+        }
+        any
     }
 
     /// Mixer mute: silence egress (unlink bus/post → dests), never cork the app sink.

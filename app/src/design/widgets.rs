@@ -1047,6 +1047,9 @@ struct SoftclipVizState {
     /// Peak-hold input (slower release) for GR readout.
     in_hold: f32,
     last_t: f64,
+    mode: super::TransferVizMode,
+    cam: super::Xfer3dCamera,
+    band_smooth: [f32; super::BAND_N],
 }
 
 /// Soft-clipper transfer plot + live signal visualization.
@@ -1054,6 +1057,8 @@ struct SoftclipVizState {
 /// Shows where program material sits on the knee: input density along X,
 /// a phosphor trail of recent operating points on the curve, and GR when
 /// the live peak is past threshold. Drag / scroll horizontally to set Threshold.
+///
+/// `mode` selects 2D vs 3D (log-frequency) view. Pass pre-FX `spectrum` in 3D.
 pub fn softclip_transfer_plot(
     ui: &mut Ui,
     theme: &dyn Theme,
@@ -1061,6 +1066,8 @@ pub fn softclip_transfer_plot(
     post: f32,
     peak_db: f32,
     size: Vec2,
+    mode: super::TransferVizMode,
+    spectrum: Option<&buschain_engine::host::SpectrumFrame>,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
 
@@ -1105,8 +1112,12 @@ pub fn softclip_transfer_plot(
             in_smooth: 0.0,
             in_hold: 0.0,
             last_t: now,
+            mode: super::TransferVizMode::TwoD,
+            cam: super::Xfer3dCamera::default(),
+            band_smooth: [0.0; super::BAND_N],
         })
     });
+    viz.mode = mode;
     let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
     viz.last_t = now;
     let atk = 1.0 - (-dt * 40.0).exp();
@@ -1146,6 +1157,99 @@ pub fn softclip_transfer_plot(
         viz.trail[i] = viz.in_smooth;
         viz.trail_i = viz.trail_i.wrapping_add(1);
     }
+
+    // ---- 3D frequency view (pre-FX spectrum → needles on extruded knee) ----
+    if matches!(viz.mode, super::TransferVizMode::ThreeD) {
+        let mut band_hz = [0.0_f32; super::BAND_N];
+        let mut band_raw = [0.0_f32; super::BAND_N];
+        if let Some(frame) = spectrum {
+            super::fill_log_bands_linear(
+                frame.sample_rate,
+                &frame.mags,
+                &mut band_hz,
+                &mut band_raw,
+            );
+        } else {
+            for i in 0..super::BAND_N {
+                let t = (i as f32 + 0.5) / super::BAND_N as f32;
+                band_hz[i] = 20.0 * (20_000.0_f32 / 20.0).powf(t);
+            }
+        }
+        let atk_b = 1.0 - (-dt * 28.0).exp();
+        let rel_b = 1.0 - (-dt * 5.0).exp();
+        for i in 0..super::BAND_N {
+            let t = band_raw[i];
+            if t > viz.band_smooth[i] {
+                viz.band_smooth[i] += (t - viz.band_smooth[i]) * atk_b;
+            } else {
+                viz.band_smooth[i] += (t - viz.band_smooth[i]) * rel_b;
+            }
+        }
+        let max_b = viz
+            .band_smooth
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1e-8);
+        let peak_scale = viz.in_smooth.max(in_inst).max(1e-4);
+        let mut band_xin = [0.0_f32; super::BAND_N];
+        for i in 0..super::BAND_N {
+            band_xin[i] = (viz.band_smooth[i] / max_b) * peak_scale;
+        }
+        let thres_c = thres;
+        let post_c = post;
+        let xfer = |xin: f32| softclip_xfer(xin, thres_c, post_c);
+        let gr = |xin: f32| {
+            let y = softclip_xfer(xin, thres_c, 1.0);
+            if xin > 1e-6 && y > 1e-6 {
+                20.0 * (y / xin).log10()
+            } else {
+                0.0
+            }
+        };
+        let past = |xin: f32| xin >= thres_c;
+        let _hover = super::paint_dynamics_xfer_3d(
+            ui,
+            theme,
+            plot,
+            &mut viz.cam,
+            0.0,
+            view_in,
+            0.0,
+            view_out,
+            &band_hz,
+            &band_xin,
+            &xfer,
+            &gr,
+            &past,
+            false,
+        );
+        // Frame chrome labels outside plot
+        let painter = ui.painter();
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, theme.border_soft()),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(plot.center().x, rect.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            "in · out · freq",
+            egui::FontId::proportional(9.0),
+            theme.text_muted(),
+        );
+        let mut changed = false;
+        let mut resp = resp;
+        // Orbit uses plot interact; scroll still sets Threshold.
+        if apply_wheel_to_value(ui, &mut resp, threshold, 0.05..=0.999) {
+            changed = true;
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));
+        ui.ctx().request_repaint();
+        return changed;
+    }
+
     let dens = viz.dens;
     let trail = viz.trail;
     let trail_i = viz.trail_i;
@@ -1505,12 +1609,18 @@ struct LimiterVizState {
     gr_hist: [f32; 96],
     gr_i: u8,
     last_t: f64,
+    mode: super::TransferVizMode,
+    cam: super::Xfer3dCamera,
+    band_smooth: [f32; super::BAND_N],
 }
 
 /// Limiter transfer plot + GR history strip.
 ///
 /// Unity → ceiling fold (soft knee when set), density / phosphor trail, live GR.
 /// Drag vertically (or scroll) to set Ceiling.
+///
+/// `mode` selects 2D vs 3D (log-frequency) view. GR history strip is 2D-only.
+/// Pass pre-FX `spectrum` in 3D.
 pub fn limiter_transfer_plot(
     ui: &mut Ui,
     theme: &dyn Theme,
@@ -1520,6 +1630,8 @@ pub fn limiter_transfer_plot(
     makeup_db: f32,
     peak_db: f32,
     size: Vec2,
+    mode: super::TransferVizMode,
+    spectrum: Option<&buschain_engine::host::SpectrumFrame>,
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
 
@@ -1527,8 +1639,13 @@ pub fn limiter_transfer_plot(
     let pad_b = 4.0;
     let pad_t = 14.0;
     let pad_r = 6.0;
-    let gr_h = (rect.height() * 0.22).clamp(28.0, 44.0);
-    let gap = 4.0;
+    let use_3d = matches!(mode, super::TransferVizMode::ThreeD);
+    let gr_h = if use_3d {
+        0.0
+    } else {
+        (rect.height() * 0.22).clamp(28.0, 44.0)
+    };
+    let gap = if use_3d { 0.0 } else { 4.0 };
     let plot = Rect::from_min_max(
         egui::pos2(rect.left() + pad_l, rect.top() + pad_t),
         egui::pos2(
@@ -1578,8 +1695,12 @@ pub fn limiter_transfer_plot(
             gr_hist: [0.0; 96],
             gr_i: 0,
             last_t: now,
+            mode: super::TransferVizMode::TwoD,
+            cam: super::Xfer3dCamera::default(),
+            band_smooth: [0.0; super::BAND_N],
         })
     });
+    viz.mode = mode;
     let dt = (now - viz.last_t).clamp(0.0, 0.08) as f32;
     viz.last_t = now;
     let atk = 1.0 - (-dt * 40.0).exp();
@@ -1623,6 +1744,89 @@ pub fn limiter_transfer_plot(
         let i = viz.gr_i as usize % viz.gr_hist.len();
         viz.gr_hist[i] = gr_now.max(0.0);
         viz.gr_i = viz.gr_i.wrapping_add(1);
+    }
+
+    if use_3d {
+        let mut band_hz = [0.0_f32; super::BAND_N];
+        let mut band_raw = [0.0_f32; super::BAND_N];
+        if let Some(frame) = spectrum {
+            super::fill_log_bands_linear(
+                frame.sample_rate,
+                &frame.mags,
+                &mut band_hz,
+                &mut band_raw,
+            );
+        } else {
+            for i in 0..super::BAND_N {
+                let t = (i as f32 + 0.5) / super::BAND_N as f32;
+                band_hz[i] = 20.0 * (20_000.0_f32 / 20.0).powf(t);
+            }
+        }
+        let atk_b = 1.0 - (-dt * 28.0).exp();
+        let rel_b = 1.0 - (-dt * 5.0).exp();
+        for i in 0..super::BAND_N {
+            let t = band_raw[i];
+            if t > viz.band_smooth[i] {
+                viz.band_smooth[i] += (t - viz.band_smooth[i]) * atk_b;
+            } else {
+                viz.band_smooth[i] += (t - viz.band_smooth[i]) * rel_b;
+            }
+        }
+        let max_b = viz
+            .band_smooth
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1e-8);
+        let peak_span = (viz.in_smooth - DB_MIN).max(0.0);
+        let mut band_xin = [DB_MIN; super::BAND_N];
+        for i in 0..super::BAND_N {
+            band_xin[i] = DB_MIN + (viz.band_smooth[i] / max_b) * peak_span;
+        }
+        let ceil_c = ceil;
+        let knee_c = knee;
+        let makeup_c = makeup;
+        let xfer = |xin: f32| limiter_xfer_db(xin, ceil_c, knee_c, makeup_c);
+        let gr = |xin: f32| limiter_gr_db(xin, ceil_c, knee_c);
+        let past = |xin: f32| xin >= ceil_c - knee_c * 0.5;
+        let _hover = super::paint_dynamics_xfer_3d(
+            ui,
+            theme,
+            plot,
+            &mut viz.cam,
+            DB_MIN,
+            DB_MAX,
+            DB_MIN,
+            DB_MAX,
+            &band_hz,
+            &band_xin,
+            &xfer,
+            &gr,
+            &past,
+            true,
+        );
+        let painter = ui.painter();
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0_f32, theme.border_soft()),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(plot.center().x, rect.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            "in · out · freq (dB)",
+            egui::FontId::proportional(9.0),
+            theme.text_muted(),
+        );
+        let mut changed = false;
+        let mut resp = resp;
+        if apply_wheel_to_value(ui, &mut resp, ceiling_db, -24.0..=0.0) {
+            changed = true;
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(viz_id, viz));
+        ui.ctx().request_repaint();
+        return changed;
     }
 
     let dens = viz.dens;

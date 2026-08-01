@@ -2992,14 +2992,34 @@ fn draw_softclip_panel(
 ) -> bool {
     let theme = state.theme;
     let peak_db = insert_peak_db(state, track_idx, insert_idx);
+    let bus_key = state
+        .session
+        .tracks
+        .get(track_idx)
+        .map(|t| {
+            t.sink_name
+                .clone()
+                .unwrap_or_else(|| t.expected_sink_name())
+        })
+        .unwrap_or_default();
     let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
     plug.ensure_params();
     let mut thres = plug.param("Threshold").unwrap_or(0.5);
     let mut post = plug.param("Post").unwrap_or(1.0);
     let mut changed = false;
 
+    let mode_id = ui.id().with(("softclip_viz_mode", track_idx, insert_idx));
+    let mut mode = ui.ctx().data_mut(|d| {
+        d.get_temp::<design::TransferVizMode>(mode_id)
+            .unwrap_or(design::TransferVizMode::TwoD)
+    });
+
     // Stacked knobs on the left · meters · tall transfer plot filling the rest.
-    let panel_h = 200.0_f32;
+    let panel_h = if matches!(mode, design::TransferVizMode::ThreeD) {
+        240.0_f32
+    } else {
+        200.0_f32
+    };
     design::inhouse_shell_ex(
         ui,
         &theme,
@@ -3009,6 +3029,22 @@ fn draw_softclip_panel(
         false, // meters live in the transfer-curve row
         |ui| {
             ui.set_max_width(420.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("View").size(10.0).color(theme.text_dim()));
+                if design::transfer_viz_mode_toggle(ui, &theme, &mut mode) {
+                    // mode persisted below
+                }
+            });
+            ui.add_space(2.0);
+
+            let spectrum = if matches!(mode, design::TransferVizMode::ThreeD) && !bus_key.is_empty()
+            {
+                crate::audio::engine_handle::host_spectrum_watch(&bus_key, false);
+                crate::audio::engine_handle::host_spectrum(&bus_key, false)
+            } else {
+                None
+            };
+
             ui.horizontal(|ui| {
                 ui.set_height(panel_h);
                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -3074,12 +3110,15 @@ fn draw_softclip_panel(
                     post,
                     peak_db,
                     Vec2::new(plot_w, panel_h - 4.0),
+                    mode,
+                    spectrum.as_ref(),
                 ) {
                     changed = true;
                 }
             });
         },
     );
+    ui.ctx().data_mut(|d| d.insert_temp(mode_id, mode));
 
     if changed {
         let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
@@ -3678,6 +3717,16 @@ fn draw_limiter_panel(
 ) -> bool {
     let theme = state.theme;
     let peak_db = insert_peak_db(state, track_idx, insert_idx);
+    let bus_key = state
+        .session
+        .tracks
+        .get(track_idx)
+        .map(|t| {
+            t.sink_name
+                .clone()
+                .unwrap_or_else(|| t.expected_sink_name())
+        })
+        .unwrap_or_default();
     let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];
     plug.ensure_params();
     let mut ceiling = plug.param("Ceiling (dB)").unwrap_or(-0.1);
@@ -3689,8 +3738,18 @@ fn draw_limiter_panel(
     let mut makeup = plug.param("Makeup (dB)").unwrap_or(0.0);
     let mut changed = false;
 
-    // Chart height includes the GR strip; knob columns fill the same vertical span.
-    let panel_h = 288.0_f32;
+    let mode_id = ui.id().with(("limiter_viz_mode", track_idx, insert_idx));
+    let mut mode = ui.ctx().data_mut(|d| {
+        d.get_temp::<design::TransferVizMode>(mode_id)
+            .unwrap_or(design::TransferVizMode::TwoD)
+    });
+
+    // Chart height includes the GR strip (2D); 3D uses full plot for freq surface.
+    let panel_h = if matches!(mode, design::TransferVizMode::ThreeD) {
+        328.0_f32
+    } else {
+        288.0_f32
+    };
     let col_w = 72.0_f32;
     let left_n = 4.0_f32;
     let slot_h = panel_h / left_n;
@@ -3737,7 +3796,18 @@ fn draw_limiter_panel(
                         .strong()
                         .color(theme.accent()),
                 );
+                ui.add_space(8.0);
+                ui.label(RichText::new("View").size(10.0).color(theme.text_dim()));
+                design::transfer_viz_mode_toggle(ui, &theme, &mut mode);
             });
+
+            let spectrum = if matches!(mode, design::TransferVizMode::ThreeD) && !bus_key.is_empty()
+            {
+                crate::audio::engine_handle::host_spectrum_watch(&bus_key, false);
+                crate::audio::engine_handle::host_spectrum(&bus_key, false)
+            } else {
+                None
+            };
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -3850,12 +3920,15 @@ fn draw_limiter_panel(
                     makeup,
                     peak_db,
                     Vec2::new(plot_w, panel_h - 4.0),
+                    mode,
+                    spectrum.as_ref(),
                 ) {
                     changed = true;
                 }
             });
         },
     );
+    ui.ctx().data_mut(|d| d.insert_temp(mode_id, mode));
 
     if changed {
         let plug = &mut state.session.tracks[track_idx].inserts[insert_idx];

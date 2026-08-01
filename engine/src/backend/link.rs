@@ -709,15 +709,18 @@ fn maybe_disconnect(out_p: &str, in_p: &str, allow_sinks: &[&str]) -> u32 {
 
 /// Unload Pulse `module-loopback` hops from `source` except allowed sinks / hold.
 /// Used by mute disarm when native unlink skips Pulse (registry ready).
+///
+/// Always timed — untimeout'd `pactl list modules` on the idle mute path wedged
+/// the ENGINE mutex for tens of seconds (dead meters / Master silence).
 pub fn unload_legacy_from_source_except(source: &str, allow_sinks: &[&str]) {
     let src = format!("source={source}");
-    let Ok(out) = Command::new("pactl")
-        .args(["list", "short", "modules"])
-        .output()
-    else {
+    let Ok(text) = super::cli::run_capture(
+        "pactl",
+        &["list", "short", "modules"],
+        super::cli::CLI_TIMEOUT,
+    ) else {
         return;
     };
-    let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let mut parts = line.splitn(3, '\t');
         let Some(idx) = parts.next() else { continue };
@@ -735,9 +738,11 @@ pub fn unload_legacy_from_source_except(source: &str, allow_sinks: &[&str]) {
         if allowed {
             continue;
         }
-        let _ = Command::new("pactl")
-            .args(["unload-module", idx])
-            .status();
+        let _ = super::cli::run_status(
+            "pactl",
+            &["unload-module", idx],
+            super::cli::CLI_TIMEOUT,
+        );
     }
 }
 

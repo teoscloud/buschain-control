@@ -84,30 +84,59 @@ pub fn track_path_ready(bus: &str, wet: bool, _dests: &[String]) -> bool {
 
 /// Silence bus monitor during cold rebuild (RAII-friendly free fn lives in backend).
 ///
-/// Native unlink (registry ready) skips Pulse — also unload legacy loopbacks so a
-/// Pulse DualMic→Master hop cannot outlive mixer mute.
+/// Native unlink (registry ready) skips Pulse — optionally unload legacy loopbacks
+/// so a Pulse DualMic→Master hop cannot outlive mixer mute. Idle paths must pass
+/// `sweep_pulse=false` (Pulse list on every tick wedged the control plane).
 pub fn disarm_track_egress(backend: &mut dyn AudioBackend, bus: &str, keep_fx_feed: bool) {
+    disarm_track_egress_ex(backend, bus, keep_fx_feed, true);
+}
+
+/// Like [`disarm_track_egress`] with optional Pulse module sweep.
+pub fn disarm_track_egress_ex(
+    backend: &mut dyn AudioBackend,
+    bus: &str,
+    keep_fx_feed: bool,
+    sweep_pulse: bool,
+) {
     let from = format!("{bus}.monitor");
     let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
     let _ = backend.unlink_from_source_except(&post_mon, &[]);
-    crate::backend::unload_legacy_from_source_except(&post_mon, &[]);
+    if sweep_pulse {
+        crate::backend::unload_legacy_from_source_except(&post_mon, &[]);
+    }
     if keep_fx_feed && registry::host_running(bus) {
         let allow = [fx.as_str(), "buschain_hold"];
         let _ = backend.unlink_from_source_except(&from, &allow);
-        crate::backend::unload_legacy_from_source_except(&from, &allow);
+        if sweep_pulse {
+            crate::backend::unload_legacy_from_source_except(&from, &allow);
+        }
         let _ = backend.ensure_link_raw(&from, &fx);
     } else {
         let allow = ["buschain_hold"];
         let _ = backend.unlink_from_source_except(&from, &allow);
-        crate::backend::unload_legacy_from_source_except(&from, &allow);
+        if sweep_pulse {
+            crate::backend::unload_legacy_from_source_except(&from, &allow);
+        }
     }
     let _ = backend.ensure_link_raw(&from, "buschain_hold");
 }
 
+/// True when every existing dest is linked from `src` (vin feed alone must not
+/// count as healthy when Master is also in Desired egress).
 fn dests_linked(src: &str, dests: &[String]) -> bool {
-    dests.iter().any(|d| !d.is_empty() && sink_exists(d) && link_is_live(src, d))
+    let mut any = false;
+    for d in dests {
+        if d.is_empty() || !sink_exists(d) {
+            continue;
+        }
+        any = true;
+        if !link_is_live(src, d) {
+            return false;
+        }
+    }
+    any
 }
 
 fn arm_dry_to_dests(

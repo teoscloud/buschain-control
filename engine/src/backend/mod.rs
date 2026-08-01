@@ -17,7 +17,8 @@ pub use virtual_input::{
 };
 
 pub use cli::{
-    invalidate_probe_caches, pactl_short_sinks, pw_link_inputs, pw_link_outputs,
+    invalidate_probe_caches, pactl_short_sinks, pw_link_inputs, pw_link_outputs, run_capture,
+    CLI_TIMEOUT,
 };
 pub use link::{
     ensure_link_force, pulse_loopback_owned, unlink_capture_into_sink_except,

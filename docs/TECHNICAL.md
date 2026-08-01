@@ -386,7 +386,7 @@ command -v buschain-plugin-surface
 
 - Quit / Teardown → `restore_system_audio` + linger destroy; persist HW preferred on quit
 - Surgical commits (`EnsureTrack` / `Route` / `VirtualInput` / `FxRewire`) **never** escalate to Full Apply when the snapshot looks cold — only `Reconcile` may ArmSession
-- Preferred `buschain_*` default / reclaim only when `speakers_armed && Master→HW` live; else force HW
+- Preferred `buschain_*` default: while the session owns the graph, keep asserting preferred (e.g. Linux track virtual out) even if Master→HW is healing — do **not** force Scarlett mid-session. HW restore + stream move-off is Quit/Teardown only. Playback reclaim pulls unpinned / Hold / HW apps onto preferred when that sink exists.
 - Capture is **shared** (`exclusive: false`); Desired `bus_inputs` reconcile + sink-side unlink
 - Wet Master hold mid-build fail-opens dry Master→HW after ~2s
 - Session load prune uses the same `teardown_track_bus` as UI delete (`destroy_node` + virtual-input teardown)

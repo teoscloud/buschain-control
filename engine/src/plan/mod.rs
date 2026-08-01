@@ -86,6 +86,13 @@ impl DesiredState {
         self.preferred_default = name.filter(|s| !s.is_empty());
     }
 
+    /// True while BusChain owns a session graph — keep preferred `buschain_*`
+    /// as system default (do not force HW when Master→HW is healing).
+    /// Quit/teardown clears buses / preferred; HW restore is a separate path.
+    pub fn owns_system_default(&self) -> bool {
+        !self.buses.is_empty()
+    }
+
     pub fn set_bus_level(&mut self, bus: &str, level: BusLevel) {
         self.bus_levels.insert(bus.to_string(), level);
     }
