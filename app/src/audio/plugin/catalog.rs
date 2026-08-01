@@ -824,6 +824,7 @@ pub fn reverb_preset_names() -> &'static [&'static str] {
         "Room",
         "Chamber",
         "Hall",
+        "Movie Theatre",
         "Plate",
         "Cathedral",
         "Tunnel",
@@ -917,6 +918,42 @@ fn reverb_preset_values(name: &str) -> Option<&'static [(&'static str, f32)]> {
             ("Listener Z", 0.75),
             ("Source Spacing", 0.55),
             ("Face Lock", 1.0),
+        ]),
+        // Front-row multiplex: large wide shoebox, THX-ish short RT60 for volume,
+        // screen-plane L/R, listener close behind looking up, strong ER / dark tail.
+        "Movie Theatre" => Some(&[
+            ("Room Type", 0.0),       // Shoebox — modern black-box auditorium
+            ("Size", 2.35),           // Large house (~22m-class width at this Shape)
+            ("Shape", 1.55),          // Wider than deep (widescreen plan)
+            ("RT60 (s)", 1.15),       // Treated cinema: short for size (clarity)
+            ("Predelay (ms)", 12.0),  // Front row → short path to screen
+            ("Character", 0.42),      // Darker / less metallic than Hall/Plate
+            ("ER Level", 0.74),       // Strong early energy up front (screen + sides)
+            ("ER Spread", 0.62),      // Wide L/R screen image
+            ("Diffusion", 0.58),      // Absorptive seats/carpet — not chamber bloom
+            ("Density", 0.74),
+            ("Modulation", 0.08),     // Stable; no chorus wash
+            ("Decay Lo", 1.05),       // Slight large-room low bloom
+            ("Decay Hi", 0.48),       // Fabric / seats kill highs fast
+            ("Wet HP (Hz)", 72.0),
+            ("Wet LP (Hz)", 8200.0),  // Screen cloth + soft seat tone
+            ("Width", 0.93),          // Immersive LCR wrap
+            ("Duck Amount", 0.0),
+            ("Freeze", 0.0),
+            ("Gate Time (ms)", 0.0),
+            ("Mix", 0.30),
+            ("Source X", 0.50),       // Screen center
+            ("Source Y", 0.62),       // Elevated L/R behind screen plane
+            ("Source Z", 0.12),       // Front wall / screen
+            ("Listener X", 0.50),     // Center aisle seat
+            ("Listener Y", 0.40),     // Seated ear height (looking up)
+            ("Listener Z", 0.28),     // Front row — close behind speakers
+            ("Source Spacing", 0.78), // Wide screen L/R baseline
+            ("Source Yaw", 0.0),
+            ("Face Lock", 1.0),       // Speakers toe-in to audience
+            ("Listener Spacing", 0.28),
+            ("Ear Angle", 155.0),     // Human forward-facing pinnae
+            ("Ear Preset", 1.0),      // Human
         ]),
         "Plate" => Some(&[
             ("Room Type", 0.0),
