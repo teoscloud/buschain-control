@@ -707,7 +707,9 @@ fn maybe_disconnect(out_p: &str, in_p: &str, allow_sinks: &[&str]) -> u32 {
     }
 }
 
-fn unload_legacy_from_source_except(source: &str, allow_sinks: &[&str]) {
+/// Unload Pulse `module-loopback` hops from `source` except allowed sinks / hold.
+/// Used by mute disarm when native unlink skips Pulse (registry ready).
+pub fn unload_legacy_from_source_except(source: &str, allow_sinks: &[&str]) {
     let src = format!("source={source}");
     let Ok(out) = Command::new("pactl")
         .args(["list", "short", "modules"])

@@ -83,22 +83,65 @@ pub fn track_path_ready(bus: &str, wet: bool, _dests: &[String]) -> bool {
 }
 
 /// Silence bus monitor during cold rebuild (RAII-friendly free fn lives in backend).
+///
+/// Native unlink (registry ready) skips Pulse — also unload legacy loopbacks so a
+/// Pulse DualMic→Master hop cannot outlive mixer mute.
 pub fn disarm_track_egress(backend: &mut dyn AudioBackend, bus: &str, keep_fx_feed: bool) {
     let from = format!("{bus}.monitor");
     let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
     let _ = backend.unlink_from_source_except(&post_mon, &[]);
+    crate::backend::unload_legacy_from_source_except(&post_mon, &[]);
     if keep_fx_feed && registry::host_running(bus) {
-        let _ = backend.unlink_from_source_except(&from, &[fx.as_str(), "buschain_hold"]);
+        let allow = [fx.as_str(), "buschain_hold"];
+        let _ = backend.unlink_from_source_except(&from, &allow);
+        crate::backend::unload_legacy_from_source_except(&from, &allow);
         let _ = backend.ensure_link_raw(&from, &fx);
     } else {
-        let _ = backend.unlink_from_source_except(&from, &["buschain_hold"]);
+        let allow = ["buschain_hold"];
+        let _ = backend.unlink_from_source_except(&from, &allow);
+        crate::backend::unload_legacy_from_source_except(&from, &allow);
     }
     let _ = backend.ensure_link_raw(&from, "buschain_hold");
 }
 
+fn dests_linked(src: &str, dests: &[String]) -> bool {
+    dests.iter().any(|d| !d.is_empty() && sink_exists(d) && link_is_live(src, d))
+}
+
+fn arm_dry_to_dests(
+    backend: &mut dyn AudioBackend,
+    from: &str,
+    post_mon: &str,
+    dests: &[String],
+) -> Result<()> {
+    if dests_linked(from, dests) {
+        let _ = backend.ensure_link_raw(from, "buschain_hold");
+        return Ok(());
+    }
+    let _ = backend.unlink_from_source_except(post_mon, &[]);
+    let allow: Vec<&str> = dests
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::once("buschain_hold"))
+        .collect();
+    let _ = backend.unlink_from_source_except(from, &allow);
+    let _ = backend.ensure_link_raw(from, "buschain_hold");
+    for d in dests {
+        if d.is_empty() || !sink_exists(d) {
+            continue;
+        }
+        backend.ensure_link_raw(from, d)?;
+    }
+    Ok(())
+}
+
 /// Exclusive arm: egress_source → each dest (plus hold on bus if source is bus).
+///
+/// Wet is only taken when the post spine can actually carry audio. Otherwise we
+/// keep/restore dry bus→dest — never leave hold-only after a failed wet cutover
+/// (mute/unmute + FX half-up was silencing DualMic while meters still moved).
 pub fn arm_track_egress(
     backend: &mut dyn AudioBackend,
     bus: &str,
@@ -110,23 +153,19 @@ pub fn arm_track_egress(
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
 
-    let dests_live = |src: &str| {
-        dests.iter().all(|d| {
-            d.is_empty() || !sink_exists(d) || link_is_live(src, d)
-        }) && dests.iter().any(|d| !d.is_empty() && sink_exists(d) && link_is_live(src, d))
-    };
+    let wet_ready = wet && sink_exists(&post) && spine_instant_ready(bus);
 
-    if wet {
+    if wet_ready {
         // Fast path: wet exclusive already up — skip unlink storms.
         if link_is_live(&from, &fx)
             && link_is_live(&fx, &post)
-            && dests_live(&post_mon)
+            && dests_linked(&post_mon, dests)
             && !dests.iter().any(|d| !d.is_empty() && link_is_live(&from, d))
         {
             let _ = backend.ensure_link_raw(&from, "buschain_hold");
             return Ok(());
         }
-        // Exclusive wet: never leave dry bus→dest alongside post→dest.
+        // Exclusive wet: drop dry bus→dest beside post→dest.
         let _ = backend.unlink_from_source_except(&from, &[fx.as_str(), "buschain_hold"]);
         let _ = backend.ensure_link_raw(&from, &fx);
         let _ = backend.ensure_link_raw(&from, "buschain_hold");
@@ -137,33 +176,23 @@ pub fn arm_track_egress(
             .chain(std::iter::once("buschain_hold"))
             .collect();
         let _ = backend.unlink_from_source_except(&post_mon, &allow);
+        let mut wet_ok = false;
         for d in dests {
             if d.is_empty() || !sink_exists(d) {
                 continue;
             }
-            backend.ensure_link_raw(&post_mon, d)?;
+            match backend.ensure_link_raw(&post_mon, d) {
+                Ok(_) => wet_ok = true,
+                Err(_) => {}
+            }
         }
-    } else {
-        if dests_live(&from) {
-            let _ = backend.ensure_link_raw(&from, "buschain_hold");
+        if wet_ok && dests_linked(&post_mon, dests) {
             return Ok(());
         }
-        let _ = backend.unlink_from_source_except(&post_mon, &[]);
-        let allow: Vec<&str> = dests
-            .iter()
-            .map(|s| s.as_str())
-            .chain(std::iter::once("buschain_hold"))
-            .collect();
-        let _ = backend.unlink_from_source_except(&from, &allow);
-        let _ = backend.ensure_link_raw(&from, "buschain_hold");
-        for d in dests {
-            if d.is_empty() || !sink_exists(d) {
-                continue;
-            }
-            backend.ensure_link_raw(&from, d)?;
-        }
+        // Wet cutover failed — restore dry so the track is audible again.
     }
-    Ok(())
+
+    arm_dry_to_dests(backend, &from, &post_mon, dests)
 }
 
 /// Soft cutover: keep dry audible until post→dest is up, then drop dry.

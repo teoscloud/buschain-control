@@ -563,30 +563,43 @@ impl Engine {
         Ok(report)
     }
 
-    /// Re-disarm mixer-muted buses if egress leaked back (idle FX/prune).
-    /// Idle leak repair: Desired muted + native sees egress → disarm (no CLI).
+    /// Idle egress heal: re-disarm muted leaks; re-arm unmuted hold-only buses.
     fn reapply_muted_egress(&mut self, _report: &mut ApplyReport) {
-        let muted: Vec<String> = self
+        let tracks: Vec<(String, bool)> = self
             .desired
             .bus_levels
             .iter()
-            .filter(|(bus, l)| {
-                l.mixer_mute
-                    && self
-                        .desired
-                        .buses
-                        .get(bus.as_str())
-                        .is_some_and(|s| {
-                            matches!(s.role, NodeRole::TrackBus | NodeRole::MasterBus)
-                        })
+            .filter(|(bus, _)| {
+                self.desired.buses.get(bus.as_str()).is_some_and(|s| {
+                    matches!(s.role, NodeRole::TrackBus | NodeRole::MasterBus)
+                })
             })
-            .map(|(b, _)| b.clone())
+            .map(|(b, l)| (b.clone(), l.mixer_mute))
             .collect();
-        for bus in muted {
-            if self.egress_audible_native(&bus) {
+        for (bus, muted) in tracks {
+            if muted {
+                // Always reinforce silence — FX ensure can recreate Master hops
+                // while the mute latch still thinks we're gated.
                 pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
+                self.applied_monitor_mute.insert(bus, true);
+                continue;
             }
-            self.applied_monitor_mute.insert(bus, true);
+            if bus == "buschain_master" && !self.desired.speakers_armed {
+                continue;
+            }
+            let dests = self.desired.egress_dests(&bus);
+            let wet = pipeline::arm::spine_instant_ready(&bus);
+            if !self.egress_to_dests_live(&bus, wet, &dests)
+                && !self.egress_to_dests_live(&bus, false, &dests)
+            {
+                let _ = self.arm_track_egress(&bus, wet, &dests);
+                if !self.egress_to_dests_live(&bus, true, &dests)
+                    && !self.egress_to_dests_live(&bus, false, &dests)
+                {
+                    let _ = self.arm_track_egress(&bus, false, &dests);
+                }
+            }
+            self.applied_monitor_mute.insert(bus, false);
         }
     }
 
@@ -1532,10 +1545,12 @@ impl Engine {
         }
         let bus = spec.bus.as_str().to_string();
         // Master→HW stays behind the session barrier until speakers_armed.
+        // Never re-arm Master hops while the track mixer mute latch is on
+        // (FX ensure used to punch dry/wet→Master and bypass the mute LED).
         let arm_egress = if bus == "buschain_master" {
             self.desired.speakers_armed
         } else {
-            true
+            !self.mixer_muted(&bus)
         };
         let clock = self.desired.clock.clone();
         let state = pipeline::insert::ensure_fx_chain(
@@ -1555,8 +1570,12 @@ impl Engine {
             self.desired.remove_fx_chain(spec.bus.as_str());
         } else if state.is_wet() {
             self.desired.ensure_fx_chain(spec);
-            // Multi-dest: arm every configured hop after primary wet land.
-            if arm_egress && !self.mixer_muted(&bus) {
+            // Defense: insert_host arms via bare pipeline when arm_egress was true;
+            // if Desired/latch says muted, strip Master hops again.
+            if self.mixer_muted(&bus) {
+                pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
+            } else if arm_egress {
+                // Multi-dest: arm every configured hop after primary wet land.
                 let dests = self.desired.egress_dests(&bus);
                 if dests.len() > 1 {
                     let _ = self.arm_track_egress(&bus, true, &dests);
@@ -2095,6 +2114,22 @@ impl Engine {
         self.applied_monitor_mute.insert(bus.to_string(), muted);
     }
 
+    /// Hot mute latch wins over stale session sync (async FX jobs with mute=false).
+    /// Restores Desired.mixer_mute and re-disarms egress for every latched bus.
+    pub fn reinforce_mute_latches(&mut self) {
+        let latched: Vec<String> = self
+            .applied_monitor_mute
+            .iter()
+            .filter(|(_, muted)| **muted)
+            .map(|(bus, _)| bus.clone())
+            .collect();
+        for bus in latched {
+            self.desired_mut_bus_mixer_mute(&bus, true);
+            pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
+            self.applied_monitor_mute.insert(bus, true);
+        }
+    }
+
     /// True when dry bus.monitor→dests or wet post→dests is live (native when ready).
     pub fn egress_to_dests_live(&self, bus: &str, wet: bool, dests: &[String]) -> bool {
         if dests.is_empty() {
@@ -2116,32 +2151,38 @@ impl Engine {
         let t0 = Instant::now();
         let prev = self.applied_monitor_mute.get(bus).copied();
         self.desired_mut_bus_mixer_mute(bus, muted);
-        // Already at desired latch — skip disarm/arm (Class A budget), unless
-        // unmuted but egress is missing (EnsureTrack/Capture left hold-only).
+        // Latch skip only when graph matches intent. Muted + leaked egress must
+        // re-disarm (FX ensure / idle dry-heal used to bypass the mute LED).
         if prev == Some(muted) {
             if muted {
-                lat_trace_line(
-                    'A',
-                    "gate_track_mute",
-                    &format!("{bus} muted={muted} (latch)"),
-                    t0.elapsed().as_millis(),
-                    true,
-                );
-                return Ok(());
+                if !self.egress_audible_native(bus) {
+                    lat_trace_line(
+                        'A',
+                        "gate_track_mute",
+                        &format!("{bus} muted={muted} (latch)"),
+                        t0.elapsed().as_millis(),
+                        true,
+                    );
+                    return Ok(());
+                }
+                // Fall through — latch said muted but Master hops leaked back.
+            } else {
+                let dests = self.desired.egress_dests(bus);
+                let wet = pipeline::arm::spine_instant_ready(bus);
+                if self.egress_to_dests_live(bus, wet, &dests)
+                    || self.egress_to_dests_live(bus, false, &dests)
+                {
+                    lat_trace_line(
+                        'A',
+                        "gate_track_mute",
+                        &format!("{bus} muted={muted} (latch)"),
+                        t0.elapsed().as_millis(),
+                        true,
+                    );
+                    return Ok(());
+                }
+                // Fall through to arm — latch said open but graph is hold-only.
             }
-            let dests = self.desired.egress_dests(bus);
-            let wet = any_gen_live(bus);
-            if self.egress_to_dests_live(bus, wet, &dests) {
-                lat_trace_line(
-                    'A',
-                    "gate_track_mute",
-                    &format!("{bus} muted={muted} (latch)"),
-                    t0.elapsed().as_millis(),
-                    true,
-                );
-                return Ok(());
-            }
-            // Fall through to arm — latch said open but graph is hold-only.
         }
         if muted {
             pipeline::arm::disarm_track_egress(&mut self.backend, bus, true);
@@ -2159,16 +2200,26 @@ impl Engine {
                 return Ok(());
             }
             let dests = self.desired.egress_dests(bus);
-            let wet = any_gen_live(bus);
+            // Only claim wet when post spine can carry; otherwise dry bus→Master.
+            let wet = pipeline::arm::spine_instant_ready(bus);
             let _ = self.arm_track_egress(bus, wet, &dests);
+            // Never stick hold-only after unmute (wet half-up used to swallow this).
+            if !self.egress_to_dests_live(bus, true, &dests)
+                && !self.egress_to_dests_live(bus, false, &dests)
+            {
+                let _ = self.arm_track_egress(bus, false, &dests);
+            }
         }
         self.applied_monitor_mute.insert(bus.to_string(), muted);
+        let ok = muted
+            || self.egress_to_dests_live(bus, true, &self.desired.egress_dests(bus))
+            || self.egress_to_dests_live(bus, false, &self.desired.egress_dests(bus));
         lat_trace_line(
             'A',
             "gate_track_mute",
             &format!("{bus} muted={muted}"),
             t0.elapsed().as_millis(),
-            t0.elapsed().as_millis() < 20,
+            ok && t0.elapsed().as_millis() < 20,
         );
         Ok(())
     }
@@ -2307,6 +2358,36 @@ pub fn plan_capture_delta(
         .cloned()
         .collect();
     (remove, add)
+}
+
+#[cfg(test)]
+mod mute_latch_tests {
+    use super::Engine;
+    use crate::plan::BusLevel;
+
+    #[test]
+    fn reinforce_mute_latches_restores_desired_after_stale_clear() {
+        let mut eng = Engine::new();
+        eng.desired_mut().set_bus_level(
+            "buschain_dualmic",
+            BusLevel {
+                gain_db: 0.0,
+                mixer_mute: true,
+            },
+        );
+        eng.mark_monitor_mute_applied("buschain_dualmic", true);
+        // Stale FX sync cleared Desired while UI LED stayed muted.
+        eng.desired_mut().set_bus_level(
+            "buschain_dualmic",
+            BusLevel {
+                gain_db: 0.0,
+                mixer_mute: false,
+            },
+        );
+        assert!(!eng.mixer_muted_public("buschain_dualmic"));
+        eng.reinforce_mute_latches();
+        assert!(eng.mixer_muted_public("buschain_dualmic"));
+    }
 }
 
 #[cfg(test)]

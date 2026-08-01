@@ -941,7 +941,7 @@ fn reverb_preset_values(name: &str) -> Option<&'static [(&'static str, f32)]> {
             ("Duck Amount", 0.0),
             ("Freeze", 0.0),
             ("Gate Time (ms)", 0.0),
-            ("Mix", 0.30),
+            ("Mix", 0.45),            // Let spatialized direct/ER read (wet carries seat geometry)
             ("Source X", 0.50),       // Screen center
             ("Source Y", 0.62),       // Elevated L/R behind screen plane
             ("Source Z", 0.12),       // Front wall / screen

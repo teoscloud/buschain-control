@@ -21,9 +21,10 @@ pub use cli::{
 };
 pub use link::{
     ensure_link_force, pulse_loopback_owned, unlink_capture_into_sink_except,
-    unlink_capture_into_sink_except_with_bridges, unload_legacy_loopback,
-    unload_legacy_loopback_force, unload_legacy_loopbacks_into_sink_except,
-    unload_orphan_hw_to_rs_loopbacks, wait_sink_playback_ports,
+    unlink_capture_into_sink_except_with_bridges, unload_legacy_from_source_except,
+    unload_legacy_loopback, unload_legacy_loopback_force,
+    unload_legacy_loopbacks_into_sink_except, unload_orphan_hw_to_rs_loopbacks,
+    wait_sink_playback_ports,
 };
 
 pub use fx_chain::{

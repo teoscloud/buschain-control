@@ -269,6 +269,9 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                 let _ = eng.teardown_fx_chain(&bus);
             }
         }
+        // Stale FX/Route session snapshots must not clear a hot mute latch and
+        // re-arm DualMic→Master while the UI LED is still red.
+        eng.reinforce_mute_latches();
     });
 }
 
@@ -352,20 +355,19 @@ pub fn arm_track_egress(bus: &str, wet: bool) -> anyhow::Result<()> {
         let dests = eng.desired().egress_dests(bus);
         if wet {
             let helper = buschain_engine::any_gen_live(bus) || eng.chain_is_wet(bus);
-            if !helper && !buschain_engine::spine_instant_ready(bus) {
-                eng.disarm_track_egress(bus, true);
+            if helper && buschain_engine::spine_instant_ready(bus) {
+                eng.arm_track_egress(bus, true, &dests)?;
+                set_wet_cached(bus, true);
+            } else {
+                // FX claimed but post spine not ready — keep dry audible (never hold-only).
+                eng.arm_track_egress(bus, false, &dests)?;
                 set_wet_cached(bus, false);
-                return Ok(());
             }
+        } else if buschain_engine::spine_instant_ready(bus) {
+            // Host owns the bus — prefer wet exclusive when spine is actually up.
             eng.arm_track_egress(bus, true, &dests)?;
             set_wet_cached(bus, true);
         } else {
-            // Never dry-bypass while an FX helper still owns the bus.
-            if buschain_engine::any_gen_live(bus) {
-                eng.arm_track_egress(bus, true, &dests)?;
-                set_wet_cached(bus, true);
-                return Ok(());
-            }
             eng.arm_track_egress(bus, false, &dests)?;
             set_wet_cached(bus, false);
         }
@@ -474,9 +476,17 @@ pub fn sync_capture_delta(session: &Session, track_id: uuid::Uuid) -> anyhow::Re
         // (EnsureTrack used to rely on demoted Pulse loopback).
         if unmuted && !eng.mixer_muted_public(&bus) {
             let dests = eng.desired().egress_dests(&bus);
-            let wet = buschain_engine::any_gen_live(&bus);
-            if !dests.is_empty() && !eng.egress_to_dests_live(&bus, wet, &dests) {
+            let wet = buschain_engine::spine_instant_ready(&bus);
+            if !dests.is_empty()
+                && !eng.egress_to_dests_live(&bus, wet, &dests)
+                && !eng.egress_to_dests_live(&bus, false, &dests)
+            {
                 let _ = eng.arm_track_egress(&bus, wet, &dests);
+                if !eng.egress_to_dests_live(&bus, true, &dests)
+                    && !eng.egress_to_dests_live(&bus, false, &dests)
+                {
+                    let _ = eng.arm_track_egress(&bus, false, &dests);
+                }
                 eng.mark_monitor_mute_applied(&bus, false);
             }
         }

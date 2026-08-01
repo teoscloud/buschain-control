@@ -1510,7 +1510,7 @@ fn process_command_batch(
                     muted,
                 } => {
                     // Keep supervisor DesiredState in sync so idle reconcile
-                    // does not snap volume back to an old fader position.
+                    // does not snap volume/mute back to an old fader position.
                     if let Some(ref mut s) = last_session {
                         if let Some(t) = s
                             .tracks
@@ -1518,6 +1518,7 @@ fn process_command_batch(
                             .find(|t| t.expected_sink_name() == sink)
                         {
                             t.gain_db = gain_db;
+                            t.mute = muted;
                         }
                     }
                     crate::audio::engine_handle::with_engine(|eng| {
