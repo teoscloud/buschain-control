@@ -3,8 +3,9 @@
 mod insert;
 
 pub use insert::{
-    bus_suffix, fx_name_for_bus, inserts_signature, mtr_name_for_bus, normalize_ladspa_label,
-    post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, InsertFormat, InsertSlot, WirePlan,
+    bus_suffix, fx_name_for_bus, glc_name_for_bus, inserts_signature, mtr_name_for_bus,
+    normalize_ladspa_label, post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState,
+    InsertFormat, InsertSlot, WirePlan,
 };
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,7 @@ impl NodeName {
             || self.0.starts_with("buschain_post_")
             || self.0.starts_with("buschain_mid_")
             || self.0.starts_with("buschain_mtr_")
+            || self.0.starts_with("buschain_glc_")
             || self.0.starts_with("buschain_rs_")
             || self.0.starts_with("buschain_vinf_")
             || self.0.starts_with("buschain_vin_")

@@ -138,6 +138,14 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
         eng.desired_mut().virtual_inputs.clear();
         eng.desired_mut().bus_inputs.clear();
         eng.desired_mut().bus_playback.clear();
+        eng.desired_mut().glc_direct.clear();
+        // Master Direct (default on) disables graph GLC; host peer PDC restored.
+        eng.desired_mut().glc_disabled = session
+            .tracks
+            .iter()
+            .find(|t| t.kind.is_master())
+            .map(|t| t.direct_out)
+            .unwrap_or(true);
 
         for track in &session.tracks {
             let bus = track.expected_sink_name();
@@ -151,6 +159,9 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             } else {
                 NodeRole::TrackBus
             };
+            if !track.kind.is_master() && track.direct_out {
+                eng.desired_mut().glc_direct.insert(bus.clone());
+            }
             // Master always public; tracks only when System virtual output is on.
             let pulse_export = track.kind.is_master() || track.virtual_output;
             eng.desired_mut().ensure_bus(NodeSpec {
@@ -510,6 +521,10 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
         return;
     };
     if track.kind.is_master() {
+        // Master Direct toggles global GLC disable.
+        with_engine(|eng| {
+            eng.desired_mut().glc_disabled = track.direct_out;
+        });
         return;
     }
     let bus = track.expected_sink_name();
@@ -543,6 +558,15 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
     }
     with_engine(|eng| {
         eng.desired_mut().set_bus_egress(&bus, dests);
+        if track.direct_out {
+            eng.desired_mut().glc_direct.insert(bus.clone());
+        } else {
+            eng.desired_mut().glc_direct.remove(&bus);
+        }
+        // Keep Master Direct → glc_disabled in lockstep if session already updated.
+        if let Some(m) = session.tracks.iter().find(|t| t.kind.is_master()) {
+            eng.desired_mut().glc_disabled = m.direct_out;
+        }
     });
 }
 
@@ -578,7 +602,7 @@ pub fn bind_master_clock(profile: &PerformanceProfile) -> anyhow::Result<String>
     })
 }
 
-/// Apply clock to one HW device. `bind_buschain` migrates BusChain buses (Master HW out).
+/// Apply clock to one HW device. `bind_buschain` force-rates Master HW only (GraphClock unchanged).
 pub fn bind_device_clock(
     device: &str,
     sample_rate: u32,
@@ -838,6 +862,47 @@ pub fn host_latency_ms(bus: &str, sample_rate: u32) -> f32 {
         return 0.0;
     }
     samples as f32 * 1000.0 / sample_rate as f32
+}
+
+/// Master-edge GLC compensation pad (samples / ms) for fan-in align readout.
+pub fn host_compensation_ms(bus: &str, sample_rate: u32) -> (u32, f32) {
+    let samples = buschain_engine::master_pad_samples(bus);
+    samples_to_ms(samples, sample_rate)
+}
+
+/// Path latency L(T) to wet out (samples / ms).
+pub fn host_path_latency_ms(bus: &str, sample_rate: u32) -> (u32, f32) {
+    let samples = buschain_engine::path_latency_samples(bus);
+    samples_to_ms(samples, sample_rate)
+}
+
+/// Master fan-in L* (longest stem path before pads).
+pub fn host_lstar_ms(sample_rate: u32) -> (u32, f32) {
+    let samples = buschain_engine::l_star_samples();
+    samples_to_ms(samples, sample_rate)
+}
+
+fn samples_to_ms(samples: u32, sample_rate: u32) -> (u32, f32) {
+    if sample_rate == 0 {
+        return (samples, 0.0);
+    }
+    (
+        samples,
+        samples as f32 * 1000.0 / sample_rate as f32,
+    )
+}
+
+/// One GraphClock quantum in ms (device/graph period).
+pub fn hw_quantum_ms(sample_rate: u32, quantum: u32) -> f32 {
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    quantum as f32 * 1000.0 / sample_rate as f32
+}
+
+/// True when Master Direct has disabled Master-edge GLC.
+pub fn glc_is_disabled() -> bool {
+    buschain_engine::glc_is_disabled()
 }
 
 pub fn stop_all_fx() {

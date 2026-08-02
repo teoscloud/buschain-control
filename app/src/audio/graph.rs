@@ -539,6 +539,7 @@ fn stream_from_props(index: u32, props: &[(String, String)], sink_key: &str) -> 
             // Hold is migrate parking — keep user streams visible/reclaimable in Apps.
             dest.starts_with("buschain_fx_")
                 || dest.starts_with("buschain_post_")
+                || dest.starts_with("buschain_glc_")
                 || dest.starts_with("buschain_mid_")
                 || dest.starts_with("buschain_rs_")
                 || dest.starts_with("buschain_mtr_")
@@ -886,6 +887,7 @@ fn is_buschain_sink_name(name: &str) -> bool {
         || name.starts_with("buschain_mid_")
         || name.starts_with("buschain_mtr_")
         || name.starts_with("buschain_post_")
+        || name.starts_with("buschain_glc_")
         || name.starts_with("buschain_rs_")
         || name == "buschain_hold"
 }

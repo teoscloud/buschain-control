@@ -1,4 +1,4 @@
-//! Graph clock domains — Master-HW-bound rate/quantum for all BusChain-owned nodes.
+//! Graph clock domains — BusChain engine rate/quantum (independent of Master HW).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -194,6 +194,88 @@ pub struct EndpointCaps {
 /// Safe fallback when no device is found (not a capability advertisement).
 const FALLBACK_RATES: &[u32] = &[48_000, 44_100, 96_000, 88_200];
 
+/// BusChain engine sample rates (Settings → Audio). Not clamped to Master HW caps.
+/// Includes DXD (352.8) and 384 kHz — archival / audiophile apex standards.
+pub const ENGINE_RATES: &[u32] = &[
+    44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+];
+
+/// Rates above this are valid but extreme (CPU / plugin risk) — UI should warn.
+pub const ENGINE_RATE_WARN_ABOVE: u32 = 192_000;
+
+/// BusChain engine quantum choices (powers of two).
+pub const ENGINE_QUANTUMS: &[u32] = &[64, 128, 256, 512, 1024, 2048];
+
+/// True for DXD / 384k-class engine rates (show a soft warning in Settings).
+pub fn engine_rate_is_extreme(rate: u32) -> bool {
+    rate > ENGINE_RATE_WARN_ABOVE
+}
+
+fn engine_allows_rate(rate: u32) -> bool {
+    ENGINE_RATES.contains(&rate)
+}
+
+fn engine_allows_quantum(q: u32) -> bool {
+    ENGINE_QUANTUMS.contains(&q)
+}
+
+fn snap_engine_rate(rate: u32) -> u32 {
+    ENGINE_RATES
+        .iter()
+        .copied()
+        .min_by_key(|c| rate.abs_diff(*c))
+        .unwrap_or(48_000)
+}
+
+fn snap_engine_quantum(q: u32) -> u32 {
+    let q = q.max(1).next_power_of_two();
+    ENGINE_QUANTUMS
+        .iter()
+        .copied()
+        .min_by_key(|c| q.abs_diff(*c))
+        .unwrap_or(256)
+}
+
+/// Resolve BusChain engine profile (independent of Master HW DeviceCaps).
+pub fn resolve_engine_profile(
+    preset: AudioPreset,
+    custom_rate: Option<u32>,
+    custom_quantum: Option<u32>,
+    soft_quantum: bool,
+) -> PerformanceProfile {
+    let (rate, quantum) = match preset {
+        AudioPreset::Balanced => (48_000, 256),
+        AudioPreset::LowLatency => (48_000, 64),
+        AudioPreset::Stable => (48_000, 512),
+        AudioPreset::Custom => {
+            let rate = custom_rate
+                .filter(|r| engine_allows_rate(*r))
+                .unwrap_or_else(|| {
+                    custom_rate
+                        .map(snap_engine_rate)
+                        .unwrap_or(48_000)
+                });
+            let quantum = custom_quantum
+                .filter(|q| engine_allows_quantum(*q))
+                .unwrap_or_else(|| {
+                    custom_quantum
+                        .map(snap_engine_quantum)
+                        .unwrap_or(256)
+                });
+            (rate, quantum)
+        }
+    };
+    PerformanceProfile {
+        preset,
+        sample_rate: rate.max(1),
+        quantum: quantum.max(1),
+        soft_quantum,
+        force_suspend_timeout_zero: true,
+        bound_device: String::new(),
+        device_limited: false,
+    }
+}
+
 /// Probe Master HW out from an already-listed sink table.
 pub fn probe_master_hw_from_sinks(
     sinks: &[DeviceNode],
@@ -257,6 +339,7 @@ fn is_buschain_helper(name: &str) -> bool {
     name.starts_with("buschain_fx_")
         || name.starts_with("buschain_post_")
         || name.starts_with("buschain_mid_")
+        || name.starts_with("buschain_glc_")
         || name.starts_with("buschain_rs_")
         || name == "buschain_hold"
 }
@@ -391,7 +474,10 @@ fn probe_alsa_momentary_rate(sink_name: &str) -> Option<u32> {
 }
 
 fn snap_common_rate(r: u32) -> u32 {
-    const CAND: &[u32] = &[8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+    const CAND: &[u32] = &[
+        8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
+        352_800, 384_000,
+    ];
     CAND
         .iter()
         .copied()
@@ -806,5 +892,46 @@ pub fn probe_endpoint_caps(name: &str) -> EndpointCaps {
         name: node.to_string(),
         rate,
         channels: Some(2),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_profile_allows_192k_independent_of_hw() {
+        let p = resolve_engine_profile(AudioPreset::Custom, Some(192_000), Some(256), true);
+        assert_eq!(p.sample_rate, 192_000);
+        assert_eq!(p.quantum, 256);
+        assert!(!p.device_limited);
+    }
+
+    #[test]
+    fn engine_profile_allows_dxd_and_384k() {
+        let dxd = resolve_engine_profile(AudioPreset::Custom, Some(352_800), Some(512), true);
+        assert_eq!(dxd.sample_rate, 352_800);
+        assert!(engine_rate_is_extreme(dxd.sample_rate));
+        let apex = resolve_engine_profile(AudioPreset::Custom, Some(384_000), Some(512), true);
+        assert_eq!(apex.sample_rate, 384_000);
+        assert!(engine_rate_is_extreme(apex.sample_rate));
+        assert!(!engine_rate_is_extreme(192_000));
+    }
+
+    #[test]
+    fn engine_presets_are_catalog_defaults() {
+        let bal = resolve_engine_profile(AudioPreset::Balanced, None, None, true);
+        assert_eq!((bal.sample_rate, bal.quantum), (48_000, 256));
+        let low = resolve_engine_profile(AudioPreset::LowLatency, None, None, false);
+        assert_eq!((low.sample_rate, low.quantum), (48_000, 64));
+        let stab = resolve_engine_profile(AudioPreset::Stable, None, None, true);
+        assert_eq!((stab.sample_rate, stab.quantum), (48_000, 512));
+    }
+
+    #[test]
+    fn engine_custom_snaps_unknown_rate() {
+        let p = resolve_engine_profile(AudioPreset::Custom, Some(50_000), Some(200), true);
+        assert!(ENGINE_RATES.contains(&p.sample_rate));
+        assert!(ENGINE_QUANTUMS.contains(&p.quantum));
     }
 }

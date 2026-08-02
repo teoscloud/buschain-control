@@ -7,7 +7,9 @@ use crate::audio::plugin::PluginRef;
 use buschain_engine::PerformanceProfile;
 
 pub mod store;
+pub mod themes;
 pub use store::{list_sessions, load_active, resolve_devices, ResolveReport, SessionMeta};
+pub use themes::{list_themes, load_theme, save_theme, delete_theme, ThemeMeta, ThemePreset};
 
 /// Per-hardware-device clock preference (Output / Input device panels).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +92,10 @@ pub struct Track {
     /// wet tap (or bus.monitor when dry). Opt-in; not available on Master.
     #[serde(default)]
     pub virtual_input: bool,
+    /// Direct Out — skip Master fan-in GLC for this stem (desktop default: on).
+    /// Master Direct disables graph sync globally. Turn off to align nested routes.
+    #[serde(default = "default_true")]
+    pub direct_out: bool,
     /// Runtime: null-sink / filter-chain sink name for this track
     #[serde(skip)]
     pub sink_name: Option<String>,
@@ -188,7 +194,8 @@ pub struct Session {
 }
 
 fn default_accent_rgb() -> [u8; 3] {
-    [0xc9, 0xa2, 0x6b]
+    // Platform mint / teal
+    [0x6e, 0xaa, 0x96]
 }
 
 impl Default for Session {
@@ -216,6 +223,7 @@ impl Default for Session {
                     output_targets: vec![],
                     virtual_output: true,
                     virtual_input: false,
+                    direct_out: true,
                     sink_name: None,
                 },
                 Track {
@@ -234,6 +242,7 @@ impl Default for Session {
                     output_targets: vec![master_id],
                     virtual_output: false,
                     virtual_input: false,
+                    direct_out: true,
                     sink_name: None,
                 },
             ],
@@ -351,21 +360,19 @@ impl Session {
         dirty
     }
 
-    /// Snap Custom rate/quantum to true Master HW caps (drops phantom 192k etc.).
+    /// Snap engine rate/quantum to the BusChain catalog (independent of Master HW).
     pub fn clamp_performance_to_device(&mut self) {
-        use buschain_engine::{probe_master_hw, resolve_profile, AudioPreset};
-        let caps = probe_master_hw(self.master_output.as_deref());
+        use buschain_engine::{resolve_engine_profile, AudioPreset};
         let soft = self.performance.soft_quantum;
         let preset = self.performance.preset;
         self.performance = match preset {
-            AudioPreset::Custom => resolve_profile(
+            AudioPreset::Custom => resolve_engine_profile(
                 AudioPreset::Custom,
-                &caps,
                 Some(self.performance.sample_rate),
                 Some(self.performance.quantum),
                 soft,
             ),
-            other => resolve_profile(other, &caps, None, None, soft),
+            other => resolve_engine_profile(other, None, None, soft),
         };
     }
 
@@ -383,6 +390,11 @@ impl Session {
     pub fn add_track(&mut self, name: impl Into<String>) -> Uuid {
         let id = Uuid::new_v4();
         let master = self.master_id();
+        // Inherit Master's Direct Out so new stems match the session sync policy.
+        let direct_out = master
+            .and_then(|mid| self.tracks.iter().find(|t| t.id == mid))
+            .map(|t| t.direct_out)
+            .unwrap_or(true);
         self.tracks.push(Track {
             id,
             name: name.into(),
@@ -400,6 +412,7 @@ impl Session {
             // Opt-in: new buses are not system virtual devices until enabled.
             virtual_output: false,
             virtual_input: false,
+            direct_out,
             sink_name: None,
         });
         id

@@ -20,19 +20,22 @@ pub use fx_busy::{is_rebuilding as fx_is_rebuilding, RebuildGuard as FxRebuildGu
 pub use fx_gen::{any_gen_live, heal_live_gen, live_fx_name, live_post_name};
 
 pub use clock::{
-    invalidate_clock_probe_caches, probe_endpoint_caps, probe_master_hw_from_sinks, probe_rates_pw,
-    probe_sink_running_rate, probe_source_running_rate, resolve_profile, set_graph_force_clock,
-    wait_hw_running_rate, AudioPreset, DeviceCaps, EndpointCaps, GraphClock, PerformanceProfile,
+    engine_rate_is_extreme, invalidate_clock_probe_caches, probe_endpoint_caps,
+    probe_master_hw_from_sinks, probe_rates_pw, probe_sink_running_rate, probe_source_running_rate,
+    resolve_engine_profile, resolve_profile, set_graph_force_clock, wait_hw_running_rate,
+    AudioPreset, DeviceCaps, EndpointCaps, GraphClock, PerformanceProfile, ENGINE_QUANTUMS,
+    ENGINE_RATES, ENGINE_RATE_WARN_ABOVE,
 };
 pub use contract::{ApplyReport, ClockProps, Intent};
 pub use domain::{
-    bus_suffix, fx_name_for_bus, mtr_name_for_bus, normalize_ladspa_label, post_name_for_bus,
-    ChainEnsureMode, ChainSpec, ChainState, DeviceNode, GraphSnapshot, InsertFormat, InsertSlot,
-    LinkSpec, NodeName, NodeRole, NodeSpec, Props, WirePlan,
+    bus_suffix, fx_name_for_bus, glc_name_for_bus, mtr_name_for_bus, normalize_ladspa_label,
+    post_name_for_bus, ChainEnsureMode, ChainSpec, ChainState, DeviceNode, GraphSnapshot,
+    InsertFormat, InsertSlot, LinkSpec, NodeName, NodeRole, NodeSpec, Props, WirePlan,
 };
 pub use plan::{BusLevel, DesiredState};
 pub use pipeline::{
-    dry_spine_instant_ready, spine_instant_ready, track_path_ready, DRY_DWELL, WET_DWELL,
+    dry_spine_instant_ready, glc_is_disabled, is_glc_node, l_star_samples, master_pad_samples,
+    path_latency_samples, spine_instant_ready, track_path_ready, DRY_DWELL, WET_DWELL,
 };
 pub use midi::{
     enumerate_devices, MidiAction, MidiCcMap, MidiDeviceInfo, MidiDeviceLive, MidiIntent,

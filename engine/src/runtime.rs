@@ -109,6 +109,13 @@ impl Engine {
         &self.last_applied_bus_inputs
     }
 
+    /// Force next `reconcile_bus_inputs` to re-ensure every track hop (clock bind /
+    /// rate-bridge teardown). Cleared fingerprint → `ensure_clocked_route_force`.
+    pub fn invalidate_capture_apply_state(&mut self) {
+        self.capture_applied = false;
+        self.last_applied_bus_inputs.clear();
+    }
+
     pub fn desired_mut(&mut self) -> &mut DesiredState {
         &mut self.desired
     }
@@ -123,68 +130,22 @@ impl Engine {
         self.last_clock = c;
     }
 
-    /// Force PipeWire graph clock, wait for Master HW, push BusChain props, drop helpers.
-    pub fn bind_master_clock_profile(
+    /// Bind BusChain GraphClock only — migrate buses/FX helpers, tear rate bridges.
+    /// Does **not** force PipeWire `clock.force-rate` (Master HW owns that).
+    pub fn bind_graph_clock_profile(
         &mut self,
         profile: PerformanceProfile,
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         let new_clock = profile.graph_clock();
-        let hw = if !profile.bound_device.is_empty() {
-            profile.bound_device.clone()
-        } else {
-            self.desired
-                .master_hw
-                .clone()
-                .or_else(|| self.master_hw.clone())
-                .unwrap_or_default()
-        };
+        let hw = self
+            .desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone())
+            .unwrap_or_default();
         if !hw.is_empty() {
             self.remember_master_hw(&hw);
-        }
-
-        // Balanced / non-Custom: clear force so HW can settle at its preferred rate.
-        // Custom: force the selected capable rate (+ quantum unless soft).
-        let (force_rate, force_q) = match profile.preset {
-            AudioPreset::Custom => (
-                profile.sample_rate,
-                if profile.soft_quantum {
-                    0
-                } else {
-                    profile.quantum
-                },
-            ),
-            _ => (0, 0),
-        };
-        match set_graph_force_clock(force_rate, force_q) {
-            Ok(()) => {
-                crate::clock::invalidate_clock_probe_caches();
-                if force_rate > 0 {
-                    report.push(format!("force-rate {force_rate}"));
-                } else {
-                    report.push("force-rate cleared");
-                }
-            }
-            Err(e) => report.push(format!("force-rate: {e}")),
-        }
-
-        let want_rate = profile.sample_rate;
-        let hw_ok = if hw.is_empty() {
-            false
-        } else {
-            wait_hw_running_rate(&hw, want_rate, Duration::from_secs(3))
-        };
-        if hw.is_empty() {
-            report.push("no Master HW sink — binding BusChain clock only");
-        } else if hw_ok {
-            report.push(format!("HW running {want_rate} Hz"));
-        } else {
-            let live = probe_sink_running_rate(&hw)
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "?".into());
-            report.push(format!(
-                "WARN: HW still {live} Hz (wanted {want_rate}) — BusChain bound anyway"
-            ));
         }
 
         let changed = new_clock != self.last_clock;
@@ -233,26 +194,93 @@ impl Engine {
             report.push(format!("recreated {migrated} app bus(es) at GraphClock"));
         }
 
-        // Drop inbound bridges + post helpers so Hotplug rebuilds at the new clock.
+        // Drop inbound + egress bridges + post helpers so ClockBind rebuilds hops.
         let _ = self.backend.teardown_rate_bridges();
         self.desired.bridges.clear();
         self.destroy_post_helpers(&mut report);
+        // Fingerprints still match Desired after teardown — without this,
+        // reconcile_bus_inputs idle-skips and every In stays silent.
+        self.invalidate_capture_apply_state();
 
         if changed {
             report.push(format!(
-                "clock bound {} Hz q{}",
+                "engine clock {} Hz q{}",
                 new_clock.sample_rate, new_clock.quantum
             ));
         } else {
             report.push(format!(
-                "clock reasserted {} Hz q{}",
+                "engine clock reasserted {} Hz q{}",
                 new_clock.sample_rate, new_clock.quantum
             ));
         }
         self.last_clock = new_clock;
-        // Mark device_limited false in desired sense — profile already resolved.
         let _ = profile;
         Ok(report)
+    }
+
+    /// Force-rate Master HW only — leaves BusChain GraphClock unchanged.
+    pub fn bind_master_hw_clock(
+        &mut self,
+        device: &str,
+        sample_rate: u32,
+        quantum: u32,
+        soft_quantum: bool,
+    ) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+        if !device.is_empty() {
+            self.remember_master_hw(device);
+        }
+        let force_q = if soft_quantum { 0 } else { quantum };
+        match set_graph_force_clock(sample_rate, force_q) {
+            Ok(()) => {
+                crate::clock::invalidate_clock_probe_caches();
+                report.push(format!("HW force-rate {sample_rate} q{force_q} ({device})"));
+            }
+            Err(e) => report.push(format!("force-rate: {e}")),
+        }
+        if device.is_empty() {
+            report.push("no Master HW sink");
+        } else if wait_hw_running_rate(device, sample_rate, Duration::from_secs(3)) {
+            report.push(format!("HW running {sample_rate} Hz"));
+        } else {
+            let live = probe_sink_running_rate(device)
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "?".into());
+            report.push(format!(
+                "WARN: HW still {live} Hz (wanted {sample_rate}) — GraphClock unchanged"
+            ));
+        }
+        // Egress converter depends on HW running rate — drop stale rs_out hops.
+        let stale_out: Vec<String> = self
+            .desired
+            .bridges
+            .keys()
+            .filter(|b| b.starts_with("buschain_rs_out_"))
+            .cloned()
+            .collect();
+        for bridge in &stale_out {
+            let mon = format!("{bridge}.monitor");
+            let _ = self.backend.destroy_node(bridge);
+            self.desired.bridges.remove(bridge);
+            self.desired.routes.retain(|(s, d)| {
+                s != bridge && d != bridge && s != &mon && d != &mon
+            });
+        }
+        if !stale_out.is_empty() {
+            report.push(format!("cleared {} egress bridge(s)", stale_out.len()));
+        }
+        // Global force-rate moves mic/source domains — inbound bridges must rebuild.
+        // Without invalidate, idle SyncCapture skip leaves every In silent.
+        self.invalidate_capture_apply_state();
+        Ok(report)
+    }
+
+    /// Legacy name — Settings Apply binds the engine GraphClock only.
+    pub fn bind_master_clock_profile(
+        &mut self,
+        profile: PerformanceProfile,
+    ) -> Result<ApplyReport> {
+        self.bind_graph_clock_profile(profile)
     }
 
     fn destroy_post_helpers(&mut self, report: &mut ApplyReport) {
@@ -422,6 +450,7 @@ impl Engine {
                     let _ = crate::host::registry::teardown_host(&bus);
                 }
                 crate::host::dry_meter::teardown_all_dry_meters();
+                pipeline::glc::teardown_all_nodes();
                 let vins: Vec<String> = self.desired.virtual_inputs.keys().cloned().collect();
                 for bus in vins {
                     let _ = crate::backend::teardown_virtual_input(&bus);
@@ -508,38 +537,35 @@ impl Engine {
                 bind_buschain,
             } => {
                 if bind_buschain {
-                    let profile = PerformanceProfile {
-                        preset: AudioPreset::Custom,
+                    // Master HW Apply: force-rate the device only — GraphClock stays.
+                    let r = self.bind_master_hw_clock(
+                        &device,
                         sample_rate,
                         quantum,
                         soft_quantum,
-                        force_suspend_timeout_zero: true,
-                        bound_device: device.clone(),
-                        device_limited: false,
-                    };
-                    let r = self.bind_master_clock_profile(profile)?;
+                    )?;
                     for m in r.messages {
                         report.push(m);
                     }
                 } else {
-                    let force_q = if soft_quantum { 0 } else { quantum };
-                    match set_graph_force_clock(sample_rate, force_q) {
-                        Ok(()) => report.push(format!(
-                            "device force-rate {sample_rate} q{force_q} ({device})"
+                    // Secondary sink/source: prefs only (Master HW owns force-rate).
+                    report.push(format!(
+                        "device clock prefs {sample_rate} Hz q{quantum} ({device}) — graph clock unchanged"
+                    ));
+                    let live = probe_sink_running_rate(&device)
+                        .or_else(|| crate::clock::probe_source_running_rate(&device));
+                    match live {
+                        Some(r) if r == sample_rate => {
+                            report.push(format!("{device} already running {sample_rate} Hz"));
+                        }
+                        Some(r) => report.push(format!(
+                            "note: {device} at {r} Hz (wanted {sample_rate}; Master HW owns force-rate)"
                         )),
-                        Err(e) => report.push(format!("force-rate: {e}")),
+                        None => report.push(format!(
+                            "note: {device} rate unknown (wanted {sample_rate}; Master HW owns force-rate)"
+                        )),
                     }
-                    if wait_hw_running_rate(&device, sample_rate, Duration::from_secs(3)) {
-                        report.push(format!("{device} running {sample_rate} Hz"));
-                    } else {
-                        let live = probe_sink_running_rate(&device)
-                            .or_else(|| crate::clock::probe_source_running_rate(&device))
-                            .map(|r| r.to_string())
-                            .unwrap_or_else(|| "?".into());
-                        report.push(format!(
-                            "WARN: {device} still {live} Hz (wanted {sample_rate})"
-                        ));
-                    }
+                    let _ = soft_quantum;
                 }
             }
         }
@@ -1259,25 +1285,39 @@ impl Engine {
     }
 
     fn prune_stale_rate_bridges(&mut self, report: &mut ApplyReport) {
+        // Dual-clock: egress `buschain_rs_out_*` intentionally runs at Master HW
+        // rate (≠ GraphClock). Never treat those as stale, and never blanket-
+        // teardown all bridges — that silences every In until a full SyncCapture.
         let clock_rate = self.desired.clock.sample_rate;
         let Ok(names) = self.backend.list_sink_names() else {
             return;
         };
         let mut removed = 0u32;
+        let mut killed_inbound = false;
         for name in names {
-            if !name.starts_with("buschain_rs_") {
+            if name.starts_with("buschain_rs_out_") {
+                continue;
+            }
+            if !name.starts_with("buschain_rs_") && !name.starts_with("shadow_rs_") {
+                continue;
+            }
+            // Keep bridges we still bookkeep as Desired.
+            if self.desired.bridges.contains_key(&name) {
                 continue;
             }
             let live = crate::clock::probe_sink_running_rate(&name).unwrap_or(0);
             if live != 0 && clock_rate != 0 && live != clock_rate {
                 let _ = self.backend.destroy_node(&name);
                 removed += 1;
+                killed_inbound = true;
             }
         }
         if removed > 0 {
-            let _ = self.backend.teardown_rate_bridges();
-            self.desired.bridges.clear();
-            report.push(format!("pruned {removed} stale rate-bridge(s)"));
+            report.push(format!("pruned {removed} orphan inbound rate-bridge(s)"));
+        }
+        if killed_inbound {
+            // Fingerprints still match Desired after destroy — force capture heal.
+            self.invalidate_capture_apply_state();
         }
     }
 
@@ -1728,6 +1768,7 @@ impl Engine {
         let state = pipeline::insert::ensure_fx_chain(
             &mut self.fx,
             &mut self.backend,
+            &mut self.desired,
             &clock,
             &spec,
             mode,
@@ -1747,11 +1788,10 @@ impl Engine {
             if self.mixer_muted(&bus) {
                 pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
             } else if arm_egress {
-                // Multi-dest: arm every configured hop after primary wet land.
+                // Re-arm via Engine so Master-edge GLC pads apply (insert_host
+                // arms the bare pipeline without reconcile).
                 let dests = self.desired.egress_dests(&bus);
-                if dests.len() > 1 {
-                    let _ = self.arm_track_egress(&bus, true, &dests);
-                }
+                let _ = self.arm_track_egress(&bus, true, &dests);
             }
         }
         Ok(state)
@@ -2020,7 +2060,14 @@ impl Engine {
                 && (crate::host::registry::host_running("buschain_master")
                     || pipeline::arm::spine_instant_ready("buschain_master")
                     || self.chain_is_wet("buschain_master"));
-            if let Err(e) = pipeline::arm::arm_master_hw(&mut self.backend, &hw, wet) {
+            let clock = self.desired.clock.clone();
+            if let Err(e) = pipeline::arm::arm_master_hw(
+                &mut self.backend,
+                &mut self.desired,
+                &clock,
+                &hw,
+                wet,
+            ) {
                 report.push(format!("arm Master→HW: {e:#}"));
             } else {
                 report.push(format!(
@@ -2107,6 +2154,8 @@ impl Engine {
         self.prune_stale_rate_bridges(&mut report);
         self.prune_parallel_fx_routes(&mut report);
         self.heal_dry_egress(&mut report);
+        // If prune invalidated capture, rebuild hops even on the no-fx idle path.
+        self.reconcile_bus_inputs(&mut report, true);
         self.reconcile_master_and_default(&mut report)?;
         if report.messages.is_empty() {
             report.push("reconcile light (no fx) ok");
@@ -2135,6 +2184,21 @@ impl Engine {
             }
         }
         self.prune_orphan_track_buses(&mut report);
+        // Master fan-in GLC before arming so δ>0 nodes exist and δ=0 stays direct.
+        match pipeline::glc::reconcile(&self.desired) {
+            Ok(plan) => {
+                let pads: Vec<String> = plan
+                    .master_pad
+                    .iter()
+                    .filter(|(_, d)| **d > 0)
+                    .map(|(b, d)| format!("{b}:δ={d}"))
+                    .collect();
+                if !pads.is_empty() {
+                    report.push(format!("glc L*={} [{}]", plan.l_star, pads.join(", ")));
+                }
+            }
+            Err(e) => report.push(format!("glc: {e:#}")),
+        }
         // Re-arm every bus egress from Desired (listen / outs / Master).
         // Capture hops are Intent::SyncCapture / reconcile_inputs_only.
         let buses: Vec<String> = self.desired.buses.keys().cloned().collect();
@@ -2235,6 +2299,7 @@ impl Engine {
         self.fx.stop_all();
         self.desired.fx_chains.clear();
         crate::host::dry_meter::teardown_all_dry_meters();
+        pipeline::glc::teardown_all_nodes();
     }
 
     /// Convenience: ensure null-sink with current clock (used by graph shim).
@@ -2277,7 +2342,17 @@ impl Engine {
             pipeline::arm::disarm_track_egress(&mut self.backend, bus, true);
             return Ok(());
         }
-        pipeline::arm::arm_track_egress(&mut self.backend, bus, wet, dests)
+        // Master fan-in GLC: δ>0 nodes before Master links; Track→Track unchanged.
+        let _ = pipeline::glc::reconcile(&self.desired);
+        let clock = self.desired.clock.clone();
+        pipeline::arm::arm_track_egress(
+            &mut self.backend,
+            &mut self.desired,
+            &clock,
+            bus,
+            wet,
+            dests,
+        )
     }
 
     pub fn ensure_link_raw(&mut self, source: &str, sink: &str) -> Result<()> {

@@ -49,6 +49,7 @@ fn is_internal_helper(name: &str) -> bool {
         || name == "auto_null"
         || name.starts_with("buschain_hold")
         || name.starts_with("buschain_post_")
+        || name.starts_with("buschain_glc_")
         || name.starts_with("buschain_rs_")
         || name.starts_with("buschain_vinf_")
         || name.starts_with("buschain_fx_")
@@ -122,7 +123,7 @@ fn pill_tab(ui: &mut egui::Ui, theme: &dyn Theme, label: &str, active: bool) -> 
                     theme.border_soft()
                 },
             ))
-            .corner_radius(CornerRadius::same(12)),
+            .corner_radius(CornerRadius::ZERO),
     )
 }
 
@@ -139,7 +140,7 @@ fn badge(ui: &mut egui::Ui, theme: &dyn Theme, label: &str, accent: bool) {
     };
     egui::Frame::NONE
         .fill(fill)
-        .corner_radius(CornerRadius::same(4))
+        .corner_radius(CornerRadius::ZERO)
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(9.0).strong().color(color));

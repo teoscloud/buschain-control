@@ -44,7 +44,9 @@ pub fn draw_plugin_windows(ctx: &egui::Context, state: &mut AppState) {
     let mut toggle_fs: Option<(Uuid, Uuid)> = None;
     let mut focus: Option<(Uuid, Uuid)> = None;
 
+    // Options window owns Esc when open — don't also close a plugin editor.
     let esc = !keys.is_empty()
+        && !state.win_options
         && !ctx.wants_keyboard_input()
         && ctx.input(|i| i.key_pressed(Key::Escape));
     if esc {

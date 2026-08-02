@@ -1,7 +1,9 @@
-//! Master-bus plugin delay compensation (non-RT bookkeeping + RT-safe delay line).
+//! Rack latency bookkeeping + RT-safe delay line.
 //!
-//! Policy: delay each track host output to `max_latency` among Master peers.
-//! The RT delay line lives in [`HostRtState`] — this module only computes targets.
+//! When Master fan-in GLC is active (`!glc::is_disabled()`), reported rack latency
+//! feeds `L_local` and host peer pads stay 0. When Master Direct disables GLC,
+//! host-side peer PDC pads each FX wet out to `max` reported latency among peers
+//! (legacy behavior). DelayLine is also reused by GLC filter nodes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,26 +19,48 @@ fn targets() -> &'static Mutex<HashMap<String, AtomicU32>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Non-RT: publish reported rack latency for `bus` and recompute peer delays.
-pub fn set_bus_latency(bus: &str, latency: u32) {
-    if let Ok(mut g) = reported().lock() {
-        g.insert(bus.to_string(), latency);
-        let max = g.values().copied().max().unwrap_or(0);
-        let snapshot: Vec<(String, u32)> = g
-            .iter()
-            .map(|(b, l)| (b.clone(), max.saturating_sub(*l)))
-            .collect();
-        drop(g);
-        if let Ok(mut t) = targets().lock() {
-            for (b, d) in snapshot {
-                t.entry(b)
-                    .or_insert_with(|| AtomicU32::new(0))
-                    .store(d, Ordering::Release);
-            }
+/// Recompute host peer pads from the reported map (call after Master Direct toggles).
+pub fn refresh_peer_pads() {
+    let glc_off = crate::pipeline::glc::is_disabled();
+    let snapshot: Vec<(String, u32)> = {
+        let Ok(g) = reported().lock() else {
+            return;
+        };
+        let max = if glc_off {
+            g.values().copied().max().unwrap_or(0)
+        } else {
+            0
+        };
+        g.iter()
+            .map(|(b, l)| {
+                let d = if glc_off {
+                    max.saturating_sub(*l)
+                } else {
+                    0
+                };
+                (b.clone(), d)
+            })
+            .collect()
+    };
+    if let Ok(mut t) = targets().lock() {
+        for (b, d) in snapshot {
+            t.entry(b)
+                .or_insert_with(|| AtomicU32::new(0))
+                .store(d, Ordering::Release);
         }
     }
 }
 
+/// Non-RT: publish reported rack latency for `bus`.
+/// Peer pads follow Master Direct (GLC off) vs GLC-on policy.
+pub fn set_bus_latency(bus: &str, latency: u32) {
+    if let Ok(mut g) = reported().lock() {
+        g.insert(bus.to_string(), latency);
+    }
+    refresh_peer_pads();
+}
+
+/// Host-side peer pad samples (non-zero only when GLC is disabled).
 pub fn compensation_samples(bus: &str) -> u32 {
     targets()
         .lock()
@@ -60,22 +84,7 @@ pub fn remove_bus(bus: &str) {
     if let Ok(mut g) = targets().lock() {
         g.remove(bus);
     }
-    // Recompute remaining peers.
-    if let Ok(g) = reported().lock() {
-        let max = g.values().copied().max().unwrap_or(0);
-        let snapshot: Vec<(String, u32)> = g
-            .iter()
-            .map(|(b, l)| (b.clone(), max.saturating_sub(*l)))
-            .collect();
-        drop(g);
-        if let Ok(mut t) = targets().lock() {
-            for (b, d) in snapshot {
-                t.entry(b)
-                    .or_insert_with(|| AtomicU32::new(0))
-                    .store(d, Ordering::Release);
-            }
-        }
-    }
+    refresh_peer_pads();
 }
 
 /// Snapshot of (bus, compensation_samples) for pushing into live hosts.

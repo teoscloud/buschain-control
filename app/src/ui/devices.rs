@@ -143,7 +143,7 @@ pub fn draw_device_clock_panel(
 
     ui.horizontal(|ui| {
         let label = if is_master_hw {
-            "Apply clock + BusChain"
+            "Apply Master HW clock"
         } else {
             "Apply device clock"
         };
@@ -275,6 +275,7 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                 // Always hide helpers + pre-rebrand Shadow Audio leftovers.
                 if s.name.starts_with("buschain_fx_")
                     || s.name.starts_with("buschain_post_")
+                    || s.name.starts_with("buschain_glc_")
                     || s.name.starts_with("buschain_mid_")
                     || s.name.starts_with("buschain_rs_")
                     || s.name.starts_with("buschain_vinf_")
@@ -337,133 +338,132 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                 .unwrap_or_else(|| sink.description.clone());
 
             design::panel(ui, &theme, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(&label)
-                                .size(13.0)
-                                .strong()
-                                .color(theme.text()),
-                        );
-                        ui.label(
-                            RichText::new(&sink.name)
-                                .size(10.0)
-                                .monospace()
-                                .color(theme.text_muted()),
-                        );
-                        if is_app_bus {
-                            ui.label(
-                                RichText::new("Mixer-owned bus — use strip fader / mute")
-                                    .size(10.0)
-                                    .color(theme.warning()),
-                            );
-                        } else if is_shadow {
-                            ui.label(
-                                RichText::new("BusChain helper (not a hardware device)")
-                                    .size(10.0)
-                                    .color(theme.warning()),
-                            );
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !is_shadow {
-                            let hw_btn = design::button(
-                                ui,
-                                &theme,
-                                "Master HW out",
-                                is_active_hw,
-                            )
-                            .on_hover_text(
-                                "Master bus plays to this device — applied live",
-                            );
-                            if hw_btn.clicked() {
-                                state.session.master_output = Some(sink.name.clone());
-                                state.session.master_output_desc =
-                                    Some(sink.description.clone());
-                                let _ = state.session.save();
-                                // Light relink only — clock bind is explicit Apply.
-                                state.worker.send(Command::SetMasterHw {
-                                    name: sink.name.clone(),
-                                    desc: Some(sink.description.clone()),
-                                });
-                                state.status = format!("Master HW out → {}", sink.description);
-                            }
-                        }
-                        let is_fx = sink.name.starts_with("buschain_fx_")
-                            || sink.name.starts_with("buschain_post_")
-                            || sink.name.starts_with("buschain_rs_")
-                            || sink.name == "buschain_hold"
-                            || sink.name.starts_with("shadow_");
-                        let is_hidden_track = sink.name.starts_with("buschain_track_")
-                            && !state.session.tracks.iter().any(|t| {
-                                t.expected_sink_name() == sink.name && t.virtual_output
-                            });
-                        let can_default = !is_fx && !is_hidden_track;
-                        if can_default {
-                            let def_btn = design::button(
-                                ui,
-                                &theme,
-                                "System default",
-                                is_active_def,
-                            )
-                            .on_hover_text(
-                                "Apps open onto this sink. Prefer a BusChain track bus \
-                                 or Master (not raw HW). Watchdog reasserts if WirePlumber fights.",
-                            );
-                            if def_btn.clicked() {
-                                if sink.name.starts_with("buschain_track_") {
-                                    if let Some(t) = state
-                                        .session
-                                        .tracks
-                                        .iter_mut()
-                                        .find(|t| t.expected_sink_name() == sink.name)
-                                    {
-                                        t.virtual_output = true;
-                                    }
-                                }
-                                state.session.preferred_default_sink = Some(sink.name.clone());
-                                // Optimistic UI — don't wait for the slow snapshot poll.
-                                state.snapshot.default_sink = Some(sink.name.clone());
-                                state
-                                    .worker
-                                    .send(Command::SetDefaultSink(sink.name.clone()));
-                                let _ = state.session.save();
-                                state.status =
-                                    format!("System default → {}", sink.description);
-                            }
-                        }
-                        if !is_app_bus {
-                            let sink_name = sink.name.clone();
-                            let mut mute = sink.mute;
-                            if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
-                                .changed()
-                            {
-                                if is_active_hw {
-                                    let _ = crate::ipc::Client::call_fast(
-                                        &crate::ipc::Request::SetHwMute { mute },
-                                    )
-                                    .or_else(|_| {
-                                        crate::ipc::Client::call(&crate::ipc::Request::SetHwMute {
-                                            mute,
-                                        })
-                                    });
-                                } else {
-                                    state.worker.send(Command::SetSinkMute {
-                                        name: sink_name.clone(),
+                // Title on its own row — never share horizontal space with action chips.
+                ui.label(
+                    RichText::new(&label)
+                        .size(13.0)
+                        .strong()
+                        .color(theme.text()),
+                );
+                ui.label(
+                    RichText::new(&sink.name)
+                        .size(10.0)
+                        .monospace()
+                        .color(theme.text_muted()),
+                );
+                if is_app_bus {
+                    ui.label(
+                        RichText::new("Mixer-owned bus — use strip fader / mute")
+                            .size(10.0)
+                            .color(theme.warning()),
+                    );
+                } else if is_shadow {
+                    ui.label(
+                        RichText::new("BusChain helper (not a hardware device)")
+                            .size(10.0)
+                            .color(theme.warning()),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if !is_app_bus {
+                        let sink_name = sink.name.clone();
+                        let mut mute = sink.mute;
+                        if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
+                            .changed()
+                        {
+                            if is_active_hw {
+                                let _ = crate::ipc::Client::call_fast(
+                                    &crate::ipc::Request::SetHwMute { mute },
+                                )
+                                .or_else(|_| {
+                                    crate::ipc::Client::call(&crate::ipc::Request::SetHwMute {
                                         mute,
-                                    });
-                                }
-                                if let Some(s) = state
-                                    .snapshot
-                                    .sinks
-                                    .iter_mut()
-                                    .find(|s| s.name == sink_name)
-                                {
-                                    s.mute = mute;
-                                }
+                                    })
+                                });
+                            } else {
+                                state.worker.send(Command::SetSinkMute {
+                                    name: sink_name.clone(),
+                                    mute,
+                                });
+                            }
+                            if let Some(s) = state
+                                .snapshot
+                                .sinks
+                                .iter_mut()
+                                .find(|s| s.name == sink_name)
+                            {
+                                s.mute = mute;
                             }
                         }
-                    });
+                    }
+                    let is_fx = sink.name.starts_with("buschain_fx_")
+                        || sink.name.starts_with("buschain_post_")
+                        || sink.name.starts_with("buschain_glc_")
+                        || sink.name.starts_with("buschain_rs_")
+                        || sink.name == "buschain_hold"
+                        || sink.name.starts_with("shadow_");
+                    let is_hidden_track = sink.name.starts_with("buschain_track_")
+                        && !state.session.tracks.iter().any(|t| {
+                            t.expected_sink_name() == sink.name && t.virtual_output
+                        });
+                    let can_default = !is_fx && !is_hidden_track;
+                    if can_default {
+                        let def_btn = design::button(
+                            ui,
+                            &theme,
+                            "System default",
+                            is_active_def,
+                        )
+                        .on_hover_text(
+                            "Apps open onto this sink. Prefer a BusChain track bus \
+                             or Master (not raw HW). Watchdog reasserts if WirePlumber fights.",
+                        );
+                        if def_btn.clicked() {
+                            if sink.name.starts_with("buschain_track_") {
+                                if let Some(t) = state
+                                    .session
+                                    .tracks
+                                    .iter_mut()
+                                    .find(|t| t.expected_sink_name() == sink.name)
+                                {
+                                    t.virtual_output = true;
+                                }
+                            }
+                            state.session.preferred_default_sink = Some(sink.name.clone());
+                            // Optimistic UI — don't wait for the slow snapshot poll.
+                            state.snapshot.default_sink = Some(sink.name.clone());
+                            state
+                                .worker
+                                .send(Command::SetDefaultSink(sink.name.clone()));
+                            let _ = state.session.save();
+                            state.status =
+                                format!("System default → {}", sink.description);
+                        }
+                    }
+                    if !is_shadow {
+                        let hw_btn = design::button(
+                            ui,
+                            &theme,
+                            "Master HW out",
+                            is_active_hw,
+                        )
+                        .on_hover_text(
+                            "Master bus plays to this device — applied live",
+                        );
+                        if hw_btn.clicked() {
+                            state.session.master_output = Some(sink.name.clone());
+                            state.session.master_output_desc =
+                                Some(sink.description.clone());
+                            let _ = state.session.save();
+                            // Light relink only — clock bind is explicit Apply.
+                            state.worker.send(Command::SetMasterHw {
+                                name: sink.name.clone(),
+                                desc: Some(sink.description.clone()),
+                            });
+                            state.status = format!("Master HW out → {}", sink.description);
+                        }
+                    }
                 });
                 if is_app_bus {
                     ui.label(
@@ -558,42 +558,39 @@ pub fn draw_input_devices(ui: &mut egui::Ui, state: &mut AppState) {
             .collect();
         for src in sources {
             design::panel(ui, &theme, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(&src.description)
-                                .size(13.0)
-                                .strong()
-                                .color(theme.text()),
-                        );
-                        ui.label(
-                            RichText::new(&src.name)
-                                .size(10.0)
-                                .monospace()
-                                .color(theme.text_muted()),
-                        );
-                    });
-                    let is_def_src = state.snapshot.default_source.as_deref()
-                        == Some(src.name.as_str());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if design::button(ui, &theme, "System default", is_def_src).clicked() {
-                            state.snapshot.default_source = Some(src.name.clone());
-                            state
-                                .worker
-                                .send(Command::SetDefaultSource(src.name.clone()));
-                            state.status =
-                                format!("System default source → {}", src.description);
-                        }
-                        let mut mute = src.mute;
-                        if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
-                            .changed()
-                        {
-                            state.worker.send(Command::SetSourceMute {
-                                name: src.name.clone(),
-                                mute,
-                            });
-                        }
-                    });
+                ui.label(
+                    RichText::new(&src.description)
+                        .size(13.0)
+                        .strong()
+                        .color(theme.text()),
+                );
+                ui.label(
+                    RichText::new(&src.name)
+                        .size(10.0)
+                        .monospace()
+                        .color(theme.text_muted()),
+                );
+                ui.add_space(4.0);
+                let is_def_src =
+                    state.snapshot.default_source.as_deref() == Some(src.name.as_str());
+                ui.horizontal_wrapped(|ui| {
+                    let mut mute = src.mute;
+                    if design::toggle_chip(ui, &theme, "Mute", &mut mute, theme.danger())
+                        .changed()
+                    {
+                        state.worker.send(Command::SetSourceMute {
+                            name: src.name.clone(),
+                            mute,
+                        });
+                    }
+                    if design::button(ui, &theme, "System default", is_def_src).clicked() {
+                        state.snapshot.default_source = Some(src.name.clone());
+                        state
+                            .worker
+                            .send(Command::SetDefaultSource(src.name.clone()));
+                        state.status =
+                            format!("System default source → {}", src.description);
+                    }
                 });
                 let mut vol = (src.volume_pct as f32).min(100.0);
                 if design::h_slider(ui, &theme, &mut vol, 0.0..=100.0, "Volume")

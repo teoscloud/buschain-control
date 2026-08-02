@@ -38,22 +38,28 @@ See [`engine/README.md`](../engine/README.md).
 ## Clock domains
 
 ```
-Master HW (DeviceCaps)
+Settings → Audio (engine catalog)
         │
         ▼
- GraphClock  ← session.performance (rate + quantum + soft)
+ GraphClock  ← session.performance (rate + quantum + soft; up to 384 kHz / DXD)
         │
-        ├── buschain_track_* / buschain_master / buschain_post_* / buschain_hold / buschain_fx_*
+        ├── buschain_track_* / buschain_master / buschain_post_* / buschain_glc_* / buschain_hold / buschain_fx_*
         │
+        └── [buschain_rs_out_* if GraphClock ≠ HW rate] ──► Master HW sink
+                                                              ▲
+Master HW (DeviceCaps / device_clocks) ── force-rate only ────┘
+
 External mic(s) ──shared──► [buschain_rs_* if rate ≠ GraphClock] ──► track bus(es)
      │
      └── desktop capture (Zoom/Discord) keeps its own links — never exclusive-stolen
 ```
 
-- Config → **Apply audio settings** → `Command::BindMasterClock` → engine `Intent::BindMasterClock` then route rewire.
-- Mismatched external endpoints get an owned `buschain_rs_*` null-sink at GraphClock; only that hop converts.
+- Settings → **Apply engine clock** → `Command::BindMasterClock` → `bind_graph_clock_profile` (no PW force-rate) then ClockBind rewire.
+- Master HW → **Apply Master HW clock** → `BindDeviceClock(bind_buschain)` → force-rate HW only; GraphClock unchanged; egress rebuilds.
+- Mismatched mics get inbound `buschain_rs_*`; mismatched Master→HW gets egress `buschain_rs_out_*`.
 - Track capture is an **input rack** (`Track.inputs`): multiple HW sources per track, same source on many tracks; Desired `bus_inputs` reconciles shared hops via one-shot `Intent::SyncCapture` (Route never N× rebuilds capture).
 - Apps rack pins use Desired `bus_playback` + one-shot `Intent::SyncPlayback` (never ApplyLevels / Route).
+- **Master fan-in GLC** (`pipeline::glc`): nested Track→Track→Master paths are delay-compensated on the Master edge only (`buschain_glc_*` when δ>0); Track→Track stays undelayed. Egress cycles rejected. **Direct Out** (default on) opts stems out of GLC for low latency; Master Direct disables graph sync globally (host peer PDC).
 
 ## PipeWire mixer graph
 
@@ -63,7 +69,8 @@ libpipewire MainLoop + registry cache for links / null-sinks / node lookup / lev
 (`PulseCompat`) and emergency fallbacks.
 
 ```
-Apps ──assign──► Track null sinks ──► buschain_fx_* (in-process host) ──► post ──► Master ──► HW
+Apps ──assign──► Track null sinks ──► buschain_fx_* (in-process host) ──► post ──┬──► [glc δ?] ──► Master ──► HW
+                                                                                 └──► other tracks (no GLC)
 HW mics ─shared rack─► (optional rate-bridge) ──► Track bus(es)   [coexists with system default]
 ```
 

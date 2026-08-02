@@ -8,7 +8,7 @@ BusChain Control is a **PipeWire system mixer** for Linux. It aims for **DAW-gra
 
 Route apps onto buses, stack builtins and LADSPA / LV2 / CLAP / VST3, expose virtual system I/O, drive Master HW from your bar, and save named layouts. Closing the window minimizes to the tray; right-click the icon → **Open BusChain Control** for the full mixer. Quit from the tray (or Settings) tears the graph down and restores hardware audio.
 
-**TLDR:** mixer tracks · playback / capture racks · sealed wet FX · sticky virtual defaults · MIDI learn · Waybar / Quickshell / GTK shell hooks. Working daily driver on PipeWire (Hyprland primary); host APIs and crash-restore still deepening. Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
+**TLDR:** mixer tracks · **Direct** / synced Master fan-in · independent BusChain rate & quantum for FX · playback / capture racks · sealed wet FX · sticky virtual defaults · MIDI learn · Waybar / Quickshell / GTK shell hooks. Working daily driver on PipeWire (Hyprland primary); host APIs and crash-restore still deepening. Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
 
 ---
 
@@ -187,12 +187,15 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 | Assign app → track | Playback tab or drag onto channel rack |
 | Virtual system out | Track → Create system virtual output |
 | Add FX | Channel rack → Add plugin |
+| Sync nested buses | Channel rack → Output → turn **Direct** off |
+| Engine rate / quantum | Options → BusChain → Settings → Audio |
 | Save layout | Sessions → Save / Save as… |
 | Quit | Tray menu or Settings |
 
 ### Tips
 
-- **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart the app after installing new plugins.
+- **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart the app after installing new plugins. Prefer a higher **BusChain engine** rate/quantum than HW when inserts need more quality headroom.
+- **Direct vs sync:** leave **Direct** on for games/desktop latency; turn it off on stems (and Master) when nested Track→Track→Master paths should align.
 - **Sticky default:** set **System default** on a virtual track once — after Quit/reopen, BusChain reasserts that sink and reclaims playback apps.
 - **Hollow desktop audio:** `buschain-ctl recover-audio` (restores HW + destroys leftover `buschain_*` PipeWire nodes), or `systemctl --user restart wireplumber` as a blunt recovery.
 - **Seal helpers in pavucontrol:** helpers are `Audio/Sink/Internal` by default; optional WirePlumber stamp via `scripts/install-wireplumber-rules.sh`.
@@ -220,15 +223,31 @@ Wire QS with `BUSCHAIN_CONTROL_QS_MIXER=1` and the stubs in [`packaging/quickshe
 
 ---
 
-## Device clocks
+## Device clocks & engine quality
 
-Most Linux desktop audio UIs bury or ignore **sample rate and quantum**. BusChain exposes them for **hardware outputs and inputs**: pick rate / buffer, soft-quantum if you want PipeWire to raise the period under load, and apply.
+Most Linux desktop audio UIs bury or ignore **sample rate and quantum**. BusChain splits them:
+
+| Clock | Where | What it drives |
+|-------|--------|----------------|
+| **Hardware** | Output / Input tabs | Speakers / mics — force-rate, quantum, soft-quantum under load |
+| **BusChain engine** | Settings → Audio | Tracks, insert FX, Master bus — independent GraphClock (up through DXD 352.8 / 384 kHz) |
+
+Run the graph (and plugins) at a higher rate / tighter quantum than the interface when you want better FX quality; an egress converter (`buschain_rs_out_*`) downsamples to Master HW when the clocks differ. **Master HW Apply** force-rates speakers only. Other sinks/sources use **Apply device clock** without forcing the whole graph.
 
 <p align="center">
   <img src="docs/assets/device-clocks.png" alt="Output / Input — PipeWire device clock and quantum controls" width="480" />
 </p>
 
-Force-rate and quantum live on the **Output** and **Input** tabs (same per-device editor). Applying on **Master HW** also binds the BusChain graph clock so tracks and FX stay aligned with the interface; other sinks/sources use **Apply device clock** without forcing the whole graph.
+---
+
+## Synced tracks & Direct Out
+
+Nested **Track → Track → Master** routes can be **delay-compensated** at the Master edge (GLC) so buses stay phase-aligned instead of combing. Desktop / game latency still matters, so each track (and Master) has a **Direct** toggle:
+
+- **Direct on** (default) — low-latency send; skips graph sync pad for that stem. Master Direct turns sync off globally.
+- **Direct off** — enable Master fan-in sync for nested routes; channel rack shows path / fx / pad / hw timing for the selected track.
+
+New buses inherit Master's current Direct state. Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md) (Master fan-in sync contract).
 
 ---
 
@@ -237,12 +256,13 @@ Force-rate and quantum live on the **Output** and **Input** tabs (same per-devic
 ### Mixer & graph
 
 - Dynamic **tracks / buses** with mute, solo, listen, and gain
+- **Direct Out / synced Master fan-in** — low-latency Direct (default) or phase-aligned nested buses when Direct is off
 - **Playback** rack — pin apps onto tracks; reclaim onto sticky preferred default after restart
 - **Input** rack — multi HW capture, shared with the desktop / other tracks
 - **Virtual system output / input** — expose tracks as sinks or post-FX capture sources
 - **Desktop lists** — only Master + System virtual outputs / inputs in pavucontrol; helpers use `Audio/Sink/Internal` (sealed, still ported). Optional: `scripts/install-wireplumber-rules.sh`
-- Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → hardware / Master`
-- **Device clocks** — sample rate / quantum per HW output and input (see above)
+- Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → [glc δ?] → Master / tracks / HW`
+- **Separated clocks** — HW rate/quantum on Output/Input; BusChain engine rate/quantum under Settings → Audio for higher-quality plugin processing
 - Live hotplug and warm adopt when the graph already matches the session
 
 ### Insert FX

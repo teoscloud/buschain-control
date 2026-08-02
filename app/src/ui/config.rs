@@ -101,7 +101,7 @@ fn draw_appearance(ui: &mut egui::Ui, state: &mut AppState) {
             .color(theme.text()),
     );
     ui.label(
-        RichText::new("Selection highlight / accent for mixer rail, tabs, and primary actions.")
+        RichText::new("Platform accent for primary actions, scope signal, and highlights.")
             .size(11.0)
             .color(theme.text_muted()),
     );
@@ -131,7 +131,7 @@ fn draw_appearance(ui: &mut egui::Ui, state: &mut AppState) {
                     .color(theme.text_dim()),
             );
             if design::button(ui, &theme, "Reset", false).clicked() {
-                state.session.accent_rgb = [0xc9, 0xa2, 0x6b];
+                state.session.accent_rgb = [0x6e, 0xaa, 0x96];
                 state.theme = SpectrumTheme::from_session_rgb(state.session.accent_rgb);
                 state.dirty = true;
             }
@@ -148,6 +148,104 @@ fn draw_appearance(ui: &mut egui::Ui, state: &mut AppState) {
             state.dirty = true;
         }
     });
+
+    ui.add_space(14.0);
+    ui.label(
+        RichText::new("Theme creator")
+            .size(14.0)
+            .strong()
+            .color(theme.text()),
+    );
+    ui.label(
+        RichText::new("Save and load named accents under ~/.config/buschain-control/themes/.")
+            .size(11.0)
+            .color(theme.text_muted()),
+    );
+    ui.add_space(6.0);
+    design::panel(ui, &theme, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Name").size(11.0).color(theme.text_dim()));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.theme_draft_name)
+                    .desired_width(180.0)
+                    .hint_text("Mint console"),
+            );
+            if design::button(ui, &theme, "Save theme", true).clicked() {
+                let name = if state.theme_draft_name.trim().is_empty() {
+                    format!(
+                        "Accent {:02X}{:02X}{:02X}",
+                        state.session.accent_rgb[0],
+                        state.session.accent_rgb[1],
+                        state.session.accent_rgb[2]
+                    )
+                } else {
+                    state.theme_draft_name.trim().to_string()
+                };
+                match crate::session::save_theme(&name, state.session.accent_rgb) {
+                    Ok(meta) => {
+                        state.status = format!("Theme saved · {}", meta.name);
+                        state.theme_draft_name = meta.name;
+                    }
+                    Err(e) => state.status = format!("Theme save failed: {e:#}"),
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Saved themes")
+                .size(11.0)
+                .color(theme.text_muted()),
+        );
+        ui.add_space(4.0);
+        match crate::session::list_themes() {
+            Ok(themes) if themes.is_empty() => {
+                ui.label(
+                    RichText::new("No saved themes yet.")
+                        .size(11.0)
+                        .color(theme.text_muted()),
+                );
+            }
+            Ok(themes) => {
+                for t in themes {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&t.name)
+                                .size(12.0)
+                                .color(theme.text()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if design::button(ui, &theme, "Delete", false).clicked() {
+                                let _ = crate::session::delete_theme(&t.slug);
+                            }
+                            if design::button(ui, &theme, "Load", false).clicked() {
+                                match crate::session::load_theme(&t.slug) {
+                                    Ok(preset) => {
+                                        state.session.accent_rgb = preset.accent_rgb;
+                                        state.theme = SpectrumTheme::from_session_rgb(
+                                            state.session.accent_rgb,
+                                        );
+                                        state.theme_draft_name = preset.name.clone();
+                                        state.dirty = true;
+                                        state.status = format!("Theme loaded · {}", preset.name);
+                                    }
+                                    Err(e) => {
+                                        state.status = format!("Theme load failed: {e:#}");
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+            Err(e) => {
+                ui.label(
+                    RichText::new(format!("Could not list themes: {e:#}"))
+                        .size(11.0)
+                        .color(theme.danger()),
+                );
+            }
+        }
+    });
 }
 
 fn draw_audio(ui: &mut egui::Ui, state: &mut AppState) {
@@ -160,7 +258,9 @@ fn draw_audio(ui: &mut egui::Ui, state: &mut AppState) {
     );
     ui.label(
         RichText::new(
-            "Clock follows Master HW out. Custom rate/quantum are limited to device capabilities; Apply switches HW + BusChain GraphClock together. Foreign mic inputs use inbound rate-bridges.",
+            "BusChain engine clock (tracks, FX, Master bus) is independent of Master HW speakers. \
+             Engine may run at 96/192 kHz (or DXD/384) while HW stays at 48 kHz — mismatch uses an egress converter. \
+             Foreign mic inputs still use inbound rate-bridges.",
         )
         .size(11.0)
         .color(theme.text_muted()),
@@ -175,9 +275,11 @@ fn draw_audio(ui: &mut egui::Ui, state: &mut AppState) {
                 .color(theme.text()),
         );
         ui.label(
-            RichText::new("Pick the device under Output devices → Master HW out. Name below is advanced override.")
-                .size(11.0)
-                .color(theme.text_muted()),
+            RichText::new(
+                "Speaker/headphone device rate & quantum. Apply force-rates this sink only — does not change the BusChain engine clock.",
+            )
+            .size(11.0)
+            .color(theme.text_muted()),
         );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -564,7 +666,9 @@ fn draw_advanced(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn draw_performance_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    use buschain_engine::{resolve_profile, AudioPreset};
+    use buschain_engine::{
+        engine_rate_is_extreme, resolve_engine_profile, AudioPreset, ENGINE_QUANTUMS, ENGINE_RATES,
+    };
     let theme = state.theme;
 
     // One-shot when Master HW caps are missing — never re-probe every frame.
@@ -574,33 +678,41 @@ fn draw_performance_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     design::panel(ui, &theme, |ui| {
         ui.label(
-            RichText::new("Performance / delay")
+            RichText::new("BusChain engine clock")
                 .size(13.0)
                 .strong()
                 .color(theme.text()),
         );
         ui.label(
             RichText::new(
-                "Defaults follow Master HW out capabilities — never forced onto unsupported hardware.",
+                "Internal GraphClock for tracks, FX, and Master bus. Not limited to Master HW caps — \
+                 96/192 kHz for quality; 352.8 (DXD) / 384 kHz for archival apex. Speakers stay on the HW clock above.",
             )
             .size(11.0)
             .color(theme.text_muted()),
         );
         ui.add_space(4.0);
 
-        let bound = if state.device_caps.sink_name.is_empty() {
-            "(auto — first real device)".to_string()
-        } else {
-            format!(
-                "{} — {}",
-                state.device_caps.description, state.device_caps.sink_name
-            )
-        };
-        ui.label(
-            RichText::new(format!("Bound device: {bound}"))
-                .size(11.0)
-                .color(theme.text_dim()),
-        );
+        let hw_rate = state.device_caps.preferred_rate;
+        let eng_rate = state.session.performance.sample_rate;
+        if hw_rate > 0 && eng_rate != hw_rate {
+            ui.label(
+                RichText::new(format!(
+                    "Engine {eng_rate} Hz ≠ Master HW {hw_rate} Hz — egress converts on Apply"
+                ))
+                .size(10.0)
+                .color(theme.warning()),
+            );
+        }
+        if engine_rate_is_extreme(eng_rate) {
+            ui.label(
+                RichText::new(
+                    "Above 192 kHz: heavy CPU, some plugins misbehave, little benefit once egress hits Master HW. DXD/384 is for archival / apex workflows.",
+                )
+                .size(10.0)
+                .color(theme.warning()),
+            );
+        }
 
         let mut preset = state.session.performance.preset;
         ui.horizontal(|ui| {
@@ -626,60 +738,34 @@ fn draw_performance_panel(ui: &mut egui::Ui, state: &mut AppState) {
         let perf = &state.session.performance;
         ui.label(
             RichText::new(format!(
-                "{} Hz · quantum {} · period {:.2} ms{}",
+                "{} Hz · quantum {} · period {:.2} ms",
                 perf.sample_rate,
                 perf.quantum,
                 perf.period_ms(),
-                if perf.device_limited {
-                    " · device limited"
-                } else {
-                    ""
-                }
             ))
             .size(11.0)
-            .color(if perf.device_limited {
-                theme.warning()
-            } else {
-                theme.accent()
-            }),
+            .color(theme.accent()),
         );
-
-        if !state.device_caps.rates.is_empty() {
-            ui.label(
-                RichText::new(format!(
-                    "Device rates: {}",
-                    state
-                        .device_caps
-                        .rates
-                        .iter()
-                        .map(|r| r.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-                .size(10.0)
-                .color(theme.text_muted()),
-            );
-        }
 
         if matches!(state.session.performance.preset, AudioPreset::Custom) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Rate").size(11.0).color(theme.text_dim()));
-                // Only true device-capable rates (EnumFormat ∪ ALSA) — never invent 192k.
-                let rates = if state.device_caps.rates.is_empty() {
-                    let r = state.device_caps.preferred_rate.max(48_000);
-                    vec![r]
-                } else {
-                    state.device_caps.rates.clone()
-                };
                 let mut rate = state.session.performance.sample_rate;
-                if !rates.contains(&rate) {
-                    rate = rates[0];
+                if !ENGINE_RATES.contains(&rate) {
+                    rate = 48_000;
                 }
                 egui::ComboBox::from_id_salt("perf_rate")
                     .selected_text(format!("{rate}"))
                     .show_ui(ui, |ui| {
-                        for r in &rates {
-                            ui.selectable_value(&mut rate, *r, format!("{r}"));
+                        for r in ENGINE_RATES {
+                            let label = if *r == 352_800 {
+                                format!("{r} (DXD)")
+                            } else if *r == 384_000 {
+                                format!("{r} (apex)")
+                            } else {
+                                format!("{r}")
+                            };
+                            ui.selectable_value(&mut rate, *r, label);
                         }
                     });
                 ui.label(RichText::new("Quantum").size(11.0).color(theme.text_dim()));
@@ -687,19 +773,16 @@ fn draw_performance_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 egui::ComboBox::from_id_salt("perf_q")
                     .selected_text(format!("{q}"))
                     .show_ui(ui, |ui| {
-                        for qq in [64, 128, 256, 512, 1024, 2048] {
-                            if state.device_caps.allows_quantum(qq) {
-                                ui.selectable_value(&mut q, qq, format!("{qq}"));
-                            }
+                        for qq in ENGINE_QUANTUMS {
+                            ui.selectable_value(&mut q, *qq, format!("{qq}"));
                         }
                     });
                 if rate != state.session.performance.sample_rate
                     || q != state.session.performance.quantum
                 {
                     let soft = state.session.performance.soft_quantum;
-                    state.session.performance = resolve_profile(
+                    state.session.performance = resolve_engine_profile(
                         AudioPreset::Custom,
-                        &state.device_caps,
                         Some(rate),
                         Some(q),
                         soft,
@@ -719,12 +802,20 @@ fn draw_performance_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
 
         ui.horizontal(|ui| {
-            if design::button(ui, &theme, "Apply audio settings", true).clicked() {
+            if design::button(ui, &theme, "Apply engine clock", true).clicked() {
                 state.apply_audio_clock();
             }
-            if design::button(ui, &theme, "Reset to device Balanced", false).clicked() {
+            if design::button(ui, &theme, "Reset engine Balanced", false).clicked() {
                 state.session.performance.preset = AudioPreset::Balanced;
                 state.apply_audio_clock();
+            }
+            if design::button(ui, &theme, "Match Master HW rate", false)
+                .on_hover_text(
+                    "Copy Master HW sample rate / quantum into the engine profile (still Apply to bind).",
+                )
+                .clicked()
+            {
+                state.match_engine_clock_to_master_hw();
             }
         });
     });

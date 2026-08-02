@@ -1006,6 +1006,25 @@ class Mixer(Gtk.Window):
             self._building = False
         self.show_all()
 
+    @staticmethod
+    def _lat_tip(track: dict) -> str:
+        """Tiny delay readout — Master pad / FX ms (empty when nothing to show)."""
+        kind = track.get("kind") or "track"
+        try:
+            pad = float(track.get("glc_comp_ms") or 0.0)
+            fx = float(track.get("fx_lat_ms") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if kind == "master":
+            return ""
+        if pad >= 0.05:
+            if fx >= 0.05:
+                return f"fx {fx:.1f} +{pad:.1f}"
+            return f"+{pad:.1f}ms"
+        if fx >= 0.05:
+            return f"fx {fx:.1f}ms"
+        return ""
+
     def _make_fader_card(
         self,
         *,
@@ -1021,6 +1040,7 @@ class Mixer(Gtk.Window):
         badge: str | None = None,
         vol_max: float = VOL_MAX,
         readout_db: bool = False,
+        lat_tip: str = "",
     ) -> Gtk.Box:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         card.get_style_context().add_class("stream-card")
@@ -1074,6 +1094,16 @@ class Mixer(Gtk.Window):
         )
         card.pack_start(pct, False, False, 0)
 
+        lat = Gtk.Label(label=lat_tip or " ", xalign=0.5)
+        lat.get_style_context().add_class("stream-meta")
+        lat.set_opacity(0.75 if lat_tip else 0.0)
+        if lat_tip:
+            lat.set_tooltip_text(
+                "FX rack latency and Master-edge sync pad (GLC). "
+                "+Nms aligns nested Track→Track→Master routes."
+            )
+        card.pack_start(lat, False, False, 0)
+
         if on_fav is not None:
             star = make_star_toggle(favorited)
             star.connect("toggled", on_fav)
@@ -1087,6 +1117,7 @@ class Mixer(Gtk.Window):
             "scale": scale,
             "mute": mute,
             "pct": pct,
+            "lat": lat,
         }
         return card
 
@@ -1209,6 +1240,7 @@ class Mixer(Gtk.Window):
                 favorited=True,
                 badge="track",
                 readout_db=True,
+                lat_tip=self._lat_tip(t),
             )
             streams.pack_start(card, False, False, 0)
 
@@ -1254,6 +1286,10 @@ class Mixer(Gtk.Window):
                 ww["pct"].set_text("0dB" if abs(db) < 0.05 else f"{db:+.0f}dB")
                 ww["mute"].set_active(bool(tt.get("mute")))
                 _set_mute_icon(ww["mute"])
+                if ww.get("lat"):
+                    tip = self._lat_tip(tt)
+                    ww["lat"].set_text(tip or " ")
+                    ww["lat"].set_opacity(0.75 if tip else 0.0)
 
             self._with_building(_track)
         for s in items:
@@ -1278,6 +1314,12 @@ class Mixer(Gtk.Window):
             tid = str(t.get("id"))
             # Drag/schedule locks `track:` and/or `tracks-tab:` — honor either.
             if self._is_local(f"track:{tid}") or self._is_local(f"tracks-tab:{tid}"):
+                # Still refresh latency tip (not volume-authority).
+                w = self._stream_widgets.get(f"tracks-tab:{tid}")
+                if w and w.get("lat"):
+                    tip = self._lat_tip(t)
+                    w["lat"].set_text(tip or " ")
+                    w["lat"].set_opacity(0.75 if tip else 0.0)
                 continue
             w = self._stream_widgets.get(f"tracks-tab:{tid}")
             if not w:
@@ -1289,6 +1331,10 @@ class Mixer(Gtk.Window):
                 ww["pct"].set_text("0dB" if abs(db) < 0.05 else f"{db:+.0f}dB")
                 ww["mute"].set_active(bool(tt.get("mute")))
                 _set_mute_icon(ww["mute"])
+                if ww.get("lat"):
+                    tip = self._lat_tip(tt)
+                    ww["lat"].set_text(tip or " ")
+                    ww["lat"].set_opacity(0.75 if tip else 0.0)
 
             self._with_building(_one)
 
@@ -1374,6 +1420,7 @@ class Mixer(Gtk.Window):
                 on_fav=lambda btn, i=tid: self._on_fav_toggle(btn, i),
                 badge="Master" if kind == "master" else "Track",
                 readout_db=True,
+                lat_tip=self._lat_tip(t),
             )
             strips.pack_start(card, False, False, 0)
 

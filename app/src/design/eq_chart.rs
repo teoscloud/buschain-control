@@ -10,15 +10,22 @@ use super::widgets::{hide_cursor_on_drag, peq_mag_db_at, PeqBand, PEQ_BAND_COLOR
 pub const EQ_DISPLAY_COLS: usize = 256;
 const F_MIN: f32 = 20.0;
 const F_MAX: f32 = 20_000.0;
+/// Interactive EQ gain window (insert editor).
 const G_MIN: f32 = -24.0;
 const G_MAX: f32 = 24.0;
+/// Absolute silence floor for FFT samples.
 const SPEC_FLOOR_DB: f32 = -96.0;
+/// Analyzer / scope Y window — full dynamic range so bass-heavy spectra still breathe.
+const SPEC_VIEW_MIN: f32 = -78.0;
+const SPEC_VIEW_MAX: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EqChartChrome {
     pub post: bool,
     pub peak_hold: bool,
     pub freeze: bool,
+    /// Mixer bottom scope — edge-to-edge, solid well, no frame/wash.
+    pub full_bleed: bool,
 }
 
 impl Default for EqChartChrome {
@@ -27,6 +34,7 @@ impl Default for EqChartChrome {
             post: true,
             peak_hold: true,
             freeze: false,
+            full_bleed: false,
         }
     }
 }
@@ -92,16 +100,42 @@ pub fn eq_chart_chrome(
     });
 }
 
+const PHOS_HIST: usize = 10;
+
 #[derive(Clone)]
 struct SpecPaintState {
     cols: Vec<f32>,
     hold: Vec<f32>,
+    /// Per-column phosphor glow (0…1) — decays when quiet, pops on attack.
+    glow: Vec<f32>,
+    /// Rolling crest history: `PHOS_HIST * N` dB samples for mint trails.
+    hist: Vec<f32>,
+    hist_i: u8,
     /// Last resampled FFT targets (only rebuilt when `last_gen` changes).
     targets: Vec<f32>,
     ctrl_log: Vec<f32>,
     ctrl_db: Vec<f32>,
     last_gen: u64,
     last_t: f64,
+}
+
+/// Spectrum bin energy → phosphor heat (crest-colored columns, not dB floor bands).
+/// Quiet bins stay cool mint; hot bins push amber → brick → lava.
+fn spec_heat(db: f32) -> f32 {
+    let db = db.clamp(SPEC_FLOOR_DB, SPEC_VIEW_MAX + 6.0);
+    if db <= -48.0 {
+        0.10
+    } else if db <= -24.0 {
+        0.10 + ((db + 48.0) / 24.0) * 0.18 // → 0.28 mint
+    } else if db <= -12.0 {
+        0.28 + ((db + 24.0) / 12.0) * 0.14 // → 0.42 amber
+    } else if db <= -3.0 {
+        0.42 + ((db + 12.0) / 9.0) * 0.20 // → 0.62 brick
+    } else if db <= 0.0 {
+        0.62 + ((db + 3.0) / 3.0) * 0.16 // → 0.78 fire
+    } else {
+        0.78 + (db / 6.0).clamp(0.0, 1.0) * 0.22 // lava
+    }
 }
 
 /// Draw interactive (or read-only) EQ chart with real FFT backdrop.
@@ -127,21 +161,37 @@ pub fn eq_chart(
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let full_bleed = chrome.full_bleed && bands.is_none();
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(3), theme.bg_chart());
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(3),
-            Stroke::new(1.0_f32, theme.border_soft()),
-            egui::StrokeKind::Inside,
-        );
+        // Solid well near the axis color — no vignette / double-frame.
+        let fill = if bands.is_some() {
+            theme.bg_chart()
+        } else {
+            // Quiet well — near panel chrome, not a vivid chart black.
+            Color32::from_rgb(0x1a, 0x1c, 0x20)
+        };
+        let r = if full_bleed {
+            CornerRadius::ZERO
+        } else {
+            theme.rounding()
+        };
+        painter.rect_filled(rect, r, fill);
+        if !full_bleed {
+            painter.rect_stroke(
+                rect,
+                r,
+                Stroke::new(1.0_f32, theme.border_soft()),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 
-    let pad_l = 10.0;
-    let pad_r = 30.0;
-    let pad_t = 16.0;
-    let pad_b = 18.0;
+    let (pad_l, pad_r, pad_t, pad_b) = if full_bleed {
+        (4.0, 28.0, 4.0, 16.0)
+    } else {
+        (10.0, 34.0, 16.0, 20.0)
+    };
     let plot = Rect::from_min_max(
         egui::pos2(rect.left() + pad_l, rect.top() + pad_t),
         egui::pos2(rect.right() - pad_r, rect.bottom() - pad_b),
@@ -156,6 +206,7 @@ pub fn eq_chart(
         48_000.0
     };
 
+    let analyzer = bands.is_none();
     let freq_to_x = |f: f32| {
         let t = ((f.max(F_MIN).ln() - F_MIN.ln()) / (F_MAX.ln() - F_MIN.ln())).clamp(0.0, 1.0);
         plot.left() + t * plot.width()
@@ -164,6 +215,7 @@ pub fn eq_chart(
         let t = ((x - plot.left()) / plot.width()).clamp(0.0, 1.0);
         (F_MIN.ln() + t * (F_MAX.ln() - F_MIN.ln())).exp()
     };
+    // Insert EQ: ±24 gain. Analyzer/scope: track-level dBFS (−48…+1).
     let gain_to_y = |g: f32| {
         let t = ((g - G_MIN) / (G_MAX - G_MIN)).clamp(0.0, 1.0);
         plot.bottom() - t * plot.height()
@@ -172,48 +224,143 @@ pub fn eq_chart(
         let t = ((plot.bottom() - y) / plot.height()).clamp(0.0, 1.0);
         G_MIN + t * (G_MAX - G_MIN)
     };
+    let spec_span = (SPEC_VIEW_MAX - SPEC_VIEW_MIN).max(0.001);
     let spec_db_to_y = |db: f32| {
-        let t = ((db.clamp(SPEC_FLOOR_DB, 0.0) - SPEC_FLOOR_DB) / -SPEC_FLOOR_DB).clamp(0.0, 1.0);
+        let t = ((db.clamp(SPEC_VIEW_MIN, SPEC_VIEW_MAX) - SPEC_VIEW_MIN) / spec_span)
+            .clamp(0.0, 1.0);
         plot.bottom() - t * plot.height()
+    };
+    let y_to_spec_db = |y: f32| {
+        let t = ((plot.bottom() - y) / plot.height()).clamp(0.0, 1.0);
+        SPEC_VIEW_MIN + t * spec_span
+    };
+    let db_grid_to_y = |db: f32| {
+        if analyzer {
+            spec_db_to_y(db)
+        } else {
+            gain_to_y(db)
+        }
+    };
+
+    // Axis label sizes (~+10% vs prior 8/9) and slightly stronger chroma.
+    let axis_font = egui::FontId::proportional(if full_bleed { 9.0 } else { 10.0 });
+    let axis_col = if full_bleed {
+        Color32::from_rgba_unmultiplied(
+            theme.text_dim().r(),
+            theme.text_dim().g(),
+            theme.text_dim().b(),
+            150,
+        )
+    } else {
+        theme.text_dim()
+    };
+    let axis_col_zero = if full_bleed {
+        Color32::from_rgba_unmultiplied(
+            theme.text().r(),
+            theme.text().g(),
+            theme.text().b(),
+            175,
+        )
+    } else if analyzer {
+        theme.text()
+    } else {
+        theme.accent()
     };
 
     // Grid first (under spectrum + EQ) so it doesn't cut through the visuals.
     {
         let painter = ui.painter();
-        let grid = theme.border_soft().gamma_multiply(0.45);
-        let zero_line = theme.accent().gamma_multiply(0.35);
-        for &f in &[50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0] {
+        // Quieter rails — labels carry orientation, not the mesh.
+        let grid = if full_bleed {
+            Color32::from_rgba_unmultiplied(
+                theme.text().r(),
+                theme.text().g(),
+                theme.text().b(),
+                5,
+            )
+        } else if analyzer {
+            Color32::from_rgba_unmultiplied(
+                theme.border().r(),
+                theme.border().g(),
+                theme.border().b(),
+                12,
+            )
+        } else {
+            theme.border_soft().gamma_multiply(0.20)
+        };
+        let zero_line = if full_bleed {
+            Color32::from_rgba_unmultiplied(
+                theme.text().r(),
+                theme.text().g(),
+                theme.text().b(),
+                14,
+            )
+        } else if analyzer {
+            Color32::from_rgba_unmultiplied(
+                theme.text().r(),
+                theme.text().g(),
+                theme.text().b(),
+                28,
+            )
+        } else {
+            theme.accent().gamma_multiply(0.20)
+        };
+        for &f in &[
+            50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+        ] {
             let x = freq_to_x(f);
             painter.line_segment(
                 [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
                 Stroke::new(1.0_f32, grid),
             );
         }
-        for g in [-24i32, -12, -6, 0, 6, 12, 24] {
-            let y = gain_to_y(g as f32);
-            let col = if g == 0 { zero_line } else { grid };
+        // Analyzer: full-range dBFS. Insert EQ: ±24 gain rails.
+        let db_marks: &[f32] = if analyzer {
+            &[-78.0, -48.0, -24.0, -12.0, 0.0, 2.0]
+        } else {
+            &[-24.0, -12.0, -6.0, 0.0, 6.0, 12.0, 24.0]
+        };
+        for &g in db_marks {
+            let y = db_grid_to_y(g);
+            let is_zero = g.abs() < 0.05;
+            let col = if is_zero { zero_line } else { grid };
             painter.line_segment(
                 [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-                Stroke::new(if g == 0 { 1.2_f32 } else { 1.0 }, col),
+                Stroke::new(if is_zero { 1.0_f32 } else { 1.0 }, col),
             );
-            if g % 12 == 0 || g == 0 {
+            let label_major = if analyzer {
+                is_zero
+                    || g == -78.0
+                    || g == -48.0
+                    || g == -24.0
+                    || g == 2.0
+            } else {
+                is_zero || g % 12.0 == 0.0 || g.abs() == 6.0
+            };
+            if label_major {
+                let label = if analyzer && (g - 2.0).abs() < 0.05 {
+                    "+2".into()
+                } else {
+                    format!("{g:+.0}")
+                };
                 painter.text(
-                    egui::pos2(plot.right() + 2.0, y),
+                    egui::pos2(plot.right() + 3.0, y),
                     egui::Align2::LEFT_CENTER,
-                    format!("{g:+}"),
-                    egui::FontId::proportional(9.0),
-                    if g == 0 {
-                        theme.accent()
-                    } else {
-                        theme.text_muted()
-                    },
+                    label,
+                    axis_font.clone(),
+                    if is_zero { axis_col_zero } else { axis_col },
                 );
             }
         }
         for &(f, label) in &[
             (20.0, "20"),
+            (50.0, "50"),
             (100.0, "100"),
+            (200.0, "200"),
+            (500.0, "500"),
             (1000.0, "1k"),
+            (2000.0, "2k"),
+            (5000.0, "5k"),
             (10000.0, "10k"),
             (20000.0, "20k"),
         ] {
@@ -221,8 +368,8 @@ pub fn eq_chart(
                 egui::pos2(freq_to_x(f), plot.bottom() + 2.0),
                 egui::Align2::CENTER_TOP,
                 label,
-                egui::FontId::proportional(9.0),
-                theme.text_muted(),
+                axis_font.clone(),
+                axis_col,
             );
         }
     }
@@ -251,6 +398,15 @@ pub fn eq_chart(
                 theme.text_muted(),
             );
         }
+        paint_eq_crosshair(
+            ui,
+            &resp,
+            plot,
+            theme,
+            &axis_font,
+            |x| x_to_freq(x),
+            y_to_spec_db,
+        );
         if !chrome.freeze {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(48));
@@ -443,11 +599,93 @@ pub fn eq_chart(
         );
     }
 
+    paint_eq_crosshair(
+        ui,
+        &resp,
+        plot,
+        theme,
+        &axis_font,
+        |x| x_to_freq(x),
+        y_to_gain,
+    );
+
     if !chrome.freeze || changed {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(48));
     }
     changed
+}
+
+/// Soft pointer crosshair with Hz / dB labels on the chart axes.
+fn paint_eq_crosshair(
+    ui: &Ui,
+    resp: &egui::Response,
+    plot: Rect,
+    theme: &dyn Theme,
+    axis_font: &egui::FontId,
+    x_to_freq: impl Fn(f32) -> f32,
+    y_to_db: impl Fn(f32) -> f32,
+) {
+    let Some(pos) = resp.hover_pos().filter(|p| plot.contains(*p)) else {
+        return;
+    };
+    let painter = ui.painter();
+    let hair = Color32::from_rgba_unmultiplied(
+        theme.text().r(),
+        theme.text().g(),
+        theme.text().b(),
+        32,
+    );
+    let hub = Color32::from_rgba_unmultiplied(
+        theme.text().r(),
+        theme.text().g(),
+        theme.text().b(),
+        55,
+    );
+    painter.vline(pos.x, plot.y_range(), Stroke::new(1.0_f32, hair));
+    painter.hline(plot.x_range(), pos.y, Stroke::new(1.0_f32, hair));
+    painter.circle_filled(pos, 2.2, hub);
+
+    let hz = x_to_freq(pos.x);
+    let db = y_to_db(pos.y);
+    let hz_txt = format_axis_hz(hz);
+    let db_txt = format!("{db:+.1}");
+    let label_col = Color32::from_rgba_unmultiplied(
+        theme.text().r(),
+        theme.text().g(),
+        theme.text().b(),
+        200,
+    );
+    // Axis readouts — sit on the printed axes, slightly brighter than static ticks.
+    painter.text(
+        egui::pos2(pos.x, plot.bottom() + 2.0),
+        egui::Align2::CENTER_TOP,
+        hz_txt,
+        axis_font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot.right() + 3.0, pos.y),
+        egui::Align2::LEFT_CENTER,
+        db_txt,
+        axis_font.clone(),
+        label_col,
+    );
+}
+
+fn format_axis_hz(f: f32) -> String {
+    if f >= 1000.0 {
+        let k = f / 1000.0;
+        if (k - k.round()).abs() < 0.05 {
+            format!("{}k", k.round() as i32)
+        } else {
+            format!("{k:.1}k")
+        }
+    } else if f >= 100.0 {
+        format!("{:.0}", f)
+    } else {
+        format!("{:.1}", f)
+    }
 }
 
 fn paint_fft_columns(
@@ -461,14 +699,19 @@ fn paint_fft_columns(
     salt_id: egui::Id,
     spec_db_to_y: impl Fn(f32) -> f32,
 ) {
+    use super::dynamics_xfer_3d::phosphor_heat_color;
+
     const N: usize = EQ_DISPLAY_COLS;
-    let spec_id = salt_id.with("eq_fft_cols");
+    let spec_id = salt_id.with("eq_fft_cols_phos_v1");
     let now = ui.input(|i| i.time);
     let mut state = ui.ctx().data_mut(|d| {
         d.get_temp::<SpecPaintState>(spec_id)
             .unwrap_or_else(|| SpecPaintState {
                 cols: vec![SPEC_FLOOR_DB; N],
                 hold: vec![SPEC_FLOOR_DB; N],
+                glow: vec![0.0; N],
+                hist: vec![SPEC_FLOOR_DB; PHOS_HIST * N],
+                hist_i: 0,
                 targets: vec![SPEC_FLOOR_DB; N],
                 ctrl_log: Vec::new(),
                 ctrl_db: Vec::new(),
@@ -476,9 +719,12 @@ fn paint_fft_columns(
                 last_t: now,
             })
     });
-    if state.cols.len() != N {
+    if state.cols.len() != N || state.glow.len() != N || state.hist.len() != PHOS_HIST * N {
         state.cols = vec![SPEC_FLOOR_DB; N];
         state.hold = vec![SPEC_FLOOR_DB; N];
+        state.glow = vec![0.0; N];
+        state.hist = vec![SPEC_FLOOR_DB; PHOS_HIST * N];
+        state.hist_i = 0;
         state.targets = vec![SPEC_FLOOR_DB; N];
         state.last_gen = u64::MAX;
     }
@@ -486,7 +732,6 @@ fn paint_fft_columns(
     state.last_t = now;
 
     if !chrome.freeze {
-        // Resample only when the host publishes a new FFT frame.
         if gen != state.last_gen {
             log_max_pool_into(mags, sr, &mut state);
             state.last_gen = gen;
@@ -494,11 +739,20 @@ fn paint_fft_columns(
         let attack = 1.0 - (-dt * 22.0).exp();
         let release = 1.0 - (-dt * 4.2).exp();
         let hold_rel = 1.0 - (-dt * 0.35).exp();
+        let glow_decay = (-dt * 1.6).exp(); // linger longer so trails read thick
         for i in 0..N {
             let tgt = state.targets[i];
             let cur = state.cols[i];
             let c = if tgt > cur { attack } else { release };
             state.cols[i] = cur + (tgt - cur) * c;
+            // Glow pops hard on rising energy, decays slowly — phosphor persistence.
+            let heat = spec_heat(state.cols[i]);
+            if tgt > cur + 0.5 {
+                state.glow[i] = (state.glow[i] + 0.35 + heat * 0.75).min(1.0);
+            } else {
+                state.glow[i] *= glow_decay;
+                state.glow[i] = state.glow[i].max(heat * 0.45);
+            }
             if chrome.peak_hold {
                 if tgt > state.hold[i] {
                     state.hold[i] = tgt;
@@ -507,15 +761,35 @@ fn paint_fft_columns(
                 }
             }
         }
+        // Stamp crest into phosphor history once per frame.
+        let hi = state.hist_i as usize % PHOS_HIST;
+        for i in 0..N {
+            state.hist[hi * N + i] = state.cols[i];
+        }
+        state.hist_i = state.hist_i.wrapping_add(1);
     }
 
-    let a = theme.accent();
     let painter = ui.painter();
-    let fill = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 70);
-    let stroke_col = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 220);
+    let floor_y = plot.bottom();
 
-    // One mesh for the mountain fill (was ~N convex_polygon shapes).
+    // Crest-colored phosphor skirt — each column tinted by its bin energy (spectrum
+    // theming), fading toward a cooler floor. Not horizontal dB meter bands.
     {
+        let tint = |c: Color32, h: f32, floor: bool| {
+            let base = if h > 0.05 {
+                (145.0 + h * 95.0) * if floor { 0.42 } else { 1.0 }
+            } else if floor {
+                55.0
+            } else {
+                70.0
+            };
+            Color32::from_rgba_unmultiplied(
+                c.r(),
+                c.g(),
+                c.b(),
+                base.clamp(0.0, 240.0) as u8,
+            )
+        };
         let mut mesh = Mesh::default();
         mesh.vertices.reserve(N.saturating_sub(1) * 4);
         mesh.indices.reserve(N.saturating_sub(1) * 6);
@@ -524,31 +798,33 @@ fn paint_fft_columns(
             let t1 = (i + 1) as f32 / (N - 1) as f32;
             let x0 = plot.left() + t0 * plot.width();
             let x1 = plot.left() + t1 * plot.width();
-            let y0 = spec_db_to_y(state.cols[i]);
-            let y1 = spec_db_to_y(state.cols[i + 1]);
+            let d0 = state.cols[i];
+            let d1 = state.cols[i + 1];
+            if d0 < SPEC_VIEW_MIN + 0.5 && d1 < SPEC_VIEW_MIN + 0.5 {
+                continue;
+            }
+            let h0 = spec_heat(d0);
+            let h1 = spec_heat(d1);
+            let y0 = spec_db_to_y(d0);
+            let y1 = spec_db_to_y(d1);
+            let c0 = phosphor_heat_color(h0, theme);
+            let c1 = phosphor_heat_color(h1, theme);
             let base = mesh.vertices.len() as u32;
-            mesh.colored_vertex(egui::pos2(x0, plot.bottom()), fill);
-            mesh.colored_vertex(egui::pos2(x0, y0), fill);
-            mesh.colored_vertex(egui::pos2(x1, y1), fill);
-            mesh.colored_vertex(egui::pos2(x1, plot.bottom()), fill);
+            mesh.colored_vertex(egui::pos2(x0, y0), tint(c0, h0, false));
+            mesh.colored_vertex(egui::pos2(x1, y1), tint(c1, h1, false));
+            mesh.colored_vertex(egui::pos2(x1, floor_y), tint(c1, h1, true));
+            mesh.colored_vertex(egui::pos2(x0, floor_y), tint(c0, h0, true));
             mesh.add_triangle(base, base + 1, base + 2);
             mesh.add_triangle(base, base + 2, base + 3);
         }
         painter.add(Shape::mesh(mesh));
     }
 
-    // Crest + hold as single path strokes.
-    {
-        let mut crest = Vec::with_capacity(N);
-        for (i, &db) in state.cols.iter().enumerate() {
-            let t = i as f32 / (N - 1) as f32;
-            crest.push(egui::pos2(
-                plot.left() + t * plot.width(),
-                spec_db_to_y(db),
-            ));
-        }
-        painter.add(PathShape::line(crest, PathStroke::new(1.35, stroke_col)));
-    }
+    // Mint crest + white tip (platform accent as signal, not chrome).
+    let phos = Color32::from_rgb(0x7a, 0xd4, 0xb4);
+    let phos_hi = Color32::from_rgb(0xe8, 0xf4, 0xee);
+
+    // Peak-hold ghost — thicker cool phosphor ridge.
     if chrome.peak_hold {
         let mut hold_pts = Vec::with_capacity(N);
         for (i, &db) in state.hold.iter().enumerate() {
@@ -559,10 +835,150 @@ fn paint_fft_columns(
             ));
         }
         painter.add(PathShape::line(
+            hold_pts.clone(),
+            PathStroke::new(
+                3.0,
+                Color32::from_rgba_unmultiplied(0xc8, 0xe8, 0xdc, 55),
+            ),
+        ));
+        painter.add(PathShape::line(
             hold_pts,
-            PathStroke::new(1.0, Color32::from_rgba_unmultiplied(0xf0, 0xf2, 0xf5, 110)),
+            PathStroke::new(
+                1.5,
+                Color32::from_rgba_unmultiplied(0xc8, 0xe8, 0xdc, 130),
+            ),
         ));
     }
+
+    // Dense phosphor history beads / vertical trails — thick & bright.
+    {
+        let step = 2usize;
+        for i in (0..N).step_by(step) {
+            let glow = state.glow[i];
+            if glow < 0.03 {
+                continue;
+            }
+            let t = i as f32 / (N - 1) as f32;
+            let x = plot.left() + t * plot.width();
+            let mut prev: Option<Pos2> = None;
+            for k in 0..PHOS_HIST {
+                let age = PHOS_HIST - 1 - k;
+                let hi = state.hist_i.wrapping_sub(1).wrapping_sub(age as u8) as usize % PHOS_HIST;
+                let db = state.hist[hi * N + i];
+                if db < SPEC_FLOOR_DB + 4.0 {
+                    prev = None;
+                    continue;
+                }
+                let p = egui::pos2(x, spec_db_to_y(db));
+                let fade = (k as f32 / (PHOS_HIST as f32 - 1.0).max(1.0)).clamp(0.0, 1.0);
+                let a = ((40.0 + fade * 180.0) * glow.sqrt().max(0.35)).clamp(0.0, 230.0) as u8;
+                let r = 1.8 + fade * 3.2 * glow.max(0.4);
+                if let Some(pp) = prev {
+                    let a_trail = ((a as u16 * 2) / 3) as u8;
+                    painter.line_segment(
+                        [pp, p],
+                        Stroke::new(
+                            2.0 + fade * 2.2,
+                            Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), a_trail),
+                        ),
+                    );
+                }
+                painter.circle_filled(
+                    p,
+                    r,
+                    Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), a),
+                );
+                prev = Some(p);
+            }
+        }
+    }
+
+    // Crest: heavy bloom + thick tube + bright core (reads over heatmap).
+    {
+        let mut crest = Vec::with_capacity(N);
+        for (i, &db) in state.cols.iter().enumerate() {
+            let t = i as f32 / (N - 1) as f32;
+            crest.push(egui::pos2(
+                plot.left() + t * plot.width(),
+                spec_db_to_y(db),
+            ));
+        }
+        let live = state.cols.iter().any(|&d| d > SPEC_FLOOR_DB + 8.0);
+        let (outer_a, mid_a, core_a) = if live {
+            (90_u8, 200, 255)
+        } else {
+            (45, 110, 160)
+        };
+        // Wide outer halo
+        painter.add(PathShape::line(
+            crest.clone(),
+            PathStroke::new(
+                14.0,
+                Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), outer_a / 2),
+            ),
+        ));
+        // Mid bloom
+        painter.add(PathShape::line(
+            crest.clone(),
+            PathStroke::new(
+                8.0,
+                Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), outer_a),
+            ),
+        ));
+        // Tube body
+        painter.add(PathShape::line(
+            crest.clone(),
+            PathStroke::new(
+                4.5,
+                Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), mid_a),
+            ),
+        ));
+        // Hot core
+        painter.add(PathShape::line(
+            crest.clone(),
+            PathStroke::new(
+                2.4,
+                Color32::from_rgba_unmultiplied(phos_hi.r(), phos_hi.g(), phos_hi.b(), core_a),
+            ),
+        ));
+        // Hot tip sparkle on loudest column.
+        if let Some((i_max, &db_max)) = state
+            .cols
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            if db_max > SPEC_FLOOR_DB + 14.0 {
+                let t = i_max as f32 / (N - 1) as f32;
+                let p = egui::pos2(plot.left() + t * plot.width(), spec_db_to_y(db_max));
+                let h = spec_heat(db_max);
+                let tip = phosphor_heat_color(h, theme);
+                painter.circle_filled(
+                    p,
+                    4.0 + h * 3.0,
+                    Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), 160),
+                );
+                painter.circle_filled(
+                    p,
+                    2.6 + h * 1.8,
+                    Color32::from_rgba_unmultiplied(tip.r(), tip.g(), tip.b(), 220),
+                );
+                painter.circle_filled(p, 1.4, Color32::from_rgba_unmultiplied(0xf4, 0xfa, 0xf6, 245));
+            }
+        }
+    }
+
+    // Floor scanline — brighter CRT rice.
+    painter.line_segment(
+        [
+            egui::pos2(plot.left(), floor_y - 0.5),
+            egui::pos2(plot.right(), floor_y - 0.5),
+        ],
+        Stroke::new(
+            1.5,
+            Color32::from_rgba_unmultiplied(phos.r(), phos.g(), phos.b(), 70),
+        ),
+    );
 
     ui.ctx().data_mut(|d| d.insert_temp(spec_id, state));
 }
@@ -603,7 +1019,7 @@ fn log_max_pool_into(mags: Option<&[f32]>, sr: f32, state: &mut SpecPaintState) 
             SPEC_FLOOR_DB
         };
         state.ctrl_log.push(f.ln());
-        state.ctrl_db.push(db.clamp(SPEC_FLOOR_DB, 6.0));
+        state.ctrl_db.push(db.clamp(SPEC_FLOOR_DB, SPEC_VIEW_MAX + 6.0));
     }
     if state.ctrl_log.len() < 4 {
         return;
@@ -683,5 +1099,5 @@ fn catmull_db_at_logf(lf: f32, ctrl_log: &[f32], ctrl_db: &[f32]) -> f32 {
             + (-p0 + p2) * t
             + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
             + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
-    v.clamp(SPEC_FLOOR_DB, 6.0)
+    v.clamp(SPEC_FLOOR_DB, SPEC_VIEW_MAX + 6.0)
 }

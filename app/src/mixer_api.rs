@@ -13,9 +13,11 @@ fn is_internal_helper_node(name: &str) -> bool {
         // Graph helpers — not user-facing virtual I/O
         || name.starts_with("buschain_hold")
         || name.starts_with("buschain_post_")
+        || name.starts_with("buschain_glc_")
         || name.starts_with("buschain_rs_")
         || name.starts_with("buschain_vinf_")
         || name.starts_with("buschain_fx_")
+        || name.starts_with("buschain_mtr_")
 }
 
 /// Track/master bus names that are app-facing virtual sinks.
@@ -142,6 +144,7 @@ pub fn build_mixer_json(
         })
         .unwrap_or_default();
 
+    let sr = status.map(|s| s.sample_rate).unwrap_or(48_000);
     let tracks: Vec<Value> = session
         .map(|s| {
             s.tracks
@@ -152,15 +155,26 @@ pub fn build_mixer_json(
                     } else {
                         "track"
                     };
+                    let bus = t.expected_sink_name();
+                    let (glc_comp_samples, glc_comp_ms) =
+                        crate::audio::engine_handle::host_compensation_ms(&bus, sr);
+                    let fx_lat_ms =
+                        crate::audio::engine_handle::host_latency_ms(&bus, sr);
+                    let (_, path_ms) =
+                        crate::audio::engine_handle::host_path_latency_ms(&bus, sr);
+                    let q = status.map(|st| st.quantum).unwrap_or(256);
+                    let hw_quantum_ms =
+                        crate::audio::engine_handle::hw_quantum_ms(sr, q);
                     json!({
                         "id": t.id.to_string(),
                         "name": t.name,
                         "kind": kind,
                         "gain_db": t.gain_db,
                         "mute": t.mute,
-                        "bus": t.expected_sink_name(),
+                        "bus": bus,
                         "virtual_output": t.virtual_output,
                         "virtual_input": t.virtual_input,
+                        "direct_out": t.direct_out,
                         "virtual_input_source": if t.virtual_input && !t.kind.is_master() {
                             Some(t.expected_virtual_input_name())
                         } else {
@@ -173,12 +187,21 @@ pub fn build_mixer_json(
                         })).collect::<Vec<_>>(),
                         // Deprecated single-input mirror of inputs[0].
                         "input_source": t.input_source,
+                        // Master-edge GLC pad (0 = direct Master link).
+                        "glc_comp_samples": glc_comp_samples,
+                        "glc_comp_ms": glc_comp_ms,
+                        "fx_lat_ms": fx_lat_ms,
+                        "path_ms": path_ms,
+                        "hw_quantum_ms": hw_quantum_ms,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default();
 
+    let (_, glc_lstar_ms) = crate::audio::engine_handle::host_lstar_ms(sr);
+    let q = status.map(|s| s.quantum).unwrap_or(256);
+    let hw_quantum_ms = crate::audio::engine_handle::hw_quantum_ms(sr, q);
     json!({
         "status": status.map(|s| json!({
             "master_hw": s.master_hw,
@@ -189,6 +212,9 @@ pub fn build_mixer_json(
             "session_slug": s.session_slug,
             "sample_rate": s.sample_rate,
             "quantum": s.quantum,
+            "glc_lstar_ms": glc_lstar_ms,
+            "hw_quantum_ms": hw_quantum_ms,
+            "glc_disabled": crate::audio::engine_handle::glc_is_disabled(),
         })),
         "streams": streams,
         "sinks": sinks,

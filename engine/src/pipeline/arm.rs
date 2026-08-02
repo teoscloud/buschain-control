@@ -5,10 +5,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::backend::{link_is_live, sink_exists, AudioBackend};
+use crate::backend::{
+    egress_allow_target, egress_hop_live, ensure_egress_clocked_route, is_physical_hw_dest,
+    link_is_live, sink_exists, AudioBackend,
+};
+use crate::clock::GraphClock;
 use crate::domain::mtr_name_for_bus;
 use crate::fx_gen::{live_fx_name, live_post_name};
 use crate::host::registry;
+use crate::pipeline::glc;
+use crate::plan::DesiredState;
 
 /// Keep short — structural edits should not sit in dwell.
 pub const WET_DWELL: Duration = Duration::from_millis(20);
@@ -103,10 +109,14 @@ pub fn disarm_track_egress_ex(
     let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
+    let glc_name = glc::glc_name_for_bus(bus);
     let _ = backend.unlink_from_source_except(&post_mon, &[]);
     if sweep_pulse {
         crate::backend::unload_legacy_from_source_except(&post_mon, &[]);
     }
+    // Master-edge GLC is owned by pipeline::glc; drop post/bus → glc on disarm.
+    let _ = backend.unlink_raw(&post_mon, &glc_name);
+    let _ = backend.unlink_raw(&from, &glc_name);
     let mtr = mtr_name_for_bus(bus);
     if keep_fx_feed && registry::host_running(bus) {
         let allow = [fx.as_str(), "buschain_hold", mtr.as_str()];
@@ -125,20 +135,57 @@ pub fn disarm_track_egress_ex(
     let _ = backend.ensure_link_raw(&from, "buschain_hold");
 }
 
-/// True when every existing dest is linked from `src` (vin feed alone must not
-/// count as healthy when Master is also in Desired egress).
-fn dests_linked(src: &str, dests: &[String]) -> bool {
+/// True when every existing dest is linked from `src` (direct or egress bridge).
+fn dests_linked(src: &str, dests: &[String], desired: &DesiredState) -> bool {
     let mut any = false;
     for d in dests {
         if d.is_empty() || !sink_exists(d) {
             continue;
         }
         any = true;
-        if !link_is_live(src, d) {
+        if !egress_hop_live(src, d, desired) {
             return false;
         }
     }
     any
+}
+
+/// Link `source` → dest (BusChain direct, or Master→HW via `buschain_rs_out_*`).
+fn link_to_dest(
+    backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
+    source: &str,
+    dest: &str,
+) -> Result<()> {
+    if dest.is_empty() || !sink_exists(dest) {
+        return Ok(());
+    }
+    if is_physical_hw_dest(dest) {
+        ensure_egress_clocked_route(backend, source, dest, clock, desired)
+    } else {
+        backend.ensure_link_raw(source, dest)?;
+        Ok(())
+    }
+}
+
+fn allow_for_dests(source: &str, dests: &[String], desired: &DesiredState) -> Vec<String> {
+    dests
+        .iter()
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            if is_physical_hw_dest(d) {
+                egress_allow_target(source, d, desired)
+            } else {
+                d.clone()
+            }
+        })
+        .collect()
+}
+
+/// Desired egress → physical link targets (Master-edge GLC when δ>0).
+fn physical_dests(bus: &str, dests: &[String]) -> Vec<String> {
+    glc::physical_egress_dests(bus, dests)
 }
 
 /// True dry: no FX host.
@@ -147,6 +194,8 @@ fn dests_linked(src: &str, dests: &[String]) -> bool {
 /// Otherwise legacy `bus.monitor → dests`.
 fn arm_dry_to_dests(
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
     bus: &str,
     from: &str,
     post_mon: &str,
@@ -156,7 +205,7 @@ fn arm_dry_to_dests(
     let post = live_post_name(bus);
     if sink_exists(&post) {
         // Already correctly armed through the fader stage?
-        if dests_linked(post_mon, dests)
+        if dests_linked(post_mon, dests, desired)
             && link_is_live(from, &post)
             && !dests
                 .iter()
@@ -169,42 +218,38 @@ fn arm_dry_to_dests(
         let _ = backend.unlink_from_source_except(from, &allow_bus);
         let _ = backend.ensure_link_raw(from, "buschain_hold");
         let _ = backend.ensure_link_raw(from, &post);
-        let allow_post: Vec<&str> = dests
+        for d in dests {
+            link_to_dest(backend, desired, clock, post_mon, d)?;
+        }
+        let allow_owned = allow_for_dests(post_mon, dests, desired);
+        let allow_post: Vec<&str> = allow_owned
             .iter()
             .map(|s| s.as_str())
             .chain(["buschain_hold"])
             .collect();
         let _ = backend.unlink_from_source_except(post_mon, &allow_post);
-        for d in dests {
-            if d.is_empty() || !sink_exists(d) {
-                continue;
-            }
-            backend.ensure_link_raw(post_mon, d)?;
-        }
         return Ok(());
     }
-    if dests_linked(from, dests)
+    if dests_linked(from, dests, desired)
         && !dests
             .iter()
-            .any(|d| !d.is_empty() && link_is_live(post_mon, d))
+            .any(|d| !d.is_empty() && egress_hop_live(post_mon, d, desired))
     {
         let _ = backend.ensure_link_raw(from, "buschain_hold");
         return Ok(());
     }
     let _ = backend.unlink_from_source_except(post_mon, &[]);
-    let allow: Vec<&str> = dests
+    for d in dests {
+        link_to_dest(backend, desired, clock, from, d)?;
+    }
+    let allow_owned = allow_for_dests(from, dests, desired);
+    let allow: Vec<&str> = allow_owned
         .iter()
         .map(|s| s.as_str())
         .chain(["buschain_hold", mtr.as_str()])
         .collect();
     let _ = backend.unlink_from_source_except(from, &allow);
     let _ = backend.ensure_link_raw(from, "buschain_hold");
-    for d in dests {
-        if d.is_empty() || !sink_exists(d) {
-            continue;
-        }
-        backend.ensure_link_raw(from, d)?;
-    }
     Ok(())
 }
 
@@ -215,6 +260,8 @@ fn arm_dry_to_dests(
 /// back to `bus→dest` only when there is no post stage yet.
 fn arm_dry_preserving_fx(
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
     bus: &str,
     from: &str,
     post_mon: &str,
@@ -240,35 +287,38 @@ fn arm_dry_preserving_fx(
             if link_is_live(from, d) {
                 let _ = backend.unlink_raw(from, d);
             }
-            let _ = backend.ensure_link_raw(post_mon, d);
+            let _ = link_to_dest(backend, desired, clock, post_mon, d);
         }
         return Ok(());
     }
     // Don't strip post→dest if somehow live — soft path owns that.
-    let allow: Vec<&str> = dests
-        .iter()
-        .map(|s| s.as_str())
-        .chain([fx, "buschain_hold", mtr.as_str()])
-        .collect();
-    let _ = backend.unlink_from_source_except(from, &allow);
     for d in dests {
         if d.is_empty() || !sink_exists(d) {
             continue;
         }
         // Per-dest cutover: once this dest hears the wet hop, dry parallel
         // there is double audio — keep dry only for dests still waiting.
-        if link_is_live(post_mon, d) {
+        if egress_hop_live(post_mon, d, desired) {
             let _ = backend.unlink_raw(from, d);
             continue;
         }
-        let _ = backend.ensure_link_raw(from, d);
+        let _ = link_to_dest(backend, desired, clock, from, d);
     }
+    let allow_owned = allow_for_dests(from, dests, desired);
+    let allow: Vec<&str> = allow_owned
+        .iter()
+        .map(|s| s.as_str())
+        .chain([fx, "buschain_hold", mtr.as_str()])
+        .collect();
+    let _ = backend.unlink_from_source_except(from, &allow);
     Ok(())
 }
 
 /// Soft cutover: dry bus→dest stays until post→dest is up, then drop dry.
 fn arm_wet_soft(
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
     bus: &str,
     from: &str,
     fx: &str,
@@ -280,28 +330,29 @@ fn arm_wet_soft(
     let _ = backend.ensure_link_raw(from, fx);
     let _ = backend.ensure_link_raw(from, "buschain_hold");
     let _ = backend.ensure_link_raw(fx, post);
-    let allow_post: Vec<&str> = dests
-        .iter()
-        .map(|s| s.as_str())
-        .chain(std::iter::once("buschain_hold"))
-        .collect();
-    let _ = backend.unlink_from_source_except(post_mon, &allow_post);
     let mut wet_ok = false;
     for d in dests {
         if d.is_empty() || !sink_exists(d) {
             continue;
         }
-        if backend.ensure_link_raw(post_mon, d).is_ok() {
+        if link_to_dest(backend, desired, clock, post_mon, d).is_ok() {
             wet_ok = true;
         }
     }
-    if wet_ok && dests_linked(post_mon, dests) {
+    let allow_owned = allow_for_dests(post_mon, dests, desired);
+    let allow_post: Vec<&str> = allow_owned
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::once("buschain_hold"))
+        .collect();
+    let _ = backend.unlink_from_source_except(post_mon, &allow_post);
+    if wet_ok && dests_linked(post_mon, dests, desired) {
         // Exclusive wet: drop dry bus→dest (keep fx + optional dry-meter tap).
         let _ = backend.unlink_from_source_except(from, &[fx, "buschain_hold", mtr.as_str()]);
         return Ok(());
     }
     // Keep dry parallel until post→dest lands (never strip fx).
-    arm_dry_preserving_fx(backend, bus, from, post_mon, fx, dests)
+    arm_dry_preserving_fx(backend, desired, clock, bus, from, post_mon, fx, dests)
 }
 
 /// Exclusive arm: egress_source → each dest (plus hold on bus if source is bus).
@@ -311,6 +362,8 @@ fn arm_wet_soft(
 /// track chain (apps/mics audible dry into Master, track FX only on Master).
 pub fn arm_track_egress(
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
     bus: &str,
     wet: bool,
     dests: &[String],
@@ -319,6 +372,8 @@ pub fn arm_track_egress(
     let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
+    // Master-only pad: Track→Track / vin stay on logical dests (no GLC).
+    let dests = physical_dests(bus, dests);
 
     let host_up = registry::host_running(bus);
     let post_up = sink_exists(&post);
@@ -327,23 +382,32 @@ pub fn arm_track_egress(
     if want_wet {
         // Fast path: exclusive wet already correct.
         if spine_instant_ready(bus)
-            && dests_linked(&post_mon, dests)
+            && dests_linked(&post_mon, &dests, desired)
             && !dests
                 .iter()
                 .any(|d| !d.is_empty() && link_is_live(&from, d))
+            // No dry∥wet Master dual-feed (direct Master while GLC owns the edge).
+            && !(glc::master_pad_samples(bus) > 0
+                && link_is_live(&from, "buschain_master"))
+            && !(glc::master_pad_samples(bus) > 0
+                && link_is_live(&post_mon, "buschain_master"))
         {
             let _ = backend.ensure_link_raw(&from, "buschain_hold");
             return Ok(());
         }
-        return arm_wet_soft(backend, bus, &from, &fx, &post, &post_mon, dests);
+        return arm_wet_soft(
+            backend, desired, clock, bus, &from, &fx, &post, &post_mon, &dests,
+        );
     }
 
-    arm_dry_to_dests(backend, bus, &from, &post_mon, dests)
+    arm_dry_to_dests(backend, desired, clock, bus, &from, &post_mon, &dests)
 }
 
 /// Soft cutover: keep dry audible until post→dest is up, then drop dry.
 pub fn arm_track_egress_soft_cutover(
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
     bus: &str,
     dests: &[String],
 ) -> Result<()> {
@@ -351,7 +415,10 @@ pub fn arm_track_egress_soft_cutover(
     let post = live_post_name(bus);
     let post_mon = format!("{post}.monitor");
     let fx = live_fx_name(bus);
-    arm_wet_soft(backend, bus, &from, &fx, &post, &post_mon, dests)
+    let dests = physical_dests(bus, dests);
+    arm_wet_soft(
+        backend, desired, clock, bus, &from, &fx, &post, &post_mon, &dests,
+    )
 }
 
 pub fn disarm_master_hw(backend: &mut dyn AudioBackend, hw: &str) {
@@ -368,13 +435,31 @@ pub fn disarm_master_hw(backend: &mut dyn AudioBackend, hw: &str) {
     let _ = backend.unlink_raw(from, hw);
     let _ = backend.unlink_from_source_except(&post_mon, &[]);
     let _ = backend.unlink_raw(&post_mon, hw);
+    // Drop egress converter hops into this HW (name prefix sweep).
+    if let Ok(names) = backend.list_sink_names() {
+        for name in names {
+            if name.starts_with("buschain_rs_out_") {
+                let mon = format!("{name}.monitor");
+                let _ = backend.unlink_raw(&mon, hw);
+                let _ = backend.unlink_raw(from, &name);
+                let _ = backend.unlink_raw(&post_mon, &name);
+                let _ = backend.destroy_node(&name);
+            }
+        }
+    }
     let _ = backend.ensure_link_raw(from, "buschain_hold");
 }
 
-pub fn arm_master_hw(backend: &mut dyn AudioBackend, hw: &str, wet: bool) -> Result<()> {
+pub fn arm_master_hw(
+    backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
+    clock: &GraphClock,
+    hw: &str,
+    wet: bool,
+) -> Result<()> {
     if hw.is_empty() || !sink_exists(hw) {
         return Ok(());
     }
     let dests = vec![hw.to_string()];
-    arm_track_egress(backend, "buschain_master", wet, &dests)
+    arm_track_egress(backend, desired, clock, "buschain_master", wet, &dests)
 }

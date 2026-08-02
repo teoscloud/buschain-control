@@ -248,6 +248,7 @@ fn list_sink_inputs_native() -> Vec<Si> {
             let internal = s.node_virtual
                 || s.sink.starts_with("buschain_fx_")
                 || s.sink.starts_with("buschain_post_")
+                || s.sink.starts_with("buschain_glc_")
                 || s.sink.starts_with("buschain_rs_")
                 || s.sink.starts_with("buschain_mtr_")
                 || s.node_name.starts_with("buschain_")

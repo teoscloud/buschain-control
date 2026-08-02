@@ -353,6 +353,7 @@ fn capture_peer_allowed(
         || peer.starts_with("buschain_post_")
         || peer.starts_with("buschain_fx_")
         || peer.starts_with("buschain_mtr_")
+        || peer.starts_with("buschain_glc_")
         || peer == "buschain_hold"
         || peer.starts_with("meter-")
     {

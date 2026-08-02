@@ -123,6 +123,7 @@ pub fn draw_playback(ui: &mut egui::Ui, state: &mut AppState) {
                         .filter(|s| {
                             if s.name.starts_with("buschain_fx_")
                                 || s.name.starts_with("buschain_post_")
+                                || s.name.starts_with("buschain_glc_")
                                 || s.name.starts_with("buschain_mid_")
                                 || s.name.starts_with("buschain_rs_")
                                 || s.name == "buschain_hold"

@@ -17,11 +17,15 @@ First-class audio engine for BusChain Control. **App code must not call `pactl` 
 
 ## Clock domains
 
-- **GraphClock** = Master HW rate + quantum after `BindMasterClock` (`PerformanceProfile`).
-- **DeviceCaps** = true rates from PipeWire `EnumFormat` ∪ ALSA `/proc/asound/cardN/stream*` `Rates:`.
-- Rate bridges are **inbound only** (external → BusChain bus); capture is **shared**
-  (`exclusive: false`) so desktop apps keep the mic.
-- Outbound Master→HW is never bridged (device adapter).
+- **GraphClock** = BusChain engine rate + quantum from `session.performance` (`BindMasterClock` /
+  `bind_graph_clock_profile`). Catalog includes 44.1–384 kHz (DXD / apex) — **not** clamped to Master HW.
+- **Master HW clock** = `device_clocks[hw]` via `BindDeviceClock(bind_buschain)` → PW
+  `clock.force-rate` only; does not overwrite GraphClock.
+- **DeviceCaps** = true HW rates from PipeWire `EnumFormat` ∪ ALSA `/proc/asound/cardN/stream*` `Rates:`.
+- **Inbound** rate bridges (`buschain_rs_*`): external mic → BusChain when rates differ; capture is
+  **shared** (`exclusive: false`) so desktop apps keep the mic.
+- **Egress** rate bridges (`buschain_rs_out_*`): Master/post → HW when GraphClock ≠ HW running rate.
+  Same-rate pairs stay direct.
 - Route / Add In: `Intent::SyncCapture` once + egress `relink_routes` (never ArmSession).
 
 ## Insert pipeline (sealed DAW contract)
@@ -77,8 +81,8 @@ Continuous Desired↔live health. Idle worker ticks + after Hotplug sync session
 - **Levels / mute** — never mute or recreate app-facing buses; silence outbound monitors / FX only.
 - **FX power / knobs** — `PushFxControls` → host queue only.
 - **FX add/remove/reorder** — `EnsureFxChain(Force)` once per track (gen-swap).
-- **Rate bridges** — inbound external→BusChain only; mic hops shared (sink-side dual-path prune).
-- **Custom clock** — device-capable rates only; Apply switches HW + GraphClock together.
+- **Rate bridges** — inbound `buschain_rs_*` (mic→bus) + egress `buschain_rs_out_*` (Master→HW); mic hops shared.
+- **Engine clock** — Settings Apply binds GraphClock only; Master HW Apply force-rates the device only.
 
 ## Native PipeWire control plane (Phase F)
 

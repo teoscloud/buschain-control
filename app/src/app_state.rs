@@ -33,9 +33,20 @@ pub struct AppState {
     pub plugins: PluginHost,
     pub worker: AudioWorker,
     pub meters: MeterHub,
+    /// Legacy tab index — mixer is always the central view; other views use float windows.
     pub tab: usize,
     /// Settings category: Appearance / Audio / Plugins / Session / Advanced.
     pub settings_tab: usize,
+    /// Master Options window (System + BusChain sections).
+    pub win_options: bool,
+    /// Options root: 0 = System · 1 = BusChain.
+    pub options_section: u8,
+    /// System tabs: 0 Playback · 1 Recording · 2 Output · 3 Input.
+    pub options_system_tab: u8,
+    /// BusChain tabs: 0 MIDI · 1 Sessions · 2 Settings.
+    pub options_buschain_tab: u8,
+    /// Settings → Appearance theme creator draft name.
+    pub theme_draft_name: String,
     pub selected_track: Option<Uuid>,
     /// Selected insert on the selected track (rack highlight).
     pub selected_plugin_slot: Option<Uuid>,
@@ -174,6 +185,11 @@ impl AppState {
             meters,
             tab: 0,
             settings_tab: 0,
+            win_options: false,
+            options_section: 0,
+            options_system_tab: 0,
+            options_buschain_tab: 2,
+            theme_draft_name: String::new(),
             selected_track: selected,
             selected_plugin_slot: None,
             status: "BusChain Control ready — buses persist across restart".into(),
@@ -426,10 +442,10 @@ impl AppState {
         true
     }
 
-    /// Recompute Balanced/Low/Stable from Master HW out probe (Custom keeps numbers).
+    /// Recompute Balanced/Low/Stable/Custom from the BusChain engine catalog.
+    /// Also refreshes Master HW caps for the device panel (does not clamp engine to HW).
     pub fn refresh_performance_from_device(&mut self) {
-        use buschain_engine::{probe_master_hw, resolve_profile, AudioPreset};
-        // One resolver for route + probe + UI (same as worker).
+        use buschain_engine::{probe_master_hw, resolve_engine_profile, AudioPreset};
         if let Ok(hw) = crate::audio::graph::resolve_hardware_output(&self.session) {
             if self.session.master_output.as_deref() != Some(hw.as_str()) {
                 self.session.master_output = Some(hw.clone());
@@ -443,62 +459,58 @@ impl AppState {
         let caps = probe_master_hw(self.session.master_output.as_deref());
         self.device_caps = caps.clone();
         let preset = self.session.performance.preset;
+        let soft = self.session.performance.soft_quantum;
         if preset == AudioPreset::Custom {
-            let soft = self.session.performance.soft_quantum;
             let rate = self.session.performance.sample_rate;
             let q = self.session.performance.quantum;
-            let before_rate = rate;
-            let before_q = q;
-            self.session.performance = resolve_profile(
-                AudioPreset::Custom,
-                &caps,
-                Some(rate),
-                Some(q),
-                soft,
-            );
+            self.session.performance =
+                resolve_engine_profile(AudioPreset::Custom, Some(rate), Some(q), soft);
             let after = &self.session.performance;
-            if after.device_limited
-                || after.sample_rate != before_rate
-                || after.quantum != before_q
-            {
+            if caps.preferred_rate > 0 && after.sample_rate != caps.preferred_rate {
                 self.status = format!(
-                    "Custom clamped to {} Hz · q{} (device caps)",
-                    after.sample_rate, after.quantum
-                );
-                self.dirty = true;
-            } else if caps.preferred_rate > 0 && after.sample_rate != caps.preferred_rate {
-                self.status = format!(
-                    "Custom {} Hz · Apply to switch HW from {} Hz",
+                    "Engine {} Hz · Master HW {} Hz (egress converts when applied)",
                     after.sample_rate, caps.preferred_rate
                 );
             }
             return;
         }
-        let soft = self.session.performance.soft_quantum;
-        self.session.performance = resolve_profile(preset, &caps, None, None, soft);
+        self.session.performance = resolve_engine_profile(preset, None, None, soft);
         self.dirty = true;
     }
 
-    /// Bind GraphClock from session performance and rewire (Config → Apply audio settings).
+    /// Bind BusChain GraphClock from session performance (Settings → Apply).
+    /// Does not force Master HW rate.
     pub fn apply_audio_clock(&mut self) {
         self.refresh_performance_from_device();
-        // Keep per-device prefs in sync with Master HW out.
-        if let Some(hw) = self.session.master_output.clone() {
-            self.session.device_clocks.insert(
-                hw,
-                crate::session::DeviceClockConfig {
-                    sample_rate: self.session.performance.sample_rate,
-                    quantum: self.session.performance.quantum,
-                    soft_quantum: self.session.performance.soft_quantum,
-                },
-            );
-        }
         let _ = self.session.save();
         self.worker.send(Command::BindMasterClock(self.session.clone()));
         self.status = format!(
-            "Clock {} Hz · q{} — binding…",
+            "Engine {} Hz · q{} — binding…",
             self.session.performance.sample_rate, self.session.performance.quantum
         );
+    }
+
+    /// Copy Master HW prefs into the BusChain engine profile (optional sync).
+    pub fn match_engine_clock_to_master_hw(&mut self) {
+        use buschain_engine::{resolve_engine_profile, AudioPreset};
+        let Some(hw) = self.session.master_output.clone() else {
+            self.status = "No Master HW out — pick a sink first".into();
+            return;
+        };
+        let (rate, quantum, soft) = if let Some(c) = self.session.device_clocks.get(&hw) {
+            (c.sample_rate, c.quantum, c.soft_quantum)
+        } else {
+            (
+                self.device_caps.preferred_rate.max(48_000),
+                self.device_caps.preferred_quantum.max(64),
+                true,
+            )
+        };
+        self.session.performance =
+            resolve_engine_profile(AudioPreset::Custom, Some(rate), Some(quantum), soft);
+        self.session.performance.preset = AudioPreset::Custom;
+        self.dirty = true;
+        self.status = format!("Engine matched Master HW → {rate} Hz · q{quantum}");
     }
 
     /// Cached caps for a HW sink/source (TTL). Safe to call from UI draw.
@@ -583,12 +595,9 @@ impl AppState {
         let quantum = entry.quantum;
         let soft_quantum = entry.soft_quantum;
 
+        // Master HW Apply force-rates the device only — GraphClock stays independent.
         let bind_buschain = !is_source
             && self.session.master_output.as_deref() == Some(device);
-        if bind_buschain {
-            self.session.performance = resolved;
-            self.session.performance.preset = AudioPreset::Custom;
-        }
         let _ = self.session.save();
         self.worker.send(Command::BindDeviceClock {
             session: self.session.clone(),
@@ -601,7 +610,7 @@ impl AppState {
         self.status = format!(
             "{} {} Hz · q{} — applying…",
             if bind_buschain {
-                "Master HW + BusChain"
+                "Master HW"
             } else {
                 "Device"
             },
@@ -1263,6 +1272,20 @@ impl AppState {
             .send(Command::ApplySession(self.session.clone()));
         self.status = "New session — Save as… to keep it".into();
         self.dirty = true;
+    }
+
+    /// Open Options → System (Playback / Recording / Output / Input).
+    pub fn open_options_system(&mut self, tab: u8) {
+        self.win_options = true;
+        self.options_section = 0;
+        self.options_system_tab = tab.min(3);
+    }
+
+    /// Open Options → BusChain (MIDI / Sessions / Settings).
+    pub fn open_options_buschain(&mut self, tab: u8) {
+        self.win_options = true;
+        self.options_section = 1;
+        self.options_buschain_tab = tab.min(2);
     }
 
     pub fn save_session(&mut self) {

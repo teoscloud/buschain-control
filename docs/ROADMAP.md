@@ -53,5 +53,6 @@
 - [x] **F2** Native levels/mute/gate + Metadata defaults + registry snapshot/sources; PulseCompat for stream-move only; app levels/defaults via engine
 - [x] **G** CLAP/VST3 on host path + insert_map + `state_blob` (always built-in; full CLAP/VST3 process APIs still incomplete)
 - [x] **H** Master-bus PDC delay lines + latency publish bookkeeping; UI latency helpers
+- [x] **H+** Master fan-in GLC (`pipeline::glc`): DAG path latency + Master-edge δ pads; Track→Track undelayed; cycle reject
 - [x] **I** Remote `AudioProcessor` hook (`host/remote.rs`, `BUSCHAIN_SANDBOX_PLUGINS`)
 - [x] **J** Host pre/post meter atomics; freeze/bounce offline; UI bridge stub; ControlMsg sample timestamps

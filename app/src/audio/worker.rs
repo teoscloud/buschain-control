@@ -1379,31 +1379,84 @@ fn process_command_batch(
                     ) {
                         Ok(clock_msg) => {
                             if bind_buschain {
-                                match graph::apply_session(
-                                    &mut session,
-                                    &mut fx,
-                                    graph::ApplyKind::ClockBind,
-                                ) {
-                                    Ok(route_msg) => {
-                                        let message = format!("{clock_msg} · {route_msg}");
-                                        *last_session = Some(session.clone());
-                                        let _ =
-                                            tx.send(Event::SessionApplied { session, message, kind: SessionAppliedKind::Other });
-                                        let _ =
-                                            tx.send(Event::Snapshot(graph::refresh_snapshot()));
-                                    }
+                                // Master HW force-rate only — rebuild Master→HW egress
+                                // (direct or buschain_rs_out_*) without FX ForceRespawn,
+                                // then heal capture hops (mic domain often moves with HW).
+                                let relink = crate::audio::engine_handle::set_master_hw_light(
+                                    &device,
+                                );
+                                let hw = graph::resolve_hardware_output(&session)
+                                    .unwrap_or_else(|_| {
+                                        session.master_output.clone().unwrap_or_default()
+                                    });
+                                crate::audio::engine_handle::sync_desired_from_session(
+                                    &session, &hw,
+                                );
+                                let heal = crate::audio::engine_handle::with_engine(|eng| {
+                                    eng.invalidate_capture_apply_state();
+                                    eng.apply(buschain_engine::Intent::SyncCapture)
+                                        .map(|r| r.join())
+                                });
+                                let mut message = match relink {
+                                    Ok(m) if !m.is_empty() => format!("{clock_msg} · {m}"),
+                                    Ok(_) => clock_msg,
                                     Err(e) => {
                                         let _ = tx.send(Event::Error(format!(
-                                            "device clock bind: {e:#}"
+                                            "Master HW egress relink: {e:#}"
+                                        )));
+                                        clock_msg
+                                    }
+                                };
+                                match heal {
+                                    Ok(cap) if !cap.is_empty() => {
+                                        message = format!("{message} · {cap}");
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        let _ = tx.send(Event::Error(format!(
+                                            "Master HW capture heal: {e:#}"
                                         )));
                                     }
                                 }
-                            } else {
                                 *last_session = Some(session.clone());
-                                let _ = tx.send(Event::Status(clock_msg));
                                 let _ = tx.send(Event::SessionApplied {
                                     session,
-                                    message: format!("Device clock → {device}"),
+                                    message,
+                                    kind: SessionAppliedKind::Other,
+                                });
+                                let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                            } else {
+                                // Prefs only (graph clock unchanged). Heal capture if a prior
+                                // secondary Apply left hops dead after a global force-rate.
+                                let hw = graph::resolve_hardware_output(&session)
+                                    .unwrap_or_else(|_| {
+                                        session.master_output.clone().unwrap_or_default()
+                                    });
+                                crate::audio::engine_handle::sync_desired_from_session(
+                                    &session, &hw,
+                                );
+                                let heal = crate::audio::engine_handle::with_engine(|eng| {
+                                    eng.invalidate_capture_apply_state();
+                                    eng.apply(buschain_engine::Intent::SyncCapture)
+                                        .map(|r| r.join())
+                                });
+                                let message = match heal {
+                                    Ok(cap) if !cap.is_empty() => {
+                                        format!("{clock_msg} · {cap}")
+                                    }
+                                    Ok(_) => clock_msg,
+                                    Err(e) => {
+                                        let _ = tx.send(Event::Error(format!(
+                                            "device clock capture heal: {e:#}"
+                                        )));
+                                        clock_msg
+                                    }
+                                };
+                                *last_session = Some(session.clone());
+                                let _ = tx.send(Event::Status(message.clone()));
+                                let _ = tx.send(Event::SessionApplied {
+                                    session,
+                                    message,
                                     kind: SessionAppliedKind::Clock,
                                 });
                                 let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));

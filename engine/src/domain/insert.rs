@@ -158,6 +158,11 @@ pub fn post_name_for_bus(bus: &str) -> String {
     format!("buschain_post_{}", bus_suffix(bus))
 }
 
+/// Master-edge graph latency compensation filter (`post → glc → Master` when δ>0).
+pub fn glc_name_for_bus(bus: &str) -> String {
+    format!("buschain_glc_{}", bus_suffix(bus))
+}
+
 /// In-process dry-bus peak tap (`{bus}.monitor` → meter → hold).
 pub fn mtr_name_for_bus(bus: &str) -> String {
     format!("buschain_mtr_{}", bus_suffix(bus))

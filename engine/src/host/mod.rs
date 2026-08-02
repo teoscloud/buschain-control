@@ -32,7 +32,7 @@ pub use fade::{mix_sample, BypassFade, FADE_LEN};
 pub use freeze::{bounce_rack, FreezeBuffer};
 pub use ladspa::{load_instance, resolve_plugin_so, LadspaInstance, LadspaLibrary};
 pub use lv2::{probe_lv2_params, Lv2Instance, Lv2ParamInfo};
-pub use pdc::{compensation_samples, reported_latency};
+pub use pdc::{compensation_samples, refresh_peer_pads, reported_latency};
 pub use processor::{AudioProcessor, MidiEvent, Passthrough};
 pub use rack::Rack;
 pub use remote::{surface_ctrl_ready, surface_forget_ctrl, surface_send_ctrl, RemoteProcessor};

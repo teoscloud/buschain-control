@@ -25,6 +25,10 @@ pub trait Theme: Send + Sync {
     }
     fn border(&self) -> Color32;
     fn border_soft(&self) -> Color32;
+    /// Track / strip selection — subtle phosphor (mint family).
+    fn selection(&self) -> Color32 {
+        Color32::from_rgb(0x6e, 0xaa, 0x96)
+    }
     fn text(&self) -> Color32;
     fn text_dim(&self) -> Color32;
     fn text_muted(&self) -> Color32;
@@ -68,7 +72,7 @@ fn darken(c: Color32, t: f32) -> Color32 {
     )
 }
 
-/// Premium dark console — warm charcoal; accent is user-customizable.
+/// Premium dark console — charcoal chrome; accent defaults to mint / teal.
 #[derive(Clone, Copy)]
 pub struct SpectrumTheme {
     pub accent: Color32,
@@ -77,7 +81,7 @@ pub struct SpectrumTheme {
 impl Default for SpectrumTheme {
     fn default() -> Self {
         Self {
-            accent: Color32::from_rgb(0xc9, 0xa2, 0x6b),
+            accent: Color32::from_rgb(0x6e, 0xaa, 0x96),
         }
     }
 }
@@ -126,19 +130,20 @@ impl Theme for SpectrumTheme {
         Color32::from_rgb(0x16, 0x18, 0x1c)
     }
     fn border(&self) -> Color32 {
-        Color32::from_rgb(0x3a, 0x3d, 0x42)
+        // Subtle hairline chrome — readable, never pops
+        Color32::from_rgb(0x3c, 0x40, 0x46)
     }
     fn border_soft(&self) -> Color32 {
-        Color32::from_rgb(0x2a, 0x2c, 0x30)
+        Color32::from_rgb(0x2c, 0x2e, 0x32)
     }
     fn text(&self) -> Color32 {
-        Color32::from_rgb(0xe6, 0xe7, 0xe9)
+        Color32::from_rgb(0xf0, 0xf1, 0xf3)
     }
     fn text_dim(&self) -> Color32 {
-        Color32::from_rgb(0xa8, 0xaa, 0xae)
+        Color32::from_rgb(0xb8, 0xba, 0xbe)
     }
     fn text_muted(&self) -> Color32 {
-        Color32::from_rgb(0x6e, 0x71, 0x76)
+        Color32::from_rgb(0x7a, 0x7e, 0x84)
     }
     fn danger(&self) -> Color32 {
         Color32::from_rgb(0xd4, 0x45, 0x3a)
@@ -167,7 +172,8 @@ impl Theme for SpectrumTheme {
         Color32::from_rgb(0xd0, 0xd2, 0xd6)
     }
     fn rounding(&self) -> CornerRadius {
-        CornerRadius::same(3)
+        // Soft suite chrome — modest radius, not pill-round.
+        CornerRadius::same(4)
     }
 
     fn apply_egui(&self, ctx: &egui::Context) {
@@ -185,8 +191,8 @@ impl Theme for SpectrumTheme {
         v.faint_bg_color = self.bg_elevated();
         v.hyperlink_color = self.accent();
         let a = self.accent();
-        v.selection.bg_fill = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 48);
-        v.selection.stroke = Stroke::new(1.0_f32, self.accent());
+        v.selection.bg_fill = Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 40);
+        v.selection.stroke = Stroke::new(1.0_f32, self.accent_dim());
         v.window_corner_radius = r;
         v.menu_corner_radius = r;
         for w in [
@@ -201,8 +207,8 @@ impl Theme for SpectrumTheme {
         v.widgets.noninteractive.bg_fill = self.bg_panel();
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border_soft());
         v.widgets.inactive.bg_fill = self.bg_elevated();
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.border());
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, self.accent_hover());
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.border_soft());
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, self.border());
         v.widgets.active.bg_fill = self.accent_dim();
         v.widgets.active.bg_stroke = Stroke::new(1.0_f32, self.accent());
         style.visuals = v;

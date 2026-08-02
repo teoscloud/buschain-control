@@ -15,6 +15,7 @@ use crate::domain::{
 use crate::fx_gen::{clear_live_gen, set_live_gen};
 use crate::host::registry;
 use crate::pipeline::arm::arm_track_egress;
+use crate::plan::DesiredState;
 
 fn host_wire_plan(spec: &ChainSpec) -> WirePlan {
     let bus = spec.bus.as_str();
@@ -85,16 +86,6 @@ fn host_spine_ready(plan: &WirePlan) -> bool {
     link_is_live(&from, fx) && link_is_live(fx, post)
 }
 
-fn path_audible(plan: &WirePlan, require_dest: bool) -> bool {
-    if !host_spine_ready(plan) {
-        return false;
-    }
-    if !require_dest || plan.dest.is_empty() {
-        return true;
-    }
-    link_is_live(&plan.post_monitor(), plan.dest.as_str())
-}
-
 fn link_spine(backend: &mut dyn AudioBackend, plan: &WirePlan) -> Result<()> {
     let from = plan.bus_monitor();
     let fx = plan.fx_sink.as_str();
@@ -107,6 +98,7 @@ fn link_spine(backend: &mut dyn AudioBackend, plan: &WirePlan) -> Result<()> {
 
 pub fn ensure_fx_chain(
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
     clock: &GraphClock,
     spec: &ChainSpec,
     mode: ChainEnsureMode,
@@ -179,7 +171,7 @@ pub fn ensure_fx_chain(
 
     if arm_egress && !plan.dest.is_empty() {
         let dests = [plan.dest.clone()];
-        let _ = arm_track_egress(backend, bus, true, &dests);
+        let _ = arm_track_egress(backend, desired, clock, bus, true, &dests);
     }
 
     if !registry::host_running(bus) {
@@ -228,8 +220,9 @@ pub fn probe_chain_state(bus: &str, inserts_len: usize, dest: &str, require_dest
         return ChainState::Failed("FX host not running".into());
     }
     // Host running + fingerprint is enough for meters/route; full spine CLI is optional.
+    // Probe has no Desired — accept direct post→dest (egress bridge checked at arm time).
     if require_dest {
-        if path_audible(&plan, true) {
+        if link_is_live(&plan.post_monitor(), plan.dest.as_str()) {
             ChainState::Wet(plan)
         } else {
             ChainState::Failed("wet path not audible".into())

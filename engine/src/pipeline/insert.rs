@@ -7,18 +7,20 @@ use anyhow::Result;
 use crate::backend::{FilterChainRuntime, AudioBackend};
 use crate::clock::GraphClock;
 use crate::domain::{ChainEnsureMode, ChainSpec, ChainState, InsertSlot};
+use crate::plan::DesiredState;
 
 use super::insert_host;
 
 pub fn ensure_fx_chain(
     _runtime: &mut FilterChainRuntime,
     backend: &mut dyn AudioBackend,
+    desired: &mut DesiredState,
     clock: &GraphClock,
     spec: &ChainSpec,
     mode: ChainEnsureMode,
     arm_egress: bool,
 ) -> Result<ChainState> {
-    insert_host::ensure_fx_chain(backend, clock, spec, mode, arm_egress)
+    insert_host::ensure_fx_chain(backend, desired, clock, spec, mode, arm_egress)
 }
 
 pub fn push_fx_controls(

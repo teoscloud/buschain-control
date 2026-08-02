@@ -10,37 +10,85 @@ use super::spatial_viz::math::{Mat4, Vec3};
 use super::tokens::Theme;
 
 /// Toned-down mint for phosphor trails (not accent / highlight).
-fn phosphor_mint() -> Color32 {
+pub(crate) fn phosphor_mint() -> Color32 {
     Color32::from_rgb(0x6e, 0xaa, 0x96)
 }
 
+fn lerp_heat(a: Color32, b: Color32, u: f32) -> Color32 {
+    let u = u.clamp(0.0, 1.0).powf(0.92);
+    Color32::from_rgb(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * u) as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * u) as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * u) as u8,
+    )
+}
+
 /// Cool→hot heatmap: deep teal → mint → amber → brick (high chroma, early warm).
-fn heat_color(t: f32, theme: &dyn Theme) -> Color32 {
+/// Soft-clip / limiter transfer surfaces — mid drive already leaves mint.
+pub(crate) fn heat_color(t: f32, theme: &dyn Theme) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let cool = Color32::from_rgb(0x14, 0x36, 0x3c);
-    let mint = Color32::from_rgb(0x4e, 0xc4, 0xa0); // brighter than phosphor mint
-    let amber = Color32::from_rgb(0xf0, 0xc0, 0x3a); // punchier than meter yellow
+    let mint = Color32::from_rgb(0x4e, 0xc4, 0xa0);
+    let amber = Color32::from_rgb(0xf0, 0xc0, 0x3a);
     let brick = theme.meter_orange();
-    let fire = Color32::from_rgb(0xe0, 0x4a, 0x2a); // hot brick tip
-    let lerp = |a: Color32, b: Color32, u: f32| -> Color32 {
-        let u = u.clamp(0.0, 1.0);
-        // Slight gamma on the mix so mid-stops don't wash to mud.
-        let u = u.powf(0.92);
-        Color32::from_rgb(
-            (a.r() as f32 + (b.r() as f32 - a.r() as f32) * u) as u8,
-            (a.g() as f32 + (b.g() as f32 - a.g() as f32) * u) as u8,
-            (a.b() as f32 + (b.b() as f32 - a.b() as f32) * u) as u8,
-        )
-    };
-    // Early amber / brick so typical program levels leave mint quickly.
+    let fire = Color32::from_rgb(0xe0, 0x4a, 0x2a);
     if t < 0.16 {
-        lerp(cool, mint, t / 0.16)
+        lerp_heat(cool, mint, t / 0.16)
     } else if t < 0.38 {
-        lerp(mint, amber, (t - 0.16) / 0.22)
+        lerp_heat(mint, amber, (t - 0.16) / 0.22)
     } else if t < 0.62 {
-        lerp(amber, brick, (t - 0.38) / 0.24)
+        lerp_heat(amber, brick, (t - 0.38) / 0.24)
     } else {
-        lerp(brick, fire, (t - 0.62) / 0.38)
+        lerp_heat(brick, fire, (t - 0.62) / 0.38)
+    }
+}
+
+/// Meter / spectrum heatmap — white tip → teal → mint → amber → brick → lava.
+pub(crate) fn phosphor_heat_color(t: f32, theme: &dyn Theme) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let white = Color32::from_rgb(0xe6, 0xea, 0xee);
+    let teal = Color32::from_rgb(0x2a, 0x7a, 0x72);
+    let mint = Color32::from_rgb(0x5a, 0xc4, 0xa0);
+    let amber = Color32::from_rgb(0xec, 0xb8, 0x3a);
+    let brick = theme.meter_orange();
+    let fire = Color32::from_rgb(0xe8, 0x3a, 0x22);
+    let lava = Color32::from_rgb(0xff, 0x1a, 0x14);
+    if t < 0.08 {
+        // Meter floor white; spectrum quiet bins sit near teal (t≈0.10).
+        lerp_heat(white, teal, t / 0.08)
+    } else if t < 0.28 {
+        lerp_heat(teal, mint, (t - 0.08) / 0.20)
+    } else if t < 0.42 {
+        lerp_heat(mint, amber, (t - 0.28) / 0.14)
+    } else if t < 0.62 {
+        lerp_heat(amber, brick, (t - 0.42) / 0.20)
+    } else if t < 0.78 {
+        lerp_heat(brick, fire, (t - 0.62) / 0.16)
+    } else {
+        lerp_heat(fire, lava, (t - 0.78) / 0.22)
+    }
+}
+
+/// Map level dBFS → heat for strip meters / scope.
+/// White at the −48 floor, then teal → mint → amber → brick → lava.
+pub(crate) fn meter_heat_from_db(db: f32) -> f32 {
+    let db = db.clamp(-90.0, 12.0);
+    if db <= -48.0 {
+        // Silent / meter floor — pure white tip of the palette.
+        0.0
+    } else if db <= -40.0 {
+        // Short white → teal rise at the very bottom of the fill.
+        ((db + 48.0) / 8.0) * 0.12 // → 0.12 teal
+    } else if db <= -24.0 {
+        0.12 + ((db + 40.0) / 16.0) * 0.16 // → 0.28 mint
+    } else if db <= -12.0 {
+        0.28 + ((db + 24.0) / 12.0) * 0.14 // → 0.42 amber
+    } else if db <= -3.0 {
+        0.42 + ((db + 12.0) / 9.0) * 0.20 // → 0.62 brick
+    } else if db <= 0.0 {
+        0.62 + ((db + 3.0) / 3.0) * 0.16 // → 0.78 fire at 0
+    } else {
+        0.78 + (db / 12.0).clamp(0.0, 1.0) * 0.22 // lava
     }
 }
 

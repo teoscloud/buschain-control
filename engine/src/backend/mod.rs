@@ -99,6 +99,8 @@ pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
                     || src.starts_with("buschain_fx_")
                     || dst.starts_with("buschain_mtr_")
                     || src.starts_with("buschain_mtr_")
+                    || dst.starts_with("buschain_glc_")
+                    || src.starts_with("buschain_glc_")
                 {
                     return Err(e);
                 }
@@ -137,6 +139,8 @@ pub fn ensure_link_force_pair(source: &str, sink: &str) -> Result<()> {
                     || src.starts_with("buschain_fx_")
                     || dst.starts_with("buschain_mtr_")
                     || src.starts_with("buschain_mtr_")
+                    || dst.starts_with("buschain_glc_")
+                    || src.starts_with("buschain_glc_")
                 {
                     return Err(e);
                 }
@@ -442,12 +446,161 @@ fn set_node_props_cli(node: &str, props: &Props) -> Result<()> {
     Ok(())
 }
 
+/// True when `dest` is a physical (non-BusChain) sink that may need egress convert.
+pub fn is_physical_hw_dest(dest: &str) -> bool {
+    let node = dest.strip_suffix(".monitor").unwrap_or(dest);
+    if node.is_empty() {
+        return false;
+    }
+    let name = NodeName::new(node);
+    !name.is_shadow() && !node.starts_with("buschain_") && !node.starts_with("shadow_")
+}
+
+/// Live Master/post → HW hop (direct or via `buschain_rs_out_*`).
+pub fn egress_hop_live(source: &str, dest: &str, desired: &DesiredState) -> bool {
+    if link_is_live(source, dest) {
+        return true;
+    }
+    for (bridge, _) in &desired.bridges {
+        if !bridge.starts_with("buschain_rs_out_") {
+            continue;
+        }
+        let mon = format!("{bridge}.monitor");
+        if desired.routes.contains(&(source.to_string(), bridge.clone()))
+            && desired.routes.contains(&(mon.clone(), dest.to_string()))
+            && link_is_live(source, bridge)
+            && link_is_live(&mon, dest)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Immediate link target for allow-lists (HW name, or egress bridge when converting).
+pub fn egress_allow_target(source: &str, dest: &str, desired: &DesiredState) -> String {
+    for (bridge, _) in &desired.bridges {
+        if !bridge.starts_with("buschain_rs_out_") {
+            continue;
+        }
+        if desired.routes.contains(&(source.to_string(), bridge.clone())) {
+            let mon = format!("{bridge}.monitor");
+            if desired.routes.contains(&(mon, dest.to_string())) {
+                return bridge.clone();
+            }
+        }
+    }
+    dest.to_string()
+}
+
+/// BusChain → physical HW: insert `buschain_rs_out_*` when GraphClock ≠ HW rate.
+/// Same-rate pairs link directly and drop any stale egress bridge for the pair.
+pub fn ensure_egress_clocked_route(
+    backend: &mut dyn AudioBackend,
+    source: &str,
+    sink: &str,
+    clock: &GraphClock,
+    desired: &mut DesiredState,
+) -> Result<()> {
+    if !is_physical_hw_dest(sink) {
+        backend.ensure_link_raw(source, sink)?;
+        desired.ensure_route(&LinkSpec {
+            source: source.to_string(),
+            sink: sink.to_string(),
+            exclusive: false,
+        });
+        return Ok(());
+    }
+
+    let src_node = source.strip_suffix(".monitor").unwrap_or(source);
+    let src_rate = {
+        let live = crate::clock::probe_sink_running_rate(src_node);
+        live.unwrap_or(clock.sample_rate).max(1)
+    };
+    let hw_rate = crate::clock::probe_sink_running_rate(sink)
+        .or_else(|| {
+            backend
+                .probe_endpoint(sink)
+                .ok()
+                .and_then(|c| c.rate)
+        })
+        .unwrap_or(0);
+
+    // Unknown HW rate: direct link (adapter); drop pair-specific egress bridges.
+    if hw_rate == 0 || hw_rate == src_rate {
+        let stale: Vec<String> = desired
+            .bridges
+            .keys()
+            .filter(|b| {
+                b.starts_with("buschain_rs_out_")
+                    && (desired.routes.contains(&(source.to_string(), (*b).clone()))
+                        || desired
+                            .routes
+                            .contains(&(format!("{b}.monitor"), sink.to_string())))
+            })
+            .cloned()
+            .collect();
+        for bridge in stale {
+            let mon = format!("{bridge}.monitor");
+            let _ = backend.unlink_raw(&mon, sink);
+            let _ = backend.unlink_raw(source, &bridge);
+            let _ = backend.destroy_node(&bridge);
+            desired.bridges.remove(&bridge);
+            desired.routes.remove(&(source.to_string(), bridge.clone()));
+            desired.routes.remove(&(mon, sink.to_string()));
+        }
+        backend.ensure_link_raw(source, sink)?;
+        desired.ensure_route(&LinkSpec {
+            source: source.to_string(),
+            sink: sink.to_string(),
+            exclusive: false,
+        });
+        return Ok(());
+    }
+
+    let bridge = DesiredState::egress_bridge_name(src_rate, hw_rate, source, sink);
+    let bridge_name = bridge.as_str().to_string();
+    // Never leave direct source→HW beside the converter (dual-path / silence).
+    let _ = backend.unlink_raw(source, sink);
+    desired.routes.remove(&(source.to_string(), sink.to_string()));
+
+    let mut bridge_clock = clock.clone();
+    bridge_clock.sample_rate = hw_rate;
+    let spec = NodeSpec {
+        name: bridge.clone(),
+        description: format!("BusChainControl_EgressBridge_{src_rate}_to_{hw_rate}"),
+        role: NodeRole::RateBridge,
+        start_muted: false,
+        pulse_export: false,
+    };
+    backend.ensure_node(&spec, &bridge_clock)?;
+    desired.ensure_bus(spec);
+    desired.bridges.insert(bridge_name.clone(), (src_rate, hw_rate));
+    invalidate_probe_caches();
+    let _ = wait_sink_playback_ports(&bridge_name, std::time::Duration::from_millis(200));
+
+    let mon = format!("{bridge_name}.monitor");
+    let _ = backend.unlink_raw(source, &bridge_name);
+    let _ = backend.unlink_raw(&mon, sink);
+    backend.ensure_link_raw(source, &bridge_name)?;
+    backend.ensure_link_raw(&mon, sink)?;
+    desired.ensure_route(&LinkSpec {
+        source: source.to_string(),
+        sink: bridge_name.clone(),
+        exclusive: false,
+    });
+    desired.ensure_route(&LinkSpec {
+        source: mon,
+        sink: sink.to_string(),
+        exclusive: false,
+    });
+    Ok(())
+}
+
 /// Ensure a clocked route, inserting buschain_rs_* when rates differ.
 ///
-/// Rate bridges are **inbound only**: external capture → BusChain bus.
-/// BusChain → HW (or any non-BusChain sink) always links directly — PipeWire's
-/// device adapter handles output resampling. Bridging master→HW was breaking
-/// audible output (orphan `buschain_rs_*` hops that never reached the device).
+/// Inbound: external capture → BusChain bus (`buschain_rs_*`).
+/// Outbound Master→HW uses [`ensure_egress_clocked_route`] (`buschain_rs_out_*`).
 pub fn ensure_clocked_route(
     backend: &mut dyn AudioBackend,
     source: &str,

@@ -11,9 +11,9 @@ use egui::{Color32, RichText, Sense, Vec2};
 use uuid::Uuid;
 
 const STRIP_W: f32 = 90.0;
-const STRIP_HEADER_H: f32 = 40.0;
+const STRIP_HEADER_H: f32 = 26.0;
 /// dB + ON LED — identical on every strip so bottoms line up.
-const STRIP_DECK_H: f32 = 58.0;
+const STRIP_DECK_H: f32 = 52.0;
 const STRIP_PAD_Y: f32 = 8.0; // frame vertical margin × 2 roughly
 
 #[derive(Clone, Copy, Default)]
@@ -35,23 +35,9 @@ pub fn draw_mixer_strips(ui: &mut egui::Ui, state: &mut AppState) {
         state.schedule_levels();
     }
 
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("MIXER")
-                .size(11.0)
-                .strong()
-                .color(theme.text_dim()),
-        );
-        ui.label(
-            RichText::new("drag headers to reorder · analyzer below")
-                .size(10.0)
-                .color(theme.text_muted()),
-        );
-    });
-    ui.add_space(6.0);
-
-    let strip_h = (ui.available_height() - 4.0).max(280.0);
-    let fader_h = (strip_h - STRIP_HEADER_H - STRIP_DECK_H - STRIP_PAD_Y - 8.0).max(160.0);
+    // Bank fills the central panel edge-to-edge (up to analyzer / rack).
+    let strip_h = ui.available_height().max(280.0);
+    let fader_h = (strip_h - STRIP_HEADER_H - STRIP_DECK_H - STRIP_PAD_Y).max(160.0);
 
     let drag_key = egui::Id::new("mixer_track_dnd");
     let mut dragging = ui.ctx().data(|d| d.get_temp::<TrackDrag>(drag_key));
@@ -66,42 +52,89 @@ pub fn draw_mixer_strips(ui: &mut egui::Ui, state: &mut AppState) {
         .auto_shrink([false, false])
         // Don't steal vertical fader drags for pan-scrolling.
         .drag_to_scroll(false)
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
         .show(ui, |ui| {
             ui.set_clip_rect(clip.intersect(ui.max_rect()));
             ui.set_height(strip_h);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+                // Contiguous cells: allocate → paint fills (selection last) → content → borders.
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.spacing_mut().button_padding = Vec2::ZERO;
                 let order = state.session.tracks_ui_order();
+                let divider = egui::Stroke::new(1.0_f32, theme.border());
+                let select = theme.selection();
+                let sel_fill = Color32::from_rgb(
+                    ((theme.bg_panel().r() as u16 * 8 + select.r() as u16 * 4) / 12) as u8,
+                    ((theme.bg_panel().g() as u16 * 8 + select.g() as u16 * 4) / 12) as u8,
+                    ((theme.bg_panel().b() as u16 * 8 + select.b() as u16 * 4) / 12) as u8,
+                );
+
+                // 1) Allocate every cell.
+                let mut slots: Vec<(egui::Rect, usize, bool, bool)> = Vec::new();
                 for (ui_i, &ti) in order.iter().enumerate() {
                     if ti >= state.session.tracks.len() {
                         continue;
                     }
+                    let (cell, _) =
+                        ui.allocate_exact_size(Vec2::new(STRIP_W, strip_h), Sense::hover());
+                    let tid = state.session.tracks[ti].id;
+                    let selected = state.selected_track == Some(tid);
                     let is_source = dragging.is_some_and(|d| d.from_ui == ui_i);
-                    let outer = draw_strip(ui, state, ti, strip_h, fader_h, is_source, ui_i == 0);
+                    slots.push((cell, ti, selected, is_source));
+                }
 
-                    // Drop indicator between strips (Master slot 0 is pinned).
+                // 2) Base fills for every cell, then selection on top (full cell rect).
+                for &(cell, _, selected, is_source) in &slots {
+                    let base = if is_source {
+                        theme.bg_elevated()
+                    } else {
+                        theme.bg_panel()
+                    };
+                    ui.painter()
+                        .with_clip_rect(cell)
+                        .rect_filled(cell, egui::CornerRadius::ZERO, base);
+                    if selected {
+                        let p = ui.painter().with_clip_rect(cell);
+                        p.rect_filled(cell, egui::CornerRadius::ZERO, sel_fill);
+                        p.rect_filled(
+                            egui::Rect::from_min_max(
+                                cell.min,
+                                egui::pos2(cell.right(), cell.top() + 2.0),
+                            ),
+                            egui::CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(
+                                select.r(),
+                                select.g(),
+                                select.b(),
+                                120,
+                            ),
+                        );
+                    }
+                }
+
+                // 3) Strip contents + header interactions inside each cell.
+                for (ui_i, &(cell, ti, _selected, is_source)) in slots.iter().enumerate() {
+                    draw_strip(ui, state, ti, cell, fader_h, is_source);
+
                     if let (Some(_), Some(x)) = (dragging, pointer_x) {
-                        if outer.x_range().contains(x) {
+                        if cell.x_range().contains(x) {
                             drop_before =
-                                Some(if x < outer.center().x { ui_i } else { ui_i + 1 });
+                                Some(if x < cell.center().x { ui_i } else { ui_i + 1 });
                         }
                     }
                     if let Some(db) = drop_before {
                         if db == ui_i && ui_i > 0 {
-                            let x = outer.left() - 3.0;
                             ui.painter().vline(
-                                x,
-                                egui::Rangef::new(outer.top() + 8.0, outer.bottom() - 8.0),
-                                egui::Stroke::new(2.0_f32, theme.accent()),
+                                cell.left(),
+                                cell.y_range(),
+                                egui::Stroke::new(2.0_f32, theme.accent_dim()),
                             );
                         }
                     }
 
-                    // Header: click = select, drag = reorder (buses only — Master pinned).
                     let header = egui::Rect::from_min_size(
-                        outer.min,
-                        Vec2::new(outer.width(), STRIP_HEADER_H + 8.0),
+                        cell.min,
+                        Vec2::new(cell.width(), STRIP_HEADER_H + 8.0),
                     );
                     let sense = ui.interact(
                         header,
@@ -113,7 +146,6 @@ pub fn draw_mixer_strips(ui: &mut egui::Ui, state: &mut AppState) {
                         state.selected_track = Some(id);
                         state.sync_selected_plugin();
                     }
-                    // Right-click → select + delete option (buses only; Master stays).
                     sense.context_menu(|ui| {
                         let id = state.session.tracks[ti].id;
                         let name = state.session.tracks[ti].name.clone();
@@ -149,10 +181,12 @@ pub fn draw_mixer_strips(ui: &mut egui::Ui, state: &mut AppState) {
                     }
                 }
 
-                if let (Some(_), Some(db)) = (dragging, drop_before) {
-                    if db == order.len() {
-                        // After last strip — paint at cursor edge is fine via last loop.
+                // 4) Borders on the exact cell edges (shared x between neighbors).
+                for (i, &(cell, _, _, _)) in slots.iter().enumerate() {
+                    if i == 0 {
+                        ui.painter().vline(cell.left(), cell.y_range(), divider);
                     }
+                    ui.painter().vline(cell.right(), cell.y_range(), divider);
                 }
 
                 ui.allocate_ui_with_layout(
@@ -208,8 +242,9 @@ pub fn draw_channel_rack_panel(ctx: &egui::Context, state: &mut AppState) {
         .frame(
             egui::Frame::NONE
                 .fill(theme.bg_panel())
-                .stroke(egui::Stroke::new(1.0_f32, theme.border()))
-                .inner_margin(egui::Margin::same(10)),
+                .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
+                .inner_margin(egui::Margin::same(12))
+                .corner_radius(theme.rounding()),
         )
         .show(ctx, |ui| {
             // Opaque fill already on the frame — keep content clipped to panel.
@@ -235,19 +270,21 @@ pub fn draw_channel_rack_panel(ctx: &egui::Context, state: &mut AppState) {
 /// Bottom rice visual — post-FX spectrum for the selected track (no EQ nodes / chrome).
 pub fn draw_mixer_analyzer_panel(ctx: &egui::Context, state: &mut AppState) {
     let theme = state.theme;
-    let min_h = 80.0_f32;
+    let min_h = 96.0_f32;
     let max_h = 420.0_f32;
     // Always show the visual (collapse chrome removed).
     state.mixer_analyzer_open = true;
     state.mixer_analyzer_height = state.mixer_analyzer_height.clamp(min_h, max_h);
     let panel_h = state.mixer_analyzer_height;
 
+    // Platform-gray border frame around the scope well (border only — no heavy chrome).
     let frame = egui::Frame::NONE
         .fill(theme.bg_panel())
         .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
-        .inner_margin(egui::Margin::symmetric(10, 4));
+        .inner_margin(egui::Margin::same(6))
+        .corner_radius(theme.rounding());
 
-    egui::TopBottomPanel::bottom("mixer_analyzer_v7")
+    egui::TopBottomPanel::bottom("mixer_analyzer_v10")
         .exact_height(panel_h)
         .resizable(false)
         .frame(frame)
@@ -273,17 +310,18 @@ pub fn draw_mixer_analyzer_panel(ctx: &egui::Context, state: &mut AppState) {
                 ui.painter().hline(
                     full.x_range(),
                     full.top() + 1.0,
-                    egui::Stroke::new(2.0_f32, theme.accent().gamma_multiply(0.85)),
-                );
-            } else {
-                ui.painter().hline(
-                    full.x_range(),
-                    full.top() + 1.0,
-                    egui::Stroke::new(1.0_f32, theme.border_soft()),
+                    egui::Stroke::new(2.0_f32, theme.border()),
                 );
             }
 
             let bus_key = selected_track_bus_key(state);
+            let track_name = state
+                .selected_track
+                .and_then(|id| state.session.tracks.iter().find(|t| t.id == id))
+                .map(|t| t.name.as_str())
+                .unwrap_or("—")
+                .to_string();
+
             // Always post-FX for the selected track.
             if !bus_key.is_empty() {
                 crate::audio::engine_handle::host_spectrum_watch(&bus_key, true);
@@ -293,20 +331,33 @@ pub fn draw_mixer_analyzer_panel(ctx: &egui::Context, state: &mut AppState) {
             } else {
                 crate::audio::engine_handle::host_spectrum(&bus_key, true)
             };
-            let (mags, sr, gen) = match &frame {
-                Some(f) => (Some(f.mags.as_slice()), f.sample_rate as f32, f.gen),
-                None => (None, 48_000.0, 0),
+            let (mags, sr, gen, peak_db) = match &frame {
+                Some(f) => {
+                    let peak = f
+                        .mags
+                        .iter()
+                        .copied()
+                        .fold(0.0_f32, f32::max);
+                    let pdb = if peak > 1e-12 {
+                        20.0 * peak.log10()
+                    } else {
+                        -90.0
+                    };
+                    (Some(f.mags.as_slice()), f.sample_rate as f32, f.gen, pdb)
+                }
+                None => (None, 48_000.0, 0, -90.0),
             };
 
             let chrome = design::EqChartChrome {
                 post: true,
                 peak_hold: true,
                 freeze: false,
+                full_bleed: true,
             };
             let mut sel = 0usize;
             let w = ui.available_width();
-            let h = (ui.available_height() - 2.0).max(48.0);
-            // Spectrum only — no EQ band nodes from inserts.
+            let h = ui.available_height().max(48.0);
+            let chart_origin = ui.cursor().min;
             design::eq_chart(
                 ui,
                 &theme,
@@ -319,6 +370,22 @@ pub fn draw_mixer_analyzer_panel(ctx: &egui::Context, state: &mut AppState) {
                 gen,
                 &chrome,
                 "mixer_analyzer",
+            );
+
+            // Subtle stats over the chart (top-left).
+            let mint = theme.accent();
+            let peak_txt = if peak_db <= -89.0 {
+                "— dBFS".into()
+            } else {
+                format!("{peak_db:+.1} dBFS")
+            };
+            let overlay = format!("SCOPE  {track_name}  ·  post  ·  {peak_txt}");
+            ui.painter().text(
+                egui::pos2(chart_origin.x + 8.0, chart_origin.y + 6.0),
+                egui::Align2::LEFT_TOP,
+                overlay,
+                egui::FontId::proportional(10.0),
+                Color32::from_rgba_unmultiplied(mint.r(), mint.g(), mint.b(), 150),
             );
         });
 }
@@ -394,111 +461,123 @@ fn store_eq_bands(
     plug.set_param("Output (dB)", out_gain.clamp(-24.0, 24.0));
 }
 
+/// Compact strip tip: processing/track vs hardware quantum.
+fn strip_latency_tip(
+    is_master: bool,
+    bus: &str,
+    sample_rate: u32,
+    quantum: u32,
+    direct_out: bool,
+) -> String {
+    use crate::audio::engine_handle::{
+        glc_is_disabled, host_compensation_ms, host_latency_ms, host_lstar_ms, hw_quantum_ms,
+    };
+    let hw = hw_quantum_ms(sample_rate, quantum);
+    let hw_s = if hw >= 0.05 {
+        format!(" · hw {hw:.1}")
+    } else {
+        String::new()
+    };
+    if is_master {
+        if direct_out || glc_is_disabled() {
+            return format!("sync off{hw_s}");
+        }
+        let (_, lstar_ms) = host_lstar_ms(sample_rate);
+        if lstar_ms >= 0.05 {
+            return format!("path {lstar_ms:.1}{hw_s}");
+        }
+        return if hw_s.is_empty() {
+            "—".into()
+        } else {
+            format!("hw {hw:.1}")
+        };
+    }
+    let fx_ms = host_latency_ms(bus, sample_rate);
+    let mut proc = String::new();
+    if direct_out {
+        if fx_ms >= 0.05 {
+            proc = format!("fx {fx_ms:.1} direct");
+        } else {
+            proc = "direct".into();
+        }
+    } else {
+        let (_, pad_ms) = host_compensation_ms(bus, sample_rate);
+        if fx_ms >= 0.05 && pad_ms >= 0.05 {
+            proc = format!("fx {fx_ms:.1} +pad {pad_ms:.1}");
+        } else if pad_ms >= 0.05 {
+            proc = format!("+pad {pad_ms:.1}");
+        } else if fx_ms >= 0.05 {
+            proc = format!("fx {fx_ms:.1}");
+        }
+    }
+    if proc.is_empty() {
+        if hw_s.is_empty() {
+            "—".into()
+        } else {
+            format!("hw {hw:.1}")
+        }
+    } else {
+        format!("{proc}{hw_s}")
+    }
+}
+
+/// Paint strip chrome/controls into an already-allocated cell.
+/// Cell background / selection is painted by the bank (so selection can win over neighbors).
 fn draw_strip(
     ui: &mut egui::Ui,
     state: &mut AppState,
     track_idx: usize,
-    strip_h: f32,
+    outer: egui::Rect,
     fader_h: f32,
-    dragging: bool,
-    is_master_slot: bool,
-) -> egui::Rect {
-    let _ = is_master_slot;
+    _dragging: bool,
+) {
     let theme = state.theme;
     let track_id = state.session.tracks[track_idx].id;
-    let (name, kind) = {
-        let t = &state.session.tracks[track_idx];
-        (t.name.clone(), t.kind)
-    };
+    let name = state.session.tracks[track_idx].name.clone();
 
     let selected = state.selected_track == Some(track_id);
-    let fill = if dragging {
-        theme.bg_elevated().gamma_multiply(0.9)
-    } else if selected {
-        // Soft accent wash — no harsh full-strip outline
-        let a = theme.accent();
-        Color32::from_rgb(
-            ((theme.bg_panel().r() as u16 * 3 + a.r() as u16) / 4) as u8,
-            ((theme.bg_panel().g() as u16 * 3 + a.g() as u16) / 4) as u8,
-            ((theme.bg_panel().b() as u16 * 3 + a.b() as u16) / 4) as u8,
-        )
-    } else {
-        theme.bg_panel()
-    };
+    let select = theme.selection();
+    let mint = theme.accent();
 
-    // Hover-only outer rect — click/drag here would steal the fader.
-    // Track selection is on the header button (and deck controls).
-    let (outer, _strip_resp) =
-        ui.allocate_exact_size(Vec2::new(STRIP_W, strip_h), Sense::hover());
-
-    // Paint full-height body first so every strip shares the same silhouette
-    ui.painter().rect_filled(outer, theme.rounding(), fill);
-    ui.painter().rect_stroke(
-        outer,
-        theme.rounding(),
-        egui::Stroke::new(
-            1.0_f32,
-            if dragging || selected {
-                theme.accent().gamma_multiply(0.55)
-            } else {
-                theme.border_soft()
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    if selected {
-        // Left accent rail
-        let rail = egui::Rect::from_min_max(
-            outer.min,
-            egui::pos2(outer.left() + 3.5, outer.bottom()),
-        );
-        ui.painter().rect_filled(
-            rail,
-            egui::CornerRadius {
-                nw: 3,
-                ne: 0,
-                sw: 3,
-                se: 0,
-            },
-            theme.accent(),
-        );
-        // Header bar underline
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(outer.left() + 3.5, outer.top()),
-            egui::pos2(outer.right(), outer.top() + 2.5),
-        );
-        ui.painter().rect_filled(bar, egui::CornerRadius::ZERO, theme.accent());
-    }
-
-    let inner = outer.shrink2(egui::vec2(5.0, 8.0));
+    // Content padding inside the cell (selection fill is the full cell behind this).
+    let inner = outer.shrink2(egui::vec2(5.0, 4.0));
     let header_rect = egui::Rect::from_min_size(
-        inner.min,
-        Vec2::new(inner.width(), STRIP_HEADER_H),
+        egui::pos2(outer.left(), inner.top()),
+        Vec2::new(outer.width(), STRIP_HEADER_H),
     );
     let deck_rect = egui::Rect::from_min_max(
         egui::pos2(inner.left(), inner.bottom() - STRIP_DECK_H),
         inner.max,
     );
     let fader_rect = egui::Rect::from_min_max(
-        egui::pos2(inner.left(), header_rect.bottom() + 4.0),
-        egui::pos2(inner.right(), deck_rect.top() - 4.0),
+        egui::pos2(inner.left(), header_rect.bottom() + 2.0),
+        egui::pos2(inner.right(), deck_rect.top() - 2.0),
     );
 
-    // ---- Header (top-locked) ----
+    // ---- Header (top-locked) — track name only ----
     ui.scope_builder(egui::UiBuilder::new().max_rect(header_rect), |ui| {
         ui.set_clip_rect(header_rect);
-        let role = if kind.is_master() { "MASTER" } else { "BUS" };
-        let header = ui.add_sized(
-            [ui.available_width(), STRIP_HEADER_H - 4.0],
-            egui::Button::new(
-                RichText::new(format!("{}\n{role}", name.to_uppercase()))
-                    .size(10.0)
-                    .strong()
-                    .color(theme.text()),
+        let name_col = if selected {
+            Color32::from_rgba_unmultiplied(select.r(), select.g(), select.b(), 220)
+        } else {
+            theme.text()
+        };
+        let header = ui
+            .allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), STRIP_HEADER_H - 2.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(name.to_uppercase())
+                            .size(11.0)
+                            .strong()
+                            .color(name_col),
+                    );
+                },
             )
-            .fill(Color32::TRANSPARENT)
-            .stroke(egui::Stroke::NONE),
-        );
+            .response
+            .interact(Sense::click());
         if header.clicked() {
             state.selected_track = Some(track_id);
             state.sync_selected_plugin();
@@ -510,16 +589,14 @@ fn draw_strip(
         );
     });
 
-    // ---- Fader (middle band) ----
-    let fader_draw_h = fader_h.min(fader_rect.height()).max(80.0);
+    // ---- Fader (middle band) — stretch to fill the strip column ----
+    let fader_draw_h = fader_rect.height().max(80.0).min(fader_h.max(fader_rect.height()));
     ui.scope_builder(egui::UiBuilder::new().max_rect(fader_rect), |ui| {
         ui.set_clip_rect(fader_rect);
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            let top_pad = ((fader_rect.height() - fader_draw_h) * 0.5).max(0.0);
-            ui.add_space(top_pad);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let total_w = 26.0 + 6.0 + 11.0;
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let total_w = 26.0 + 5.0 + 13.0;
                 let pad = ((ui.available_width() - total_w) * 0.5).max(0.0);
                 ui.add_space(pad);
                 let mut gain = state.session.tracks[track_idx].gain_db;
@@ -556,13 +633,13 @@ fn draw_strip(
                         strip_peak_db(state, &key)
                     })
                     .unwrap_or(-90.0);
-                // Same dB window as the fader — 0 dB rails stay locked together.
-                design::meter(ui, &theme, peak_db, Vec2::new(11.0, fader_draw_h), track_id);
+                // Same dB window as the fader — phosphor heatmap meter.
+                design::meter(ui, &theme, peak_db, Vec2::new(13.0, fader_draw_h), track_id);
             });
         });
     });
 
-    // ---- Control deck (bottom-locked) — same theme fill as the strip body ----
+    // ---- Control deck (bottom-locked) ----
     ui.painter().hline(
         deck_rect.x_range(),
         deck_rect.top(),
@@ -571,72 +648,68 @@ fn draw_strip(
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(deck_rect), |ui| {
         ui.set_clip_rect(deck_rect);
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            ui.add_space(6.0);
-            let gdb = state.session.tracks[track_idx].gain_db;
-            let db_col = if gdb > 0.05 {
-                theme.warning()
-            } else if gdb.abs() < 0.05 {
-                theme.accent()
-            } else {
-                theme.text_dim()
-            };
-            ui.label(
-                RichText::new(format!("{gdb:+.1} dB"))
-                    .size(10.0)
-                    .monospace()
-                    .color(db_col),
-            );
-            ui.add_space(6.0);
+        // Fixed slots — dB above, jewel pinned to deck bottom (uniform across strips).
+        const LED_H: f32 = 28.0;
+        let led_rect = egui::Rect::from_center_size(
+            egui::pos2(deck_rect.center().x, deck_rect.bottom() - 3.0 - LED_H * 0.5),
+            Vec2::new(34.0, LED_H),
+        );
+        let db_rect = egui::Rect::from_min_max(
+            egui::pos2(deck_rect.left() + 2.0, deck_rect.top() + 4.0),
+            egui::pos2(deck_rect.right() - 2.0, led_rect.top() - 1.0),
+        );
 
-            // ON LED — one SetTrackLevel (never Levels N× fan-out).
-            let mut live = !state.session.tracks[track_idx].mute;
-            let has_sink = state.session.tracks[track_idx].sink_name.is_some();
-            if design::track_on_led(ui, &theme, &mut live).changed() {
-                let mute = !live;
-                state.session.tracks[track_idx].mute = mute;
-                state.selected_track = Some(track_id);
-                state.dirty = true;
-                let gain_db = state.session.tracks[track_idx].gain_db;
-                let sink = state.session.tracks[track_idx].expected_sink_name();
-                let rev =
-                    crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
-                if !has_sink {
-                    state.commit(crate::audio::LiveChange::EnsureTrack { track_id });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(db_rect), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                let gdb = state.session.tracks[track_idx].gain_db;
+                let db_col = if gdb > 0.05 {
+                    theme.warning()
+                } else if gdb.abs() < 0.05 {
+                    mint
+                } else {
+                    theme.text_dim()
+                };
+                ui.label(
+                    RichText::new(format!("{gdb:+.1} dB"))
+                        .size(10.0)
+                        .monospace()
+                        .color(db_col),
+                );
+            });
+        });
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(led_rect), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                let mut live = !state.session.tracks[track_idx].mute;
+                let has_sink = state.session.tracks[track_idx].sink_name.is_some();
+                if design::track_on_led(ui, &theme, &mut live).changed() {
+                    let mute = !live;
+                    state.session.tracks[track_idx].mute = mute;
+                    state.selected_track = Some(track_id);
+                    state.dirty = true;
+                    let gain_db = state.session.tracks[track_idx].gain_db;
+                    let sink = state.session.tracks[track_idx].expected_sink_name();
+                    let rev =
+                        crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
+                    if !has_sink {
+                        state.commit(crate::audio::LiveChange::EnsureTrack { track_id });
+                    }
+                    state.worker.send(Command::SetTrackLevel {
+                        sink,
+                        gain_db,
+                        muted: mute,
+                        mixer_mute: mute,
+                        rev,
+                    });
                 }
-                state.worker.send(Command::SetTrackLevel {
-                    sink,
-                    gain_db,
-                    muted: mute,
-                    mixer_mute: mute,
-                    rev,
-                });
-            }
+            });
         });
     });
-
-    outer
 }
 
 fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let theme = state.theme;
     ui.set_min_width(ui.available_width());
-
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("CHANNEL")
-                .size(11.0)
-                .strong()
-                .color(theme.text_dim()),
-        );
-        ui.label(
-            RichText::new("RACK")
-                .size(11.0)
-                .strong()
-                .color(theme.accent()),
-        );
-    });
-    ui.add_space(8.0);
 
     let Some(sel_id) = state.selected_track else {
         ui.label(RichText::new("—").size(13.0).color(theme.text_muted()));
@@ -652,16 +725,15 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.label(
         RichText::new(format!("CHANNEL — {track_name}"))
-            .size(14.0)
+            .size(13.0)
             .strong()
             .color(theme.text()),
     );
     ui.add_space(6.0);
 
     {
-        let name_fill = Color32::from_rgb(0x30, 0x33, 0x38);
         let resp = egui::Frame::NONE
-            .fill(name_fill)
+            .fill(theme.bg_elevated())
             .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
             .corner_radius(theme.rounding())
             .inner_margin(egui::Margin::symmetric(8, 5))
@@ -721,6 +793,25 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(12.0);
     design::section_label(ui, &theme, "OUTPUT");
+    {
+        let t = &state.session.tracks[track_idx];
+        let bus = t.expected_sink_name();
+        let sr = state.session.performance.sample_rate.max(1);
+        let q = state.session.performance.quantum.max(1);
+        let tip = strip_latency_tip(is_master, &bus, sr, q, t.direct_out);
+        ui.label(
+            RichText::new(tip)
+                .size(10.0)
+                .monospace()
+                .color(theme.text_muted()),
+        )
+        .on_hover_text(
+            "path/fx/pad = BusChain processing & sync; hw = device quantum period. \
+             Direct skips Master sync pad (low latency). Turn Direct off to align \
+             nested Track→Track→Master routes.",
+        );
+        ui.add_space(4.0);
+    }
     draw_output_rack(ui, state, track_idx, sel_id, is_master);
 }
 
@@ -728,9 +819,9 @@ fn draw_side_panel(ui: &mut egui::Ui, state: &mut AppState) {
 fn draw_virtual_output_section(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
     let theme = state.theme;
     egui::Frame::NONE
-        .fill(theme.bg_chart())
+        .fill(theme.bg_elevated())
         .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
-        .corner_radius(egui::CornerRadius::same(3))
+        .corner_radius(theme.rounding())
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -768,9 +859,9 @@ fn draw_virtual_output_section(ui: &mut egui::Ui, state: &mut AppState, track_id
 fn draw_io_strip(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, is_master: bool) {
     let theme = state.theme;
     egui::Frame::NONE
-        .fill(theme.bg_chart())
+        .fill(theme.bg_elevated())
         .stroke(egui::Stroke::new(1.0_f32, theme.border_soft()))
-        .corner_radius(egui::CornerRadius::same(3))
+        .corner_radius(theme.rounding())
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -835,6 +926,54 @@ fn short_device_title(name: &str) -> String {
     head.replace('_', " ")
 }
 
+fn draw_direct_out_toggle(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    track_idx: usize,
+    is_master: bool,
+    content_w: f32,
+) {
+    let theme = state.theme;
+    let mut on = state.session.tracks[track_idx].direct_out;
+    mini_rack_row(ui, &theme, content_w, |ui| {
+        let label = if is_master { "Direct (all)" } else { "Direct" };
+        ui.label(
+            RichText::new(label)
+                .size(12.0)
+                .strong()
+                .color(theme.text()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if design::track_on_led(ui, &theme, &mut on)
+                .on_hover_text(if is_master {
+                    "Master Direct: all tracks skip graph sync (best for desktop/games). \
+                     Turn off to align nested Track→Track→Master. Host peer PDC while on."
+                } else {
+                    "Direct Out: low-latency Master send — skips sync pad / leaves GLC graph. \
+                     Nested dual-path may comb when on. Turn off to sync nested routes."
+                })
+                .changed()
+            {
+                state.session.tracks[track_idx].direct_out = on;
+                state.dirty = true;
+                let tid = state.session.tracks[track_idx].id;
+                crate::audio::engine_handle::patch_bus_egress(&state.session, tid);
+                state.mark_routing_dirty();
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(if is_master {
+            "All tracks skip graph sync (desktop/games). Turn off to align nested routes."
+        } else {
+            "Low-latency Master send — turn off to sync nested routes."
+        })
+        .size(10.0)
+        .color(theme.text_muted()),
+    );
+}
+
 /// OUTPUT mini-rack — master shows HW title; other tracks show checked destinations.
 fn draw_output_rack(
     ui: &mut egui::Ui,
@@ -846,6 +985,9 @@ fn draw_output_rack(
     let theme = state.theme;
     let content_w = ui.available_width();
     ui.set_max_width(content_w);
+
+    draw_direct_out_toggle(ui, state, track_idx, is_master, content_w);
+    ui.add_space(6.0);
 
     if is_master {
         mini_rack_row(ui, &theme, content_w, |ui| {
@@ -1013,13 +1155,12 @@ fn mini_rack_row(
     const ROW_H: f32 = 34.0;
     let (row_rect, _) = ui.allocate_exact_size(Vec2::new(content_w, ROW_H), Sense::hover());
     ui.painter()
-        .rect_filled(row_rect, theme.rounding(), theme.bg_chart());
-    ui.painter().rect_stroke(
-        row_rect,
-        theme.rounding(),
-        egui::Stroke::new(1.0_f32, theme.border()),
-        egui::StrokeKind::Inside,
-    );
+        .rect_filled(row_rect, egui::CornerRadius::ZERO, theme.bg_elevated());
+    let sep = egui::Stroke::new(1.0_f32, theme.border_soft());
+    ui.painter()
+        .hline(row_rect.x_range(), row_rect.top() + 0.5, sep);
+    ui.painter()
+        .hline(row_rect.x_range(), row_rect.bottom() - 0.5, sep);
     let inner = row_rect.shrink2(Vec2::new(8.0, 4.0));
     ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1131,6 +1272,7 @@ fn draw_inputs_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, i
             if s.name.contains(".monitor")
                 || s.name.starts_with("buschain_vinf_")
                 || s.name.starts_with("buschain_post_")
+                || s.name.starts_with("buschain_glc_")
                 || s.name.starts_with("buschain_hold")
                 || s.name == own_vin
                 || assigned.contains(&s.name)
@@ -1495,19 +1637,19 @@ fn draw_insert_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
             .any(|w| w.track_id == tid && w.slot_id == slot_id);
         let is_source = dragging.is_some_and(|d| d.from == i);
 
+        // Squared shared-line list — lighter idle rows, no per-card borders.
         let fill = if is_source {
-            theme.bg_chart().gamma_multiply(0.9)
+            theme.bg_panel()
         } else if window_open || selected {
+            let e = theme.bg_elevated();
+            let a = theme.accent();
+            Color32::from_rgb(
+                ((e.r() as u16 * 10 + a.r() as u16) / 11) as u8,
+                ((e.g() as u16 * 10 + a.g() as u16) / 11) as u8,
+                ((e.b() as u16 * 10 + a.b() as u16) / 11) as u8,
+            )
+        } else {
             theme.bg_elevated()
-        } else {
-            theme.bg_chart()
-        };
-        let stroke = if is_source || window_open || selected {
-            theme.accent()
-        } else if bypassed {
-            theme.border_soft()
-        } else {
-            theme.border()
         };
 
         if let Some(db) = drop_before {
@@ -1535,13 +1677,26 @@ fn draw_insert_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize) {
 
         let (row_rect, row_sense) =
             ui.allocate_exact_size(Vec2::new(content_w, ROW_H), Sense::click_and_drag());
-        ui.painter().rect_filled(row_rect, theme.rounding(), fill);
-        ui.painter().rect_stroke(
-            row_rect,
-            theme.rounding(),
-            egui::Stroke::new(1.0_f32, stroke),
-            egui::StrokeKind::Inside,
-        );
+        ui.painter()
+            .rect_filled(row_rect, egui::CornerRadius::ZERO, fill);
+        // Shared row separators (keep visible when selected).
+        let sep = egui::Stroke::new(1.0_f32, theme.border_soft());
+        if i == 0 {
+            ui.painter().hline(row_rect.x_range(), row_rect.top() + 0.5, sep);
+        }
+        ui.painter()
+            .hline(row_rect.x_range(), row_rect.bottom() - 0.5, sep);
+        if selected || window_open {
+            // Accent rail — selection without replacing the grid lines.
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    row_rect.min,
+                    egui::pos2(row_rect.left() + 2.5, row_rect.bottom()),
+                ),
+                egui::CornerRadius::ZERO,
+                theme.accent_dim(),
+            );
+        }
 
         if row_sense.drag_started() {
             let d = InsertDrag { from: i };
@@ -2783,7 +2938,7 @@ fn draw_reverb_panel(
                         backend.end_frame();
                         {
                             let painter = ui.painter_at(rect);
-                            painter.rect_filled(rect, CornerRadius::same(2), theme.bg_app());
+                            painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_app());
                         }
                         backend.paint_in_ui(ui, rect);
 
@@ -2986,7 +3141,7 @@ fn metric_spark(ui: &mut egui::Ui, theme: &dyn Theme, label: &str, hist: &[f32],
         let size = Vec2::new(88.0, 24.0);
         let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
         let rect = resp.rect;
-        painter.rect_filled(rect, CornerRadius::same(3), theme.bg_app());
+        painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_app());
         if hist.len() >= 2 {
             let mut pts = Vec::with_capacity(hist.len());
             for (i, v) in hist.iter().enumerate() {
@@ -3017,10 +3172,10 @@ fn band_bar(ui: &mut egui::Ui, theme: &dyn Theme, label: &str, value: f32, max: 
         let size = Vec2::new(56.0, 10.0);
         let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
         let rect = resp.rect;
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_app());
+        painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_app());
         let f = (value / max).clamp(0.0, 1.0);
         let fill = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * f, rect.height()));
-        painter.rect_filled(fill, CornerRadius::same(2), theme.accent());
+        painter.rect_filled(fill, CornerRadius::ZERO, theme.accent());
     });
 }
 

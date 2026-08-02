@@ -427,15 +427,37 @@ Canonical per-bus node set and the only legal links. Anything else is pruned; no
 | `{bus}.monitor → buschain_mtr_X` | no live FX host (dry strip meter; hard-protected in unlink) | `host::dry_meter` only |
 | `{bus}.monitor → dest` | dry, or soft-cutover **per dest** while that dest's wet hop is down | arm |
 | `buschain_fx_X → buschain_post_X` | FX Desired | ensure_fx_chain |
-| `{post}.monitor → dest` | wet | arm |
+| `{post}.monitor → dest` | wet (Track→Track / vin / hold) | arm |
+| `{post}.monitor → buschain_glc_X → Master` | wet Master send when GLC δ>0 | arm + `pipeline::glc` |
+| `{post}.monitor → Master` | wet Master send when GLC δ=0 (no helper node) | arm |
 
 Cutover rules:
 
-- **Per-dest exclusivity:** once `post.monitor→dest` is live, the dry `{bus}.monitor→dest` for *that* dest is dropped; dests still waiting keep dry (no all-or-nothing silence, no double audio).
+- **Per-dest exclusivity:** once `post.monitor→dest` is live, the dry `{bus}.monitor→dest` for *that* dest is dropped; dests still waiting keep dry (no all-or-nothing silence, no double audio). Soft-cutover is the only transient dry∥wet window; idle prune remains mandatory.
 - **Never prune dry before wet lands:** idle prune drops a dry `bus→dest` only when that dest's `post→dest` is live (`prune_parallel_fx_routes`).
 - **Master mid-build hold keeps the FX feed** (fx + mtr allow-listed) — a hold-only allow-list is the historical sealed-chain bug.
 - **`buschain_mtr_*` lifecycle:** created only by `host::dry_meter` when no host is live; torn down when a host comes up (including the ensure-race re-check), on track delete / orphan prune / Teardown / Quit, and when the UI hides (`sleep_visualization` — no RT peak-scanning while nothing renders).
+- **`buschain_glc_*` lifecycle:** Internal Master-edge delay filter only when δ>0; torn down when δ returns to 0, on Teardown / Quit. Filtered from device lists like `buschain_post_*`.
 - **Dry egress heal (`heal_dry_egress`):** `prune_parallel_fx_routes` only walks `fx_chains`, and a track with zero inserts never gets a chain spec, so nothing re-armed `bus→dest` for it after a sweep / WirePlumber restart / device recreate. The strip kept metering (mtr tap and hold are separate links) while being silent to Master. The heal runs each idle tick over every non-Master bus that is dry, unmuted, and missing a configured dest.
+
+### Master fan-in sync contract (GLC)
+
+PipeWire does not delay-compensate parallel paths. BusChain can seal **Master fan-in alignment** (DAW mix-bus PDC generalized to graph path latency):
+
+\[
+L(T) = L_\mathrm{local}(T) + \max\{L(U) : U \xrightarrow{\mathrm{audio}} T\},\quad
+L^\star = \max\{L(T) : T \to \mathrm{Master}\},\quad
+\delta_T = L^\star - L(T)
+\]
+
+- \(L_\mathrm{local}\) = reported rack latency + **2** stage quanta (bus + post null-sinks; in-process FX is not a full period) × GraphClock quantum.
+- Delay stem \(T\)'s **Master-only** ingress by \(\delta_T\) via `buschain_glc_<suffix>`. Track→Track / vin feeds stay **undelayed**.
+- \(\delta=0\) ⇒ direct `post.monitor → Master` (no GLC node).
+- Applied DelayLine length is \(\delta - 1\cdot\mathrm{quantum}\) so the GLC filter hop is not double-counted on top of δ.
+- Audio egress **cycles are rejected** (DAG required; feedback would need an explicit feature later). Recompute is \(O(N+E)\) on Route / Listen / output_targets, FxRewire (latency publish), BindMasterClock, EnsureTrack.
+- **Direct Out (desktop default: on):** `Track.direct_out` excludes that bus from the GLC DAG and forces Master edge direct. **Master Direct** (`glc_disabled`) turns off graph GLC for everyone and restores **host peer PDC** (pad FX wet outs to max rack among peers). Turn Direct **off** to enable nested Track→Track→Master alignment. New tracks inherit Master's current Direct state (`Session::add_track`). Strip tips: `path`/`fx`/`pad` = processing & sync; `hw` = one GraphClock quantum (device period). \(L^\star\) / path ≠ an active pad when all \(\delta=0\).
+- When GLC is on, host-side peer pads stay at 0 — rack latency is folded into \(L_\mathrm{local}\).
+- Out of scope: sub-quantum PW scheduler jitter, non-BusChain apps summing outside Master, intentional creative delay (reported into \(L_\mathrm{local}\) then peer-compensated at Master).
 
 **Still open:**
 

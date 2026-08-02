@@ -18,7 +18,11 @@ pub fn button(ui: &mut Ui, theme: &dyn Theme, label: &str, primary: bool) -> egu
     let text = if primary { Color32::WHITE } else { theme.text() };
     let stroke = Stroke::new(
         1.0_f32,
-        if primary { theme.accent_dim() } else { theme.border() },
+        if primary {
+            theme.accent_dim()
+        } else {
+            theme.border_soft()
+        },
     );
     ui.add(
         egui::Button::new(RichText::new(label).size(12.0).color(text))
@@ -68,6 +72,17 @@ pub fn apply_wheel_to_value(
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> bool {
+    apply_wheel_to_value_scaled(ui, resp, value, range, 1.0)
+}
+
+/// Like [`apply_wheel_to_value`], with an extra scale (use &lt;1 for fine fader steps).
+pub fn apply_wheel_to_value_scaled(
+    ui: &mut Ui,
+    resp: &mut egui::Response,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    scale: f32,
+) -> bool {
     if !resp.hovered() {
         return false;
     }
@@ -85,11 +100,12 @@ pub fn apply_wheel_to_value(
     let hi = *range.end();
     let span = (hi - lo).max(1e-9);
     let sens = drag_sensitivity(ui);
+    let scale = scale.clamp(0.02, 4.0);
     // ~14 px raw ≈ one physical notch on many mice.
     let steps = if raw_y.abs() > 0.0 {
-        (raw_y / 14.0).clamp(-4.0, 4.0)
+        (raw_y / 14.0).clamp(-3.0, 3.0)
     } else {
-        (smooth_y / 48.0).clamp(-2.5, 2.5)
+        (smooth_y / 48.0).clamp(-2.0, 2.0)
     };
     if steps.abs() < 1e-4 {
         return false;
@@ -99,10 +115,11 @@ pub fn apply_wheel_to_value(
     if logarithmic {
         let v = (*value).clamp(lo, hi).max(lo);
         let t = (v.ln() - lo.ln()) / (hi.ln() - lo.ln());
-        let nt = (t + steps * 0.03 * sens).clamp(0.0, 1.0);
+        let nt = (t + steps * 0.03 * sens * scale).clamp(0.0, 1.0);
         *value = (lo.ln() + nt * (hi.ln() - lo.ln())).exp();
     } else {
-        *value = (*value + steps * span * 0.03 * sens).clamp(lo, hi);
+        // Default ~1.8 dB/notch on a 60 dB strip; faders pass a small scale (~0.25 dB).
+        *value = (*value + steps * span * 0.03 * sens * scale).clamp(lo, hi);
     }
     resp.mark_changed();
     true
@@ -152,39 +169,10 @@ pub fn text_tool_button(ui: &mut Ui, theme: &dyn Theme, label: &str) -> egui::Re
     )
 }
 
-/// Green/red LED tone matched to the selection accent's value + saturation.
-fn accent_matched_led(accent: Color32, green: bool) -> Color32 {
-    let ar = accent.r() as f32 / 255.0;
-    let ag = accent.g() as f32 / 255.0;
-    let ab = accent.b() as f32 / 255.0;
-    let amax = ar.max(ag).max(ab).max(1e-3_f32);
-    let amin = ar.min(ag).min(ab);
-    let sat = ((amax - amin) / amax).clamp(0.15_f32, 0.85_f32);
-    let val = amax.clamp(0.35_f32, 0.92_f32);
-
-    // Unit green / red hue directions (console, not neon).
-    let (hr, hg, hb) = if green {
-        (0.38_f32, 0.78_f32, 0.52_f32)
-    } else {
-        (0.82_f32, 0.36_f32, 0.32_f32)
-    };
-    let hmax = hr.max(hg).max(hb);
-    let nr = hr / hmax;
-    let ng = hg / hmax;
-    let nb = hb / hmax;
-
-    let mix = |n: f32| ((1.0 - sat) * val + sat * n * val).clamp(0.0, 1.0);
-    Color32::from_rgb(
-        (mix(nr) * 255.0) as u8,
-        (mix(ng) * 255.0) as u8,
-        (mix(nb) * 255.0) as u8,
-    )
-}
-
-/// Analog LED jewel — green when lit, red when dark. No bezel / border / text.
+/// Soft phosphor LED jewel — mint when on, amber-brick when off. Shared by tracks + inserts.
 fn analog_led_jewel(
     ui: &mut Ui,
-    theme: &dyn Theme,
+    _theme: &dyn Theme,
     on: &mut bool,
     size: Vec2,
     hover_on: &str,
@@ -193,22 +181,60 @@ fn analog_led_jewel(
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
     let lit = *on;
-    let led = accent_matched_led(theme.accent(), lit);
+    // On: phosphor mint. Off: mid amber↔brick, matched vibrancy.
+    let led = if lit {
+        Color32::from_rgb(0x58, 0xb8, 0x96)
+    } else {
+        Color32::from_rgb(0xe0, 0x7a, 0x38)
+    };
+    let glow = if lit {
+        Color32::from_rgb(0x3e, 0x8e, 0x74)
+    } else {
+        Color32::from_rgb(0xc4, 0x5e, 0x28)
+    };
+    let core = if lit {
+        Color32::from_rgba_unmultiplied(0x7a, 0xd0, 0xb0, 55)
+    } else {
+        Color32::from_rgba_unmultiplied(0xf0, 0xa8, 0x58, 55)
+    };
 
-    let r = (rect.width().min(rect.height()) * 0.36).clamp(5.0, 8.0);
+    let r = (rect.width().min(rect.height()) * 0.32).clamp(4.5, 6.5);
     let c = rect.center();
-    // Tight outer glow (kept smaller than the jewel face)
+    // Same halo strength on / off
+    painter.circle_filled(
+        c,
+        r * 1.55,
+        Color32::from_rgba_unmultiplied(glow.r(), glow.g(), glow.b(), 28),
+    );
     painter.circle_filled(
         c,
         r * 1.22,
-        Color32::from_rgba_unmultiplied(led.r(), led.g(), led.b(), if lit { 36 } else { 24 }),
+        Color32::from_rgba_unmultiplied(led.r(), led.g(), led.b(), 40),
     );
     painter.circle_filled(c, r, led);
+    painter.circle_filled(c, r * 0.42, core);
     painter.circle_filled(
-        egui::pos2(c.x - r * 0.28, c.y - r * 0.32),
-        r * 0.30,
-        Color32::from_rgba_unmultiplied(255, 255, 255, if lit { 90 } else { 40 }),
+        egui::pos2(c.x - r * 0.26, c.y - r * 0.30),
+        r * 0.22,
+        Color32::from_rgba_unmultiplied(
+            if lit { 0xb0 } else { 0xf4 },
+            if lit { 0xe8 } else { 0xc4 },
+            if lit { 0xd8 } else { 0x88 },
+            48,
+        ),
     );
+
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        painter.circle_stroke(
+            c,
+            r * 1.12,
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_unmultiplied(led.r(), led.g(), led.b(), 70),
+            ),
+        );
+    }
 
     if resp.clicked() {
         *on = !*on;
@@ -242,7 +268,7 @@ pub fn toggle_chip(
 ) -> egui::Response {
     let fill = if *on { active } else { theme.bg_well() };
     let text = if *on { Color32::WHITE } else { theme.text_dim() };
-    let stroke = Stroke::new(1.0_f32, if *on { active } else { theme.border() });
+    let stroke = Stroke::new(1.0_f32, if *on { active } else { theme.border_soft() });
     let mut resp = ui.add(
         egui::Button::new(RichText::new(label).size(11.0).strong().color(text))
             .fill(fill)
@@ -282,7 +308,7 @@ pub fn mixer_pad_inert(ui: &mut Ui, theme: &dyn Theme, label: &str) -> egui::Res
     )
 }
 
-/// Track live LED — green when audible (`on`), red when muted. Just the light.
+/// Track live LED — phosphor mint when audible (`on`), brick when muted.
 pub fn track_on_led(ui: &mut Ui, theme: &dyn Theme, on: &mut bool) -> egui::Response {
     analog_led_jewel(
         ui,
@@ -312,11 +338,11 @@ fn mixer_pad_sized(
     let painter = ui.painter();
 
     // Outer bezel
-    painter.rect_filled(rect, CornerRadius::same(4), theme.bg_well());
+    painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_well());
     painter.rect_stroke(
         rect,
-        CornerRadius::same(4),
-        Stroke::new(1.0_f32, theme.border()),
+        CornerRadius::ZERO,
+        Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Outside,
     );
 
@@ -328,11 +354,11 @@ fn mixer_pad_sized(
     } else {
         theme.bg_well()
     };
-    painter.rect_filled(inner, CornerRadius::same(3), fill);
+    painter.rect_filled(inner, CornerRadius::ZERO, fill);
     if *on && interactive {
         painter.rect_stroke(
             inner,
-            CornerRadius::same(3),
+            CornerRadius::ZERO,
             Stroke::new(1.0_f32, lit),
             egui::StrokeKind::Inside,
         );
@@ -480,11 +506,11 @@ pub fn fader_db(
         rect.center(),
         Vec2::new(track_w, rect.height() - 8.0),
     );
-    painter.rect_filled(track, CornerRadius::same(2), Color32::from_rgb(0x1a, 0x1b, 0x1d));
+    painter.rect_filled(track, CornerRadius::ZERO, Color32::from_rgb(0x1a, 0x1b, 0x1d));
     painter.rect_stroke(
         track,
-        CornerRadius::same(2),
-        Stroke::new(1.0_f32, Color32::from_rgb(0x8a, 0x8e, 0x94)),
+        CornerRadius::ZERO,
+        Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Outside,
     );
 
@@ -511,10 +537,15 @@ pub fn fader_db(
             }
             let y = db_to_y(db);
             if is_zero {
+                let zero_col = if matches!(style, FaderStyle::Track) {
+                    Color32::from_rgb(0x6e, 0xaa, 0x96)
+                } else {
+                    theme.accent()
+                };
                 painter.hline(
                     egui::Rangef::new(rect.left() + 1.0, rect.right() - 1.0),
                     y,
-                    Stroke::new(2.0_f32, theme.accent()),
+                    Stroke::new(2.0_f32, zero_col),
                 );
                 if wide {
                     painter.text(
@@ -522,7 +553,7 @@ pub fn fader_db(
                         egui::Align2::LEFT_CENTER,
                         "0",
                         egui::FontId::proportional(9.0),
-                        theme.accent(),
+                        zero_col,
                     );
                 }
             } else if wide {
@@ -550,7 +581,7 @@ pub fn fader_db(
         egui::pos2(track.left(), y),
         egui::pos2(track.right(), track.bottom()),
     );
-    painter.rect_filled(fill, CornerRadius::same(2), theme.fader_fill());
+    painter.rect_filled(fill, CornerRadius::ZERO, theme.fader_fill());
 
     // Skeuomorphic console fader cap — tall rectangle, bevel + grip grooves.
     let at_zero = value_db.abs() < 0.05;
@@ -723,7 +754,8 @@ pub fn fader_db(
         *value_db = 0.0;
         resp.mark_changed();
     }
-    if apply_wheel_to_value(ui, &mut resp, value_db, lo..=hi) {
+    // Fine hover-scroll: ~0.25–0.5 dB per notch on strip range (not multi-dB jumps).
+    if apply_wheel_to_value_scaled(ui, &mut resp, value_db, lo..=hi, 0.18) {
         snap_zero(value_db);
     }
     resp
@@ -753,6 +785,7 @@ struct MeterPeakHold {
 }
 
 /// Peak meter with an explicit dB window (must match sibling fader if paired).
+/// Heatmap fill + mint tip; white chrome (not accent-framed).
 pub fn meter_range(
     ui: &mut Ui,
     theme: &dyn Theme,
@@ -762,13 +795,16 @@ pub fn meter_range(
     max_db: f32,
     id_salt: impl std::hash::Hash,
 ) {
-    let id = ui.id().with("meter_peak_hold").with(id_salt);
+    use super::dynamics_xfer_3d::{meter_heat_from_db, phosphor_heat_color};
+
+    let id = ui.id().with("meter_peak_hold_phos").with(id_salt);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(1), theme.bg_well());
+    let phos = Color32::from_rgb(0x8a, 0xe0, 0xc0);
+    painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_well());
     painter.rect_stroke(
         rect,
-        CornerRadius::same(1),
+        CornerRadius::ZERO,
         Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Inside,
     );
@@ -776,55 +812,75 @@ pub fn meter_range(
     let span = (max_db - min_db).max(0.001);
     let zero_t = ((0.0 - min_db) / span).clamp(0.0, 1.0);
     let inner = Rect::from_min_max(
-        egui::pos2(rect.left() + 1.0, rect.top() + 1.0),
-        egui::pos2(rect.right() - 1.0, rect.bottom() - 1.0),
+        egui::pos2(rect.left() + 1.5, rect.top() + 1.5),
+        egui::pos2(rect.right() - 1.5, rect.bottom() - 1.5),
     );
     let y0 = inner.bottom() - inner.height() * zero_t;
 
     let db = level_db.clamp(min_db, max_db);
     if db > min_db + 0.5 {
-        let t = (db - min_db) / span;
-        let fill_h = inner.height() * t;
-        let yellow = theme.meter_yellow();
-        let orange = theme.meter_orange();
-        let red = theme.meter_red();
-
+        let t = ((db - min_db) / span).clamp(0.0, 1.0);
+        let tip_y = inner.bottom() - inner.height() * t;
+        // Opaque overlapping slices — avoids transparent hairline gaps between bands.
         const SLICES: i32 = 48;
+        let fill_h = (inner.bottom() - tip_y).max(1.0);
         let slice_h = fill_h / SLICES as f32;
         for i in 0..SLICES {
-            let y1 = inner.bottom() - (i as f32 + 1.0) * slice_h;
             let yb = inner.bottom() - i as f32 * slice_h;
-            if yb <= inner.bottom() - fill_h {
+            let y1 = (inner.bottom() - (i as f32 + 1.0) * slice_h).max(tip_y);
+            if yb <= tip_y + 0.05 {
                 break;
             }
             let y_mid = (yb + y1) * 0.5;
             let pos = ((inner.bottom() - y_mid) / inner.height()).clamp(0.0, 1.0);
-            // Red from 0 dBFS up. Below that: yellow → amber → brick (ease-in).
-            let amber = Color32::from_rgb(0xe0, 0x8a, 0x2a);
-            let color = if pos >= zero_t {
-                red
-            } else {
-                let u = (pos / zero_t.max(0.001)).clamp(0.0, 1.0);
-                if u < 0.50 {
-                    lerp_color(yellow, amber, u / 0.50)
-                } else {
-                    // Last half of the climb: hard into brick/terracotta.
-                    let v = ((u - 0.50) / 0.50).clamp(0.0, 1.0);
-                    let v = v * v; // ease-in
-                    lerp_color(amber, orange, v)
-                }
-            };
+            let db_at = min_db + pos * span;
+            let heat = meter_heat_from_db(db_at);
+            let c = phosphor_heat_color(heat, theme);
+            // Slight vertical overlap seals subpixel seams; fully opaque face.
             let band = Rect::from_min_max(
-                egui::pos2(inner.left(), y1.max(inner.bottom() - fill_h)),
-                egui::pos2(inner.right(), yb),
+                egui::pos2(inner.left(), (y1 - 0.6).max(tip_y)),
+                egui::pos2(inner.right(), yb + 0.6),
             );
-            if band.height() > 0.2 {
-                painter.rect_filled(band, CornerRadius::ZERO, color);
+            if band.height() > 0.05 {
+                painter.rect_filled(band, CornerRadius::ZERO, c);
             }
         }
+        // Tip bloom — mint below 0, lava when peaking over.
+        let tip = if db > 0.05 {
+            Color32::from_rgb(0xff, 0x3a, 0x28)
+        } else {
+            phos
+        };
+        painter.hline(
+            inner.x_range(),
+            tip_y,
+            Stroke::new(
+                3.5_f32,
+                Color32::from_rgba_unmultiplied(tip.r(), tip.g(), tip.b(), 90),
+            ),
+        );
+        painter.hline(
+            inner.x_range(),
+            tip_y,
+            Stroke::new(
+                1.75_f32,
+                Color32::from_rgba_unmultiplied(tip.r(), tip.g(), tip.b(), 230),
+            ),
+        );
+        let cx = inner.center().x;
+        painter.circle_filled(
+            egui::pos2(cx, tip_y),
+            (inner.width() * 0.42).clamp(2.2, 4.5),
+            Color32::from_rgba_unmultiplied(tip.r(), tip.g(), tip.b(), 200),
+        );
+        painter.circle_filled(
+            egui::pos2(cx, tip_y),
+            1.2,
+            Color32::from_rgba_unmultiplied(0xf4, 0xf6, 0xf8, 240),
+        );
     }
 
-    // Last-peak hold tick (soft chalk gray).
+    // Last-peak hold — soft chalk tick.
     const HOLD_SECS: f64 = 1.4;
     const FALL_DB_PER_SEC: f32 = 18.0;
     let now = ui.input(|i| i.time);
@@ -851,18 +907,30 @@ pub fn meter_range(
     if hold_db > min_db + 1.0 {
         let ht = ((hold_db - min_db) / span).clamp(0.0, 1.0);
         let y_hold = inner.bottom() - inner.height() * ht;
+        let hold_c = theme.meter_peak_hold();
         painter.hline(
             inner.x_range(),
             y_hold,
-            Stroke::new(1.5_f32, theme.meter_peak_hold()),
+            Stroke::new(
+                2.0_f32,
+                Color32::from_rgba_unmultiplied(hold_c.r(), hold_c.g(), hold_c.b(), 150),
+            ),
         );
     }
 
-    // Unity rail — matches fader 0 dB
+    // Unity rail — soft white chrome
     painter.hline(
         inner.x_range(),
         y0,
-        Stroke::new(1.75_f32, theme.accent()),
+        Stroke::new(
+            1.25_f32,
+            Color32::from_rgba_unmultiplied(
+                theme.text().r(),
+                theme.text().g(),
+                theme.text().b(),
+                140,
+            ),
+        ),
     );
 }
 
@@ -1364,7 +1432,7 @@ pub fn softclip_transfer_plot(
         let painter = ui.painter();
         painter.rect_stroke(
             rect,
-            CornerRadius::same(2),
+            CornerRadius::ZERO,
             Stroke::new(1.0_f32, theme.border_soft()),
             egui::StrokeKind::Inside,
         );
@@ -1399,10 +1467,10 @@ pub fn softclip_transfer_plot(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+    painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_chart());
     painter.rect_stroke(
         rect,
-        CornerRadius::same(2),
+        CornerRadius::ZERO,
         Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Inside,
     );
@@ -1533,7 +1601,7 @@ pub fn softclip_transfer_plot(
         };
         painter.rect_filled(
             bar,
-            CornerRadius::same(1),
+            CornerRadius::ZERO,
             Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (40.0 + t * 110.0) as u8),
         );
     }
@@ -1622,7 +1690,7 @@ pub fn softclip_transfer_plot(
             let o = theme.meter_orange();
             painter.rect_filled(
                 gr_rect,
-                CornerRadius::same(1),
+                CornerRadius::ZERO,
                 Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 90),
             );
             painter.text(
@@ -2037,7 +2105,7 @@ pub fn limiter_transfer_plot(
         let painter = ui.painter();
         painter.rect_stroke(
             rect,
-            CornerRadius::same(2),
+            CornerRadius::ZERO,
             Stroke::new(1.0_f32, theme.border_soft()),
             egui::StrokeKind::Inside,
         );
@@ -2074,10 +2142,10 @@ pub fn limiter_transfer_plot(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+    painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_chart());
     painter.rect_stroke(
         rect,
-        CornerRadius::same(2),
+        CornerRadius::ZERO,
         Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Inside,
     );
@@ -2201,7 +2269,7 @@ pub fn limiter_transfer_plot(
         };
         painter.rect_filled(
             bar,
-            CornerRadius::same(1),
+            CornerRadius::ZERO,
             Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (40.0 + t * 110.0) as u8),
         );
     }
@@ -2282,7 +2350,7 @@ pub fn limiter_transfer_plot(
             let o = theme.meter_orange();
             painter.rect_filled(
                 gr_rect,
-                CornerRadius::same(1),
+                CornerRadius::ZERO,
                 Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 90),
             );
             painter.text(
@@ -2319,7 +2387,7 @@ pub fn limiter_transfer_plot(
     {
         painter.rect_filled(
             gr_strip,
-            CornerRadius::same(1),
+            CornerRadius::ZERO,
             theme.bg_well().gamma_multiply(0.85),
         );
         painter.text(
@@ -2545,10 +2613,10 @@ pub fn theatre_drive_plot(
     }
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+    painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_chart());
     painter.rect_stroke(
         rect,
-        CornerRadius::same(2),
+        CornerRadius::ZERO,
         Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Inside,
     );
@@ -2621,7 +2689,7 @@ pub fn theatre_drive_plot(
             let col = if hot { o } else { a };
             painter.rect_filled(
                 bar,
-                CornerRadius::same(1),
+                CornerRadius::ZERO,
                 Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (36.0 + t * 100.0) as u8),
             );
         }
@@ -2689,7 +2757,7 @@ pub fn theatre_drive_plot(
                         egui::pos2(p.x - 2.5, top),
                         egui::pos2(p.x + 2.5, bot),
                     ),
-                    CornerRadius::same(1),
+                    CornerRadius::ZERO,
                     Color32::from_rgba_unmultiplied(o.r(), o.g(), o.b(), 85),
                 );
             }
@@ -2894,10 +2962,10 @@ pub fn plugin_stereo_meters(
 ) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(2), theme.bg_well());
+    painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_well());
     painter.rect_stroke(
         rect,
-        CornerRadius::same(2),
+        CornerRadius::ZERO,
         Stroke::new(1.0_f32, theme.border_soft()),
         egui::StrokeKind::Inside,
     );
@@ -2941,7 +3009,7 @@ pub fn plugin_stereo_meters(
             egui::pos2(x0, rect.top() + 3.0),
             egui::pos2(x0 + bar_w, rect.bottom() - 3.0),
         );
-        painter.rect_filled(well, CornerRadius::same(1), theme.bg_app());
+        painter.rect_filled(well, CornerRadius::ZERO, theme.bg_app());
 
         if t > 0.01 {
             const SLICES: i32 = 32;
@@ -3185,7 +3253,7 @@ fn paint_peak_spectrum(
         let alpha = (55.0 + bin * 120.0).clamp(40.0, 175.0) as u8;
         painter.rect_filled(
             bar,
-            CornerRadius::same(1),
+            CornerRadius::ZERO,
             Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), alpha),
         );
     }
@@ -3472,10 +3540,10 @@ pub fn denoiser_param_graph(
 
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+        painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_chart());
         painter.rect_stroke(
             rect,
-            CornerRadius::same(2),
+            CornerRadius::ZERO,
             Stroke::new(1.0_f32, theme.border_soft()),
             egui::StrokeKind::Inside,
         );
@@ -3820,10 +3888,10 @@ pub fn peq_graph(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+        painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_chart());
         painter.rect_stroke(
             rect,
-            CornerRadius::same(2),
+            CornerRadius::ZERO,
             Stroke::new(1.0_f32, theme.border_soft()),
             egui::StrokeKind::Inside,
         );
@@ -4037,10 +4105,10 @@ pub fn track_analyzer(
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(2), theme.bg_chart());
+        painter.rect_filled(rect, CornerRadius::ZERO, theme.bg_chart());
         painter.rect_stroke(
             rect,
-            CornerRadius::same(2),
+            CornerRadius::ZERO,
             Stroke::new(1.0_f32, theme.border_soft()),
             egui::StrokeKind::Inside,
         );

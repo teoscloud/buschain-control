@@ -22,7 +22,7 @@ impl Default for BusLevel {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DesiredState {
     pub clock: GraphClock,
     pub buses: HashMap<String, NodeSpec>,
@@ -50,6 +50,34 @@ pub struct DesiredState {
     pub bus_inputs: HashMap<String, Vec<String>>,
     /// Bus → session-pinned playback app keys (`bin:…` / `name:…`).
     pub bus_playback: HashMap<String, Vec<String>>,
+    /// Master Direct Out — disable Master fan-in GLC (host peer PDC restored).
+    /// Desktop default: true (latency-first).
+    pub glc_disabled: bool,
+    /// Buses with Direct Out (excluded from GLC DAG; Master edge always direct).
+    pub glc_direct: HashSet<String>,
+}
+
+impl Default for DesiredState {
+    fn default() -> Self {
+        Self {
+            clock: GraphClock::default(),
+            buses: HashMap::new(),
+            routes: HashSet::new(),
+            bridges: HashMap::new(),
+            fx_chains: HashMap::new(),
+            bus_egress: HashMap::new(),
+            master_hw: None,
+            preferred_default: None,
+            bus_levels: HashMap::new(),
+            speakers_armed: false,
+            fx_failed: HashSet::new(),
+            virtual_inputs: HashMap::new(),
+            bus_inputs: HashMap::new(),
+            bus_playback: HashMap::new(),
+            glc_disabled: true,
+            glc_direct: HashSet::new(),
+        }
+    }
 }
 
 impl DesiredState {
@@ -168,6 +196,18 @@ impl DesiredState {
         src_rate.hash(&mut h);
         dst_rate.hash(&mut h);
         NodeName::new(format!("buschain_rs_{:x}", h.finish()))
+    }
+
+    /// Outbound Master/post → HW converter (GraphClock → device rate).
+    pub fn egress_bridge_name(src_rate: u32, dst_rate: u32, source: &str, sink: &str) -> NodeName {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        source.hash(&mut h);
+        sink.hash(&mut h);
+        src_rate.hash(&mut h);
+        dst_rate.hash(&mut h);
+        NodeName::new(format!("buschain_rs_out_{:x}", h.finish()))
     }
 }
 

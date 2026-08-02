@@ -18,7 +18,7 @@ pub enum Intent {
     },
     /// Push PipeWire Props (generic).
     PushProps { node: String, props: Props },
-    /// Bind Master HW clock from a resolved performance profile.
+    /// Bind BusChain GraphClock from session performance (no PW force-rate).
     BindMasterClock { profile: PerformanceProfile },
     /// Sealed insert chain: spawn/reattach filter-chain + exclusive wet wire.
     EnsureFxChain {
@@ -50,7 +50,7 @@ pub enum Intent {
         force_fx: bool,
     },
     /// Apply rate/quantum to one HW node via graph force-clock.
-    /// When `bind_buschain` is true (Master HW out), also migrate BusChain buses.
+    /// When `bind_buschain` is true (Master HW out), force-rate HW only — GraphClock unchanged.
     BindDeviceClock {
         device: String,
         sample_rate: u32,

@@ -21,7 +21,7 @@ pub fn draw_app_icon(ui: &mut egui::Ui, state: &mut AppState, icon_name: Option<
     ui.add(
         egui::Image::new(&tex)
             .fit_to_exact_size(Vec2::splat(DISPLAY_SIZE))
-            .corner_radius(egui::CornerRadius::same(3)),
+            .corner_radius(egui::CornerRadius::ZERO),
     );
     true
 }
