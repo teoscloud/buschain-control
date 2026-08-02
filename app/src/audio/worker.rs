@@ -164,10 +164,16 @@ pub enum Command {
     /// Volume/mute only — no module load.
     ApplyLevels(Session),
     /// Fast fader path — single bus, usually one pactl call.
+    /// `muted` is the audible gate (mute ∨ solo-duck). `mixer_mute` is the
+    /// user mute bit persisted into `last_session` / GetMixer.
+    /// `rev` is the mixer-write generation — older revs are dropped so a
+    /// queued pre-drag SetTrackLevel cannot snap volume after a newer write.
     SetTrackLevel {
         sink: String,
         gain_db: f32,
         muted: bool,
+        mixer_mute: bool,
+        rev: u64,
     },
     SetSinkVolume { name: String, pct: u32 },
     SetSinkMute { name: String, mute: bool },
@@ -619,7 +625,7 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
         return vec![Command::Shutdown];
     }
 
-    let mut levels: HashMap<String, (f32, bool)> = HashMap::new();
+    let mut levels: HashMap<String, (f32, bool, bool, u64)> = HashMap::new();
     let mut full_levels: Option<Session> = None;
     let mut fx_params: HashMap<uuid::Uuid, Session> = HashMap::new();
     let mut fx_controls: HashMap<String, Vec<buschain_engine::InsertSlot>> = HashMap::new();
@@ -638,9 +644,16 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
                 sink,
                 gain_db,
                 muted,
+                mixer_mute,
+                rev,
             } => {
                 full_levels = None;
-                levels.insert(sink, (gain_db, muted));
+                match levels.get(&sink) {
+                    Some(&(_, _, _, old_rev)) if old_rev > rev => {}
+                    _ => {
+                        levels.insert(sink, (gain_db, muted, mixer_mute, rev));
+                    }
+                }
             }
             Command::ApplyLevels(s) => {
                 levels.clear();
@@ -714,11 +727,13 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
     if let Some(s) = full_levels {
         class_a.push(Command::ApplyLevels(s));
     } else {
-        for (sink, (gain_db, muted)) in levels {
+        for (sink, (gain_db, muted, mixer_mute, rev)) in levels {
             class_a.push(Command::SetTrackLevel {
                 sink,
                 gain_db,
                 muted,
+                mixer_mute,
+                rev,
             });
         }
     }
@@ -984,6 +999,7 @@ fn interactive_loop(
     buschain_engine::midi::ensure_runtime(track_sink, track_bus);
     // Buses currently mixer-muted — volume drags skip the heavy gate path.
     let mut muted_buses: HashMap<String, bool> = HashMap::new();
+    let mut level_revs: HashMap<String, u64> = HashMap::new();
     let mut props_retry: HashMap<String, PropsRetry> = HashMap::new();
     // Interactive never ForceRespawns — blackhole FX job channel.
     let (fx_job_tx, fx_job_rx) = mpsc::channel::<FxEnsureJob>();
@@ -1041,6 +1057,7 @@ fn interactive_loop(
                         &mut session_gen,
                         &shared_session,
                         &mut muted_buses,
+                        &mut level_revs,
                         &mut props_retry,
                         &mut place_retry,
                         &mut default_reclaim_until,
@@ -1073,6 +1090,7 @@ fn interactive_loop(
             &mut session_gen,
             &shared_session,
             &mut muted_buses,
+            &mut level_revs,
             &mut props_retry,
             &mut place_retry,
             &mut default_reclaim_until,
@@ -1096,6 +1114,7 @@ fn supervisor_loop(
     let mut last_session: Option<Session> = None;
     let mut session_gen: u64 = 0;
     let mut muted_buses: HashMap<String, bool> = HashMap::new();
+    let mut level_revs: HashMap<String, u64> = HashMap::new();
     let mut props_retry: HashMap<String, PropsRetry> = HashMap::new();
     let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
     let (fx_job_tx, fx_job_rx) = mpsc::channel::<FxEnsureJob>();
@@ -1157,6 +1176,7 @@ fn supervisor_loop(
                         &mut session_gen,
                         &shared_session,
                         &mut muted_buses,
+                        &mut level_revs,
                         &mut props_retry,
                         &mut place_retry,
                         &mut default_reclaim_until,
@@ -1249,6 +1269,7 @@ fn supervisor_loop(
             &mut session_gen,
             &shared_session,
             &mut muted_buses,
+            &mut level_revs,
             &mut props_retry,
             &mut place_retry,
             &mut default_reclaim_until,
@@ -1270,6 +1291,7 @@ fn process_command_batch(
     session_gen: &mut u64,
     shared_session: &Arc<Mutex<SharedSessionSlot>>,
     muted_buses: &mut HashMap<String, bool>,
+    level_revs: &mut HashMap<String, u64>,
     props_retry: &mut HashMap<String, PropsRetry>,
     place_retry: &mut HashMap<String, PlaceRetry>,
     default_reclaim_until: &mut Option<Instant>,
@@ -1395,6 +1417,8 @@ fn process_command_batch(
                 Command::ApplySession(mut session) => {
                     sync_engine_clock(&session);
                     session.normalize();
+                    // Stale clones must not reset post faders / Desired to 0 dB.
+                    crate::daemon::overlay_track_mixer_authority(&mut session);
                     if let Ok(msg) = graph::teardown_legacy_shadow_graph() {
                         if !msg.is_empty() {
                             let _ = tx.send(Event::Status(msg));
@@ -1486,6 +1510,7 @@ fn process_command_batch(
                 | Command::HotplugSession(mut session) => {
                     sync_engine_clock(&session);
                     session.normalize();
+                    crate::daemon::overlay_track_mixer_authority(&mut session);
                     // One-shot capture + egress — never Hotplug N× rewire_track_route.
                     let hw = graph::resolve_hardware_output(&session)
                         .unwrap_or_else(|_| session.master_output.clone().unwrap_or_default());
@@ -1706,7 +1731,8 @@ fn process_command_batch(
                         let _ = tx.send(Event::Error(format!("prune track: {e:#}")));
                     }
                 },
-                Command::ApplyLevels(session) => {
+                Command::ApplyLevels(mut session) => {
+                    crate::daemon::overlay_track_mixer_authority(&mut session);
                     *last_session = Some(session.clone());
                     if let Ok(hw) = graph::resolve_hardware_output(&session) {
                         crate::audio::engine_handle::sync_desired_from_session(&session, &hw);
@@ -1736,7 +1762,15 @@ fn process_command_batch(
                     sink,
                     gain_db,
                     muted,
+                    mixer_mute,
+                    rev,
                 } => {
+                    // Drop stale fader cmds that lost the race to a newer write.
+                    let applied = level_revs.get(&sink).copied().unwrap_or(0);
+                    if rev < applied {
+                        continue;
+                    }
+                    level_revs.insert(sink.clone(), rev);
                     // Keep supervisor DesiredState in sync so idle reconcile
                     // does not snap volume/mute back to an old fader position.
                     if let Some(ref mut s) = last_session {
@@ -1746,7 +1780,7 @@ fn process_command_batch(
                             .find(|t| t.expected_sink_name() == sink)
                         {
                             t.gain_db = gain_db;
-                            t.mute = muted;
+                            t.mute = mixer_mute;
                         }
                     }
                     crate::audio::engine_handle::with_engine(|eng| {

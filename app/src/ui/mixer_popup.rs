@@ -339,11 +339,13 @@ fn apply_track_level(state: &mut AppState, track_id: uuid::Uuid, gain_db: f32, m
         t.gain_db = gain_db;
         t.mute = mute;
     }
-    crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
+    let rev = crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
     state.worker.send(Command::SetTrackLevel {
         sink,
         gain_db,
         muted: mute,
+        mixer_mute: mute,
+        rev,
     });
 }
 

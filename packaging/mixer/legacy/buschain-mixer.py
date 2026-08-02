@@ -72,6 +72,12 @@ _CTL_WORKER_LOCK = threading.Lock()
 _CTL_WORKER_STARTED = False
 
 
+# Latest pending track vol/mute by id — drops stale queued values so an older
+# `track vol` cannot run after a newer one and snap the fader back.
+_CTL_TRACK_LATEST: dict[str, tuple[str, ...]] = {}
+_CTL_TRACK_LOCK = threading.Lock()
+
+
 def _ensure_ctl_worker() -> None:
     global _CTL_WORKER_STARTED
     with _CTL_WORKER_LOCK:
@@ -84,6 +90,19 @@ def _ensure_ctl_worker() -> None:
                 item = _CTL_Q.get()
                 if item is None:
                     return
+                # Coalesce track vol/mute: skip if a newer cmd superseded this one.
+                if (
+                    len(item) >= 4
+                    and item[0] == "track"
+                    and item[1] in ("vol", "mute")
+                ):
+                    tid = item[2]
+                    with _CTL_TRACK_LOCK:
+                        latest = _CTL_TRACK_LATEST.get(tid)
+                        if latest is not None and latest != item:
+                            continue
+                        if latest == item:
+                            _CTL_TRACK_LATEST.pop(tid, None)
                 try:
                     subprocess.run(
                         [CTL, *item], capture_output=True, text=True, check=False
@@ -106,7 +125,11 @@ def _lat(msg: str) -> None:
 def ctl_queue(*args: str) -> None:
     """Ordered async ctl (Master HW scroll/drag)."""
     _ensure_ctl_worker()
-    _CTL_Q.put(tuple(args))
+    item = tuple(args)
+    if len(item) >= 4 and item[0] == "track" and item[1] in ("vol", "mute"):
+        with _CTL_TRACK_LOCK:
+            _CTL_TRACK_LATEST[item[2]] = item
+    _CTL_Q.put(item)
 
 
 def ctl_async(*args: str) -> None:
@@ -679,6 +702,8 @@ class Mixer(Gtk.Window):
         self._drag_keys: set[str] = set()
         # Keys recently changed locally — suppress patch snap-back (ms wall clock).
         self._local_until: dict[str, float] = {}
+        # Optimistic track gain_db while local lock holds (survives widget rebuilds).
+        self._local_track_db: dict[str, float] = {}
         self._opened_at = time.monotonic()
         self._play_fp: tuple | None = None
         self._tracks_fp: tuple | None = None
@@ -819,8 +844,21 @@ class Mixer(Gtk.Window):
             return False
         if time.monotonic() >= until:
             self._local_until.pop(key, None)
+            # Drop optimistic track dB when the lock expires.
+            if key.startswith("track:") or key.startswith("tracks-tab:"):
+                tid = key.split(":", 1)[-1]
+                self._local_track_db.pop(tid, None)
             return False
         return True
+
+    def _track_gain_for_ui(self, track: dict) -> float:
+        tid = str(track.get("id") or "")
+        if tid and (
+            self._is_local(f"track:{tid}") or self._is_local(f"tracks-tab:{tid}")
+        ):
+            if tid in self._local_track_db:
+                return float(self._local_track_db[tid])
+        return float(track.get("gain_db") or 0.0)
 
     def _clear_drag_locks(self) -> None:
         """Lost button-release (focus-out / grab) must not freeze patch forever."""
@@ -908,6 +946,15 @@ class Mixer(Gtk.Window):
             return False
 
         self._interact_timer = GLib.timeout_add(ms, _clear)
+
+    def _with_building(self, fn) -> None:
+        """Run `fn` with value-changed handlers suppressed (nested-safe)."""
+        prev = self._building
+        self._building = True
+        try:
+            fn()
+        finally:
+            self._building = prev
 
     def _clear(self, box: Gtk.Box) -> None:
         for child in list(box.get_children()):
@@ -1052,17 +1099,17 @@ class Mixer(Gtk.Window):
         fav_order = {pid: i for i, pid in enumerate(self._favorites)}
         fav_tracks.sort(key=lambda t: fav_order.get(t.get("id"), 999))
 
+        # Identity only — live gain/mute are patched. Including gain in the
+        # fingerprint forced a full strip rebuild on every fader move, which
+        # ignored `_is_local` and snapped thumbs back to a stale GetMixer read.
         fp = (
             tuple(
                 (int(s["index"]), s.get("name"), s.get("icon_name"), s.get("binary"))
                 for s in items
             ),
-            tuple(
-                (t.get("id"), round(float(t.get("gain_db") or 0), 2), bool(t.get("mute")))
-                for t in fav_tracks
-            ),
-            min(hw_pct, int(HW_VOL_MAX)),
-            hw_mute,
+            tuple(t.get("id") for t in fav_tracks),
+            # HW identity for card chrome; pct/mute still patched.
+            bool(st),
         )
         if (
             self._play_fp is not None
@@ -1148,7 +1195,7 @@ class Mixer(Gtk.Window):
         for t in fav_tracks:
             tid = str(t.get("id"))
             key = f"track:{tid}"
-            vol_ui = db_to_ui(float(t.get("gain_db") or 0.0))
+            vol_ui = db_to_ui(self._track_gain_for_ui(t))
             ic = icon_image("audio-speakers-symbolic", "🎚")
             ic.get_style_context().add_class("app-icon")
             card = self._make_fader_card(
@@ -1183,33 +1230,32 @@ class Mixer(Gtk.Window):
         self, st: dict, items: list, fav_tracks: list
     ) -> None:
         if st and hasattr(self, "_hw_scale") and not self._is_local("hw"):
-            self._building = True
-            try:
+            def _hw() -> None:
                 self._hw_scale.set_value(
                     min(int(st.get("hw_volume_pct") or 0), int(HW_VOL_MAX))
                 )
                 if hasattr(self, "_hw_mute"):
                     self._hw_mute.set_active(bool(st.get("hw_mute")))
                     _set_mute_icon(self._hw_mute)
-            finally:
-                self._building = False
+
+            self._with_building(_hw)
         for t in fav_tracks:
-            key = f"track:{t.get('id')}"
-            if self._is_local(key):
+            tid = str(t.get("id"))
+            key = f"track:{tid}"
+            if self._is_local(key) or self._is_local(f"tracks-tab:{tid}"):
                 continue
             w = self._stream_widgets.get(key)
             if not w:
                 continue
-            self._building = True
-            try:
-                vol = db_to_ui(float(t.get("gain_db") or 0))
-                w["scale"].set_value(vol)
-                db = float(t.get("gain_db") or 0)
-                w["pct"].set_text("0dB" if abs(db) < 0.05 else f"{db:+.0f}dB")
-                w["mute"].set_active(bool(t.get("mute")))
-                _set_mute_icon(w["mute"])
-            finally:
-                self._building = False
+
+            def _track(tt=t, ww=w) -> None:
+                db = self._track_gain_for_ui(tt)
+                ww["scale"].set_value(db_to_ui(db))
+                ww["pct"].set_text("0dB" if abs(db) < 0.05 else f"{db:+.0f}dB")
+                ww["mute"].set_active(bool(tt.get("mute")))
+                _set_mute_icon(ww["mute"])
+
+            self._with_building(_track)
         for s in items:
             key = f"si:{int(s['index'])}"
             if self._is_local(key):
@@ -1217,15 +1263,34 @@ class Mixer(Gtk.Window):
             w = self._stream_widgets.get(key)
             if not w:
                 continue
-            self._building = True
-            try:
-                vol = int(s.get("volume_pct") or 0)
-                w["scale"].set_value(vol)
-                w["pct"].set_text(f"{vol}%")
-                w["mute"].set_active(bool(s.get("mute")))
-                _set_mute_icon(w["mute"])
-            finally:
-                self._building = False
+
+            def _stream(ss=s, ww=w) -> None:
+                vol = int(ss.get("volume_pct") or 0)
+                ww["scale"].set_value(vol)
+                ww["pct"].set_text(f"{vol}%")
+                ww["mute"].set_active(bool(ss.get("mute")))
+                _set_mute_icon(ww["mute"])
+
+            self._with_building(_stream)
+
+    def _patch_tracks_values(self, tracks: list) -> None:
+        for t in tracks:
+            tid = str(t.get("id"))
+            # Drag/schedule locks `track:` and/or `tracks-tab:` — honor either.
+            if self._is_local(f"track:{tid}") or self._is_local(f"tracks-tab:{tid}"):
+                continue
+            w = self._stream_widgets.get(f"tracks-tab:{tid}")
+            if not w:
+                continue
+
+            def _one(tt=t, ww=w) -> None:
+                db = self._track_gain_for_ui(tt)
+                ww["scale"].set_value(db_to_ui(db))
+                ww["pct"].set_text("0dB" if abs(db) < 0.05 else f"{db:+.0f}dB")
+                ww["mute"].set_active(bool(tt.get("mute")))
+                _set_mute_icon(ww["mute"])
+
+            self._with_building(_one)
 
     def _rebuild_tracks(self) -> None:
         # Favorites leftmost (same as Playback / egui), then remaining session tracks.
@@ -1237,19 +1302,26 @@ class Mixer(Gtk.Window):
                 fav_order.get(str(t.get("id")), 0),
             ),
         )
+        # Identity / star only — patch live gain/mute (same snap rule as Playback).
         fp = tuple(
             (
                 t.get("id"),
                 t.get("name"),
-                round(float(t.get("gain_db") or 0), 2),
-                bool(t.get("mute")),
+                t.get("kind"),
                 str(t.get("id")) in self._favorites,
             )
             for t in tracks
         )
         if self._tracks_fp == fp and self.tracks_box.get_children():
+            self._patch_tracks_values(tracks)
             return
         self._tracks_fp = fp
+        # Drop destroyed tracks-tab entries; Playback `track:` / `si:` cards stay.
+        self._stream_widgets = {
+            k: v
+            for k, v in self._stream_widgets.items()
+            if not k.startswith("tracks-tab:")
+        }
         self._clear(self.tracks_box)
 
         hint = Gtk.Label(
@@ -1284,7 +1356,7 @@ class Mixer(Gtk.Window):
             tid = str(t.get("id"))
             starred = tid in self._favorites
             kind = t.get("kind") or "track"
-            vol_ui = db_to_ui(float(t.get("gain_db") or 0.0))
+            vol_ui = db_to_ui(self._track_gain_for_ui(t))
             ic = icon_image(
                 "audio-volume-high-symbolic" if kind == "master" else "audio-speakers-symbolic",
                 "🎚",
@@ -1591,7 +1663,10 @@ class Mixer(Gtk.Window):
             return
         self._bump_interact()
         db = ui_to_db(scale.get_value())
-        # Key must match stream widget / patch key (`track:…`).
+        self._local_track_db[track_id] = db
+        # Playback favorites use `track:`; Tracks tab uses `tracks-tab:`.
+        # Lock both so a poll cannot snap either strip.
+        self._touch_local(f"tracks-tab:{track_id}")
         self._schedule_vol(
             f"track:{track_id}", ("track", "vol", track_id, f"{db:.2f}")
         )
@@ -1600,6 +1675,8 @@ class Mixer(Gtk.Window):
         if self._building:
             return
         self._bump_interact()
+        self._touch_local(f"track:{track_id}")
+        self._touch_local(f"tracks-tab:{track_id}")
         ctl_async("track", "mute", track_id, "on" if btn.get_active() else "off")
         _set_mute_icon(btn)
 

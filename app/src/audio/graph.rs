@@ -1820,8 +1820,12 @@ pub fn apply_track_levels(session: &Session) -> Result<()> {
         // Always use deterministic bus name — never skip when sink_name is None
         // (that left Master at create-mute@0 after Tear down / failed FX).
         let sink = track.expected_sink_name();
-        let muted = track.mute || (any_solo && !track.solo && !track.kind.is_master());
-        set_track_audible(&sink, muted, track.gain_db)?;
+        let (gain_db, track_mute) =
+            crate::daemon::track_mixer_authority_values(track.id)
+                .unwrap_or((track.gain_db, track.mute));
+        let muted =
+            track_mute || (any_solo && !track.solo && !track.kind.is_master());
+        set_track_audible(&sink, muted, gain_db)?;
     }
     Ok(())
 }

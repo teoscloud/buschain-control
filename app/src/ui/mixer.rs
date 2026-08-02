@@ -536,6 +536,12 @@ fn draw_strip(
                     state.session.tracks[track_idx].gain_db = gain;
                     state.selected_track = Some(track_id);
                     state.dirty = true;
+                    // Claim mixer authority immediately so a QS/ctl echo cannot
+                    // overwrite this drag before flush_levels runs.
+                    let mute = state.session.tracks[track_idx].mute;
+                    let _ = crate::daemon::note_track_mixer_write(
+                        track_id, gain, mute, false,
+                    );
                     state.schedule_track_level(track_id);
                 }
                 let peak_db = state
@@ -593,7 +599,8 @@ fn draw_strip(
                 state.dirty = true;
                 let gain_db = state.session.tracks[track_idx].gain_db;
                 let sink = state.session.tracks[track_idx].expected_sink_name();
-                crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
+                let rev =
+                    crate::daemon::push_track_mixer_to_daemon(track_id, gain_db, mute);
                 if !has_sink {
                     state.commit(crate::audio::LiveChange::EnsureTrack { track_id });
                 }
@@ -601,6 +608,8 @@ fn draw_strip(
                     sink,
                     gain_db,
                     muted: mute,
+                    mixer_mute: mute,
+                    rev,
                 });
             }
         });

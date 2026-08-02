@@ -15,7 +15,7 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use crate::audio::graph::{self, PwSnapshot};
-use crate::audio::worker::{AudioWorker, Command, Event};
+use crate::audio::worker::{AudioWorker, Command, Event, SessionAppliedKind};
 use crate::ipc::{self, Request, Response, SessionListItem, Status};
 use crate::session::{self, Session};
 
@@ -25,6 +25,25 @@ pub struct TrackMixerPatch {
     pub track_id: Uuid,
     pub gain_db: f32,
     pub mute: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackMixerOrigin {
+    /// `buschain-ctl` / Quickshell via SetTrackMixer.
+    External,
+    /// Tray / mixer UI fader.
+    Ui,
+}
+
+/// Last intentional track vol/mute write. Sticky until replaced — TTL expiry was
+/// letting SessionApplied / dual-session copies snap faders back after ~900ms.
+#[derive(Debug, Clone, Copy)]
+struct TrackMixerAuthority {
+    gain_db: f32,
+    mute: bool,
+    /// Monotonic per-track generation; worker drops SetTrackLevel with older rev.
+    rev: u64,
+    origin: TrackMixerOrigin,
 }
 
 fn ui_track_mixer_patches() -> &'static Mutex<Vec<TrackMixerPatch>> {
@@ -37,8 +56,126 @@ fn daemon_track_mixer_patches() -> &'static Mutex<Vec<TrackMixerPatch>> {
     Q.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn track_mixer_authority() -> &'static Mutex<std::collections::HashMap<Uuid, TrackMixerAuthority>> {
+    static Q: OnceLock<Mutex<std::collections::HashMap<Uuid, TrackMixerAuthority>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn mixer_vals_differ(a_gain: f32, a_mute: bool, gain_db: f32, mute: bool) -> bool {
+    (a_gain - gain_db).abs() > 0.001 || a_mute != mute
+}
+
+/// Record an intentional mixer write. Returns the new generation for SetTrackLevel.
+pub fn note_track_mixer_write(
+    track_id: Uuid,
+    gain_db: f32,
+    mute: bool,
+    external: bool,
+) -> u64 {
+    let origin = if external {
+        TrackMixerOrigin::External
+    } else {
+        TrackMixerOrigin::Ui
+    };
+    let Ok(mut m) = track_mixer_authority().lock() else {
+        return 0;
+    };
+    let rev = m.get(&track_id).map(|a| a.rev.saturating_add(1)).unwrap_or(1);
+    m.insert(
+        track_id,
+        TrackMixerAuthority {
+            gain_db,
+            mute,
+            rev,
+            origin,
+        },
+    );
+    rev
+}
+
+pub fn track_mixer_write_rev(track_id: Uuid) -> u64 {
+    track_mixer_authority()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&track_id).map(|a| a.rev))
+        .unwrap_or(0)
+}
+
+fn clear_daemon_track_mixer_patch(track_id: Uuid) {
+    if let Ok(mut q) = daemon_track_mixer_patches().lock() {
+        q.retain(|p| p.track_id != track_id);
+    }
+}
+
+/// Overlay last intentional track vol/mute so GetMixer / SessionApplied / egui
+/// cannot snap sliders back to a stale session copy.
+pub fn overlay_track_mixer_authority(session: &mut Session) {
+    let Ok(m) = track_mixer_authority().lock() else {
+        return;
+    };
+    for (id, a) in m.iter() {
+        if let Some(t) = session.tracks.iter_mut().find(|t| t.id == *id) {
+            t.gain_db = a.gain_db;
+            t.mute = a.mute;
+        }
+    }
+}
+
+/// Seed authority from a loaded session (Full Apply / session switch).
+pub fn seed_track_mixer_authority_from_session(session: &Session) {
+    let Ok(mut m) = track_mixer_authority().lock() else {
+        return;
+    };
+    m.clear();
+    for t in &session.tracks {
+        m.insert(
+            t.id,
+            TrackMixerAuthority {
+                gain_db: t.gain_db,
+                mute: t.mute,
+                rev: 1,
+                origin: TrackMixerOrigin::Ui,
+            },
+        );
+    }
+}
+
+/// Active external (QS/ctl) mixer write the UI session may not have adopted yet.
+pub fn external_track_mixer_authority(track_id: Uuid) -> Option<(f32, bool)> {
+    let Ok(m) = track_mixer_authority().lock() else {
+        return None;
+    };
+    m.get(&track_id).and_then(|a| {
+        if a.origin == TrackMixerOrigin::External {
+            Some((a.gain_db, a.mute))
+        } else {
+            None
+        }
+    })
+}
+
+/// Latest intentional gain/mute for a track (any origin), if known.
+pub fn track_mixer_authority_values(track_id: Uuid) -> Option<(f32, bool)> {
+    let Ok(m) = track_mixer_authority().lock() else {
+        return None;
+    };
+    m.get(&track_id).map(|a| (a.gain_db, a.mute))
+}
+
+/// UI adopted a QS/ctl patch — local fader moves may overwrite authority.
+pub fn acknowledge_track_mixer_authority(track_id: Uuid) {
+    if let Ok(mut m) = track_mixer_authority().lock() {
+        if let Some(a) = m.get_mut(&track_id) {
+            a.origin = TrackMixerOrigin::Ui;
+        }
+    }
+}
+
 /// QS/ctl changed a track fader — UI should adopt on next tick.
 pub fn push_track_mixer_to_ui(track_id: Uuid, gain_db: f32, mute: bool) {
+    note_track_mixer_write(track_id, gain_db, mute, true);
+    // Drop any in-flight UI→daemon echo that still carries the pre-drag value.
+    clear_daemon_track_mixer_patch(track_id);
     if let Ok(mut q) = ui_track_mixer_patches().lock() {
         // Coalesce: keep latest patch per track.
         if let Some(p) = q.iter_mut().find(|p| p.track_id == track_id) {
@@ -66,7 +203,16 @@ pub fn take_track_mixer_ui_patches() -> Vec<TrackMixerPatch> {
 }
 
 /// UI changed a track fader — embedded daemon session / get_mixer should adopt.
-pub fn push_track_mixer_to_daemon(track_id: Uuid, gain_db: f32, mute: bool) {
+/// Returns the mixer write generation to stamp on SetTrackLevel.
+pub fn push_track_mixer_to_daemon(track_id: Uuid, gain_db: f32, mute: bool) -> u64 {
+    // While a QS/ctl write is still authoritative and the UI session has not
+    // adopted it, ignore echoes that would regress the fader.
+    if let Some((ag, am)) = external_track_mixer_authority(track_id) {
+        if mixer_vals_differ(ag, am, gain_db, mute) {
+            return track_mixer_write_rev(track_id);
+        }
+    }
+    let rev = note_track_mixer_write(track_id, gain_db, mute, false);
     if let Ok(mut q) = daemon_track_mixer_patches().lock() {
         if let Some(p) = q.iter_mut().find(|p| p.track_id == track_id) {
             *p = TrackMixerPatch {
@@ -82,6 +228,7 @@ pub fn push_track_mixer_to_daemon(track_id: Uuid, gain_db: f32, mute: bool) {
             });
         }
     }
+    rev
 }
 
 fn apply_track_mixer_patches(session: &mut Session, patches: &[TrackMixerPatch]) -> bool {
@@ -103,12 +250,12 @@ fn drain_daemon_track_mixer_patches(session: &mut Session) {
         .lock()
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
-    if patches.is_empty() {
-        return;
-    }
-    if apply_track_mixer_patches(session, &patches) {
+    if !patches.is_empty() && apply_track_mixer_patches(session, &patches) {
         let _ = session.save();
     }
+    // Always re-assert fresh authority so a just-written QS value wins over a
+    // stale UI echo that drained in the same handle() call.
+    overlay_track_mixer_authority(session);
 }
 
 /// Set by embedded IPC on `Shutdown` / tray Quit coordination.
@@ -392,10 +539,36 @@ impl DaemonState {
                 Event::SessionApplied {
                     session,
                     message,
-                    kind: _,
+                    kind,
                 } => {
-                    // Worker applied session is authoritative (tracks + inserts + sink names).
+                    // Topology-only applies often carry a stale gain/mute clone from
+                    // before a QS/UI fader move — keep live mixer bits unless this is
+                    // a full session load / clock replace.
+                    let keep_mixer = !matches!(
+                        kind,
+                        SessionAppliedKind::Full | SessionAppliedKind::Clock
+                    );
+                    let mixer: Vec<(Uuid, f32, bool)> = if keep_mixer {
+                        self.session
+                            .tracks
+                            .iter()
+                            .map(|t| (t.id, t.gain_db, t.mute))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    // Never reseed authority from ApplySession clones — those often
+                    // predate a QS/UI fader move and were wiping gain back to 0 dB.
+                    // Explicit SessionLoad calls seed_track_mixer_authority_from_session.
                     self.session = session;
+                    for (id, gain_db, mute) in mixer {
+                        if let Some(t) = self.session.tracks.iter_mut().find(|t| t.id == id)
+                        {
+                            t.gain_db = gain_db;
+                            t.mute = mute;
+                        }
+                    }
+                    overlay_track_mixer_authority(&mut self.session);
                     self.status_msg = message;
                 }
             }
@@ -991,10 +1164,13 @@ impl DaemonState {
                 let _ = self.session.save();
                 // Tray mixer strips read AppState.session — push so faders/dB labels update.
                 push_track_mixer_to_ui(track_id, gain, muted);
+                let rev = track_mixer_write_rev(track_id);
                 self.cmds.send(Command::SetTrackLevel {
                     sink,
                     gain_db: gain,
                     muted,
+                    mixer_mute: muted,
+                    rev,
                 });
                 crate::mixer_api::touch_mixer_tick();
                 Response::Ok {
@@ -1066,6 +1242,7 @@ impl DaemonState {
                         .map(|x| (x.name.clone(), x.description.clone()))
                         .collect();
                     let report = session::resolve_devices(&mut s, &sinks, &sources);
+                    seed_track_mixer_authority_from_session(&s);
                     self.session = s;
                     self.cmds
                         .send(Command::ApplySession(self.session.clone()));

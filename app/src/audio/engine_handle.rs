@@ -160,12 +160,16 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                 start_muted: true,
                 pulse_export,
             });
+            // Prefer sticky QS/UI fader authority over a stale ApplySession clone.
+            let (gain_db, track_mute) =
+                crate::daemon::track_mixer_authority_values(track.id)
+                    .unwrap_or((track.gain_db, track.mute));
             let mixer_mute =
-                track.mute || (any_solo && !track.solo && !track.kind.is_master());
+                track_mute || (any_solo && !track.solo && !track.kind.is_master());
             eng.desired_mut().set_bus_level(
                 &bus,
                 BusLevel {
-                    gain_db: track.gain_db,
+                    gain_db,
                     mixer_mute,
                 },
             );

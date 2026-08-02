@@ -289,6 +289,7 @@ impl AppState {
             self.params_track = None;
             self.pending_level_track = None;
             self.levels_pending_full = false;
+            crate::daemon::overlay_track_mixer_authority(&mut self.session);
             self.worker
                 .send(Command::ApplySession(self.session.clone()));
             self.graph_loading = true;
@@ -1104,13 +1105,19 @@ impl AppState {
                 .iter()
                 .any(|t| t.solo && !t.kind.is_master());
             for t in &self.session.tracks {
-                crate::daemon::push_track_mixer_to_daemon(t.id, t.gain_db, t.mute);
+                let (gain_db, mixer_mute) =
+                    crate::daemon::external_track_mixer_authority(t.id)
+                        .unwrap_or((t.gain_db, t.mute));
+                let rev =
+                    crate::daemon::push_track_mixer_to_daemon(t.id, gain_db, mixer_mute);
                 let muted =
-                    t.mute || (any_solo && !t.solo && !t.kind.is_master());
+                    mixer_mute || (any_solo && !t.solo && !t.kind.is_master());
                 self.worker.send(Command::SetTrackLevel {
                     sink: t.expected_sink_name(),
-                    gain_db: t.gain_db,
+                    gain_db,
                     muted,
+                    mixer_mute,
+                    rev,
                 });
             }
             return;
@@ -1124,15 +1131,25 @@ impl AppState {
                 .iter()
                 .any(|t| t.solo && !t.kind.is_master());
             if let Some(track) = self.session.tracks.iter().find(|t| t.id == track_id) {
+                // Prefer a just-written QS/ctl value if the local session lags a frame.
+                let (gain_db, mixer_mute) =
+                    crate::daemon::external_track_mixer_authority(track_id)
+                        .unwrap_or((track.gain_db, track.mute));
                 // Always address the deterministic bus — never skip when sink_name is None.
                 let sink = track.expected_sink_name();
                 let muted =
-                    track.mute || (any_solo && !track.solo && !track.kind.is_master());
-                crate::daemon::push_track_mixer_to_daemon(track_id, track.gain_db, track.mute);
+                    mixer_mute || (any_solo && !track.solo && !track.kind.is_master());
+                let rev = crate::daemon::push_track_mixer_to_daemon(
+                    track_id,
+                    gain_db,
+                    mixer_mute,
+                );
                 self.worker.send(Command::SetTrackLevel {
                     sink,
-                    gain_db: track.gain_db,
+                    gain_db,
                     muted,
+                    mixer_mute,
+                    rev,
                 });
             }
             // Clear only after a successful schedule; a new drag re-sets it.
@@ -1349,6 +1366,7 @@ impl AppState {
                     message,
                     ..
                 }) => {
+                    crate::daemon::seed_track_mixer_authority_from_session(&s);
                     self.adopt_session(s);
                     self.status = if message.is_empty() {
                         format!("Loaded session «{}»", self.session.name)
@@ -1368,6 +1386,7 @@ impl AppState {
             Ok(mut session) => {
                 let _ = crate::session::store::write_active_slug(slug);
                 self.apply_resolved_session(&mut session);
+                crate::daemon::seed_track_mixer_authority_from_session(&session);
                 self.adopt_session(session);
                 self.worker
                     .send(Command::ApplySession(self.session.clone()));
@@ -1481,11 +1500,19 @@ impl AppState {
             self.caps_probe_budget = 0;
         }
         self.drain_editor_params_into_session();
+        // Last intentional QS/UI write wins over any stale session clone.
+        crate::daemon::overlay_track_mixer_authority(&mut self.session);
         // Quickshell / ctl track vol → visual faders + dB readouts.
         for p in crate::daemon::take_track_mixer_ui_patches() {
             if let Some(t) = self.session.tracks.iter_mut().find(|t| t.id == p.track_id) {
                 t.gain_db = p.gain_db;
                 t.mute = p.mute;
+            }
+            crate::daemon::acknowledge_track_mixer_authority(p.track_id);
+            // Drop any in-flight local fader flush that still targets the old gain —
+            // otherwise flush_levels echoes it back to the daemon and QS snaps.
+            if self.pending_level_track == Some(p.track_id) {
+                self.pending_level_track = None;
             }
         }
 
@@ -1601,7 +1628,24 @@ impl AppState {
                             .iter()
                             .map(|t| (t.id, t.virtual_output))
                             .collect();
+                        // Keep live fader values across Full Apply — the worker
+                        // session clone often predates a QS/UI volume move.
+                        let mixer: Vec<(uuid::Uuid, f32, bool)> = self
+                            .session
+                            .tracks
+                            .iter()
+                            .map(|t| (t.id, t.gain_db, t.mute))
+                            .collect();
                         self.adopt_session(session);
+                        for (id, gain_db, mute) in mixer {
+                            if let Some(t) =
+                                self.session.tracks.iter_mut().find(|t| t.id == id)
+                            {
+                                t.gain_db = gain_db;
+                                t.mute = mute;
+                            }
+                        }
+                        crate::daemon::overlay_track_mixer_authority(&mut self.session);
                         // Persist ensure-flipped preferred / virtual_output after Full Apply.
                         let pref_changed =
                             self.session.preferred_default_sink != prev_pref;
