@@ -1,20 +1,20 @@
 # BusChain Control
 
 <p align="center">
-  <img src="docs/assets/hero.jpg" alt="BusChain Control — mixer, insert FX, and spectrum view" width="960" />
+  <img src="docs/assets/hero.jpg" alt="BusChain Control — mixer, inserts, builtins, and live spectrum" width="960" />
 </p>
 
-BusChain Control is a **PipeWire system mixer** for Linux. It aims for **DAW-grade control of the desktop audio graph** — tracks, insert FX, app routing, and sessions — without treating system sound as a second-class panel.
+**DAW-grade PipeWire mixer for Linux.** Route apps onto buses, stack insert FX, sync nested tracks when you need phase alignment, run plugins at a higher engine clock than your interface, and keep a named session that survives restarts — without treating system audio like a second-class volume slider.
 
-Route apps onto buses, stack builtins and LADSPA / LV2 / CLAP / VST3, expose virtual system I/O, drive Master HW from your bar, and save named layouts. Closing the window minimizes to the tray; right-click the icon → **Open BusChain Control** for the full mixer. Quit from the tray (or Settings) tears the graph down and restores hardware audio.
+Closing the window minimizes to the tray. Quit from the tray (or Settings) tears the graph down and restores hardware audio.
 
-**TLDR:** mixer tracks · **Direct** / synced Master fan-in · independent BusChain rate & quantum for FX · playback / capture racks · sealed wet FX · sticky virtual defaults · MIDI learn · Waybar / Quickshell / GTK shell hooks. Working daily driver on PipeWire (Hyprland primary); host APIs and crash-restore still deepening. Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
+**TLDR:** tracks · inserts (builtins + LADSPA / LV2 / CLAP / VST3) · **Direct** / synced Master fan-in · independent BusChain rate & quantum · playback / capture racks · sealed wet path · sticky virtual defaults · MIDI learn · Options (System + BusChain) · Waybar / Quickshell / GTK. Daily driver on PipeWire (Hyprland primary). Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
 
 ---
 
 ## Who it’s for
 
-- Linux users on **PipeWire** who want a real mixer for the desktop, not just a volume slider
+- PipeWire users who want a **real mixer** for the desktop, not just per-app sliders
 - Hyprland / Wayland rices (Quickshell, Waybar) and general desktops via GTK / egui popup
 - Anyone routing browsers, games, Discord, mics, and hardware through per-app buses with FX
 
@@ -49,13 +49,11 @@ environment.systemPackages = [
 # services.buschain-control.enable = true;
 ```
 
-One-shot:
-
 ```bash
 nix profile install github:teoscloud/buschain-control
 ```
 
-### Arch Linux
+### Arch / Debian / Ubuntu
 
 **Nix (simplest binaries)**
 
@@ -63,7 +61,8 @@ nix profile install github:teoscloud/buschain-control
 nix profile install github:teoscloud/buschain-control
 ```
 
-**From source**
+<details>
+<summary>Build from source (Arch)</summary>
 
 ```bash
 sudo pacman -S --needed rust cargo pkgconf openssl pipewire \
@@ -82,15 +81,10 @@ cp packaging/waybar/buschain-waybar packaging/mixer/buschain-mixer-gtk \
 chmod +x ~/.local/bin/buschain-*
 ```
 
-### Debian / Ubuntu
+</details>
 
-**Nix**
-
-```bash
-nix profile install github:teoscloud/buschain-control
-```
-
-**From source**
+<details>
+<summary>Build from source (Debian / Ubuntu)</summary>
 
 ```bash
 sudo apt update
@@ -114,6 +108,8 @@ cp packaging/waybar/buschain-waybar packaging/mixer/buschain-mixer-gtk \
 chmod +x ~/.local/bin/buschain-*
 ```
 
+</details>
+
 Use a current PipeWire session (`pipewire` + `pipewire-pulse`).
 
 ### From this checkout
@@ -132,10 +128,13 @@ cargo run -- --hidden    # tray + graph + IPC
 buschain-control --hidden
 ```
 
-- Closing the window minimizes to the tray.
-- Full mixer: right-click tray → **Open BusChain Control**. Left-click opens the compact popup.
-- Quit from the tray (or Settings) stops audio ownership and restores HW default.
-- CLI: `buschain-ctl status`
+| Action | What happens |
+|--------|----------------|
+| Close window | Minimize to tray (graph stays up) |
+| Tray left-click | Compact mixer popup (**QS → GTK → egui**) |
+| Tray right-click → **Open BusChain Control** | Full mixer |
+| Tray → Quit | Tear down graph + restore HW default |
+| `buschain-ctl status` / `popup` | CLI status / same popup router |
 
 Disable any old user systemd unit if you used one before:
 
@@ -145,66 +144,70 @@ systemctl --user disable --now buschain-control 2>/dev/null || true
 
 ---
 
-## Usage
+## What you’ll use day to day
 
-Start with `buschain-control --hidden` for autostart, or open normally and close to tray.
+| Goal | Where |
+|------|--------|
+| Full mixer + channel rack | Open BusChain Control |
+| Assign apps → tracks | **System → Playback** (or drag onto the rack) |
+| Capture / mics | **System → Recording** + track **In** rack |
+| Hardware speakers / mics clocks | **System → Output / Input** |
+| Engine rate & quantum (FX quality) | **BusChain → Settings → Audio** |
+| Appearance / themes | **BusChain → Settings → Appearance** |
+| MIDI learn | **BusChain → MIDI** |
+| Save / load layouts | **BusChain → Sessions** |
+| Sync nested Track→Track→Master | Channel rack → **Output** → turn **Direct** off |
+| Add / power / mix inserts | Channel rack → **INSERTS** |
+| Live spectrum | Bottom **SCOPE** (selected track, post-FX) |
 
-| Action | Behavior |
-|--------|----------|
-| Left-click tray | Compact mixer popup (**QS → GTK → egui**) |
-| Right-click → **Open BusChain Control** | Full mixer window |
-| Tray → Quit | Tear down graph + restore HW audio |
-| `buschain-ctl popup` / Waybar click | Same compact popup router |
-
-### Hyprland + Quickshell
-
-```conf
-# ~/.config/hypr/hyprland.conf
-exec-once = buschain-control --hidden
-env = BUSCHAIN_CONTROL_QS_MIXER,1
-env = BUSCHAIN_CONTROL_QS_STRIP,1
-```
-
-Waybar pill: merge [`packaging/waybar/module.jsonc`](packaging/waybar/module.jsonc) — **no** `on-scroll-*` (scroll belongs to the QS/GTK strip).
-
-Quickshell contract: [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md) · stubs in [`packaging/quickshell/`](packaging/quickshell/).
-
-### General desktop (no Quickshell)
-
-**GTK layer-shell** compact mixer when packaged; egui `--popup` as fallback.
-
-```bash
-export BUSCHAIN_CONTROL_USE_GTK_MIXER=0   # force egui popup
-export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
-```
-
-### Day-to-day
-
-| Action | How |
-|--------|-----|
-| Compact mixer | Left-click tray or Waybar pill |
-| Full mixer | Right-click → Open BusChain Control |
-| Assign app → track | Playback tab or drag onto channel rack |
-| Virtual system out | Track → Create system virtual output |
-| Add FX | Channel rack → Add plugin |
-| Sync nested buses | Channel rack → Output → turn **Direct** off |
-| Engine rate / quantum | Options → BusChain → Settings → Audio |
-| Save layout | Sessions → Save / Save as… |
-| Quit | Tray menu or Settings |
+Menus: **File** · **System** · **BusChain**. **Esc** closes Options; **Ctrl+S** saves the session.
 
 ### Tips
 
-- **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart the app after installing new plugins. Prefer a higher **BusChain engine** rate/quantum than HW when inserts need more quality headroom.
-- **Direct vs sync:** leave **Direct** on for games/desktop latency; turn it off on stems (and Master) when nested Track→Track→Master paths should align.
+- **Direct vs sync:** leave **Direct** on for games / desktop latency. Turn it off on stems (and Master) when nested buses should phase-align at Master.
+- **Engine vs HW clock:** run inserts hotter than the interface when you want quality headroom; egress (`buschain_rs_out_*`) downsamples to Master HW when they differ.
+- **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart after installing new plugins.
 - **Sticky default:** set **System default** on a virtual track once — after Quit/reopen, BusChain reasserts that sink and reclaims playback apps.
-- **Hollow desktop audio:** `buschain-ctl recover-audio` (restores HW + destroys leftover `buschain_*` PipeWire nodes), or `systemctl --user restart wireplumber` as a blunt recovery.
-- **Seal helpers in pavucontrol:** helpers are `Audio/Sink/Internal` by default; optional WirePlumber stamp via `scripts/install-wireplumber-rules.sh`.
+- **Hollow desktop audio:** `buschain-ctl recover-audio`, or `systemctl --user restart wireplumber` as a blunt recovery.
+- **Quiet pavucontrol lists:** helpers use `Audio/Sink/Internal`; optional WirePlumber stamp via `scripts/install-wireplumber-rules.sh`.
 
 ---
 
-## Compact mixer — Quickshell rice & default egui
+## Highlights
 
-Left-click the tray (or Waybar pill) for a compact mixer. Popup order is **Quickshell → GTK → egui**, so Hyprland rices can own the look while everyone else still gets a built-in panel.
+### Direct Out & synced tracks
+
+Nested **Track → Track → Master** routes can be delay-compensated at the Master edge (**GLC**) so buses stay phase-aligned instead of combing. Each track (and Master) has a **Direct** toggle:
+
+- **On** (default) — low-latency send; that stem skips the graph sync pad. Master Direct disables sync globally.
+- **Off** — enable Master fan-in sync for nested routes; the rack shows path / fx / pad / hw timing for the selected track.
+
+New buses inherit Master’s current Direct state. Contract: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).
+
+### Separated device & engine clocks
+
+| Clock | Where | Drives |
+|-------|--------|--------|
+| **Hardware** | System → Output / Input | Speakers / mics — force-rate, quantum, soft-quantum |
+| **BusChain engine** | BusChain → Settings → Audio | Tracks, inserts, Master bus (up through DXD 352.8 / 384 kHz) |
+
+**Master HW Apply** force-rates speakers only. Other devices use **Apply device clock** without forcing the whole graph.
+
+<p align="center">
+  <img src="docs/assets/device-clocks.png" alt="Output / Input — PipeWire device clock and quantum controls" width="480" />
+</p>
+
+### Mixer, FX & scope
+
+- Dynamic tracks with gain, mute jewels, phosphor meters, and a post-FX **SCOPE** for the selected track
+- Channel rack: apps, inserts (power / wet Mix / reorder), Direct, outputs
+- **Builtins** — EQ, Theatre Drive, Room, Soft Clipper, limiter, denoiser, pitch, and more (with live viz)
+- **Hosted** — LADSPA, LV2, CLAP, VST3 (in-process DSP; optional SHM sandbox; VST3 editors via `buschain-plugin-surface`)
+- Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → [glc δ?] → Master / tracks / HW`
+
+### Compact mixer — Quickshell rice & default egui
+
+Popup order is **Quickshell → GTK → egui**.
 
 <table>
   <tr>
@@ -219,64 +222,26 @@ Left-click the tray (or Waybar pill) for a compact mixer. Popup order is **Quick
   </tr>
 </table>
 
-Wire QS with `BUSCHAIN_CONTROL_QS_MIXER=1` and the stubs in [`packaging/quickshell/`](packaging/quickshell/) — contract: [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md).
+```conf
+# ~/.config/hypr/hyprland.conf
+exec-once = buschain-control --hidden
+env = BUSCHAIN_CONTROL_QS_MIXER,1
+env = BUSCHAIN_CONTROL_QS_STRIP,1
+```
 
----
+Waybar: [`packaging/waybar/module.jsonc`](packaging/waybar/module.jsonc) — **no** `on-scroll-*` (scroll belongs to the QS/GTK strip).  
+QS contract: [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md) · stubs in [`packaging/quickshell/`](packaging/quickshell/).
 
-## Device clocks & engine quality
-
-Most Linux desktop audio UIs bury or ignore **sample rate and quantum**. BusChain splits them:
-
-| Clock | Where | What it drives |
-|-------|--------|----------------|
-| **Hardware** | Output / Input tabs | Speakers / mics — force-rate, quantum, soft-quantum under load |
-| **BusChain engine** | Settings → Audio | Tracks, insert FX, Master bus — independent GraphClock (up through DXD 352.8 / 384 kHz) |
-
-Run the graph (and plugins) at a higher rate / tighter quantum than the interface when you want better FX quality; an egress converter (`buschain_rs_out_*`) downsamples to Master HW when the clocks differ. **Master HW Apply** force-rates speakers only. Other sinks/sources use **Apply device clock** without forcing the whole graph.
-
-<p align="center">
-  <img src="docs/assets/device-clocks.png" alt="Output / Input — PipeWire device clock and quantum controls" width="480" />
-</p>
-
----
-
-## Synced tracks & Direct Out
-
-Nested **Track → Track → Master** routes can be **delay-compensated** at the Master edge (GLC) so buses stay phase-aligned instead of combing. Desktop / game latency still matters, so each track (and Master) has a **Direct** toggle:
-
-- **Direct on** (default) — low-latency send; skips graph sync pad for that stem. Master Direct turns sync off globally.
-- **Direct off** — enable Master fan-in sync for nested routes; channel rack shows path / fx / pad / hw timing for the selected track.
-
-New buses inherit Master's current Direct state. Details: [`docs/TECHNICAL.md`](docs/TECHNICAL.md) (Master fan-in sync contract).
-
----
-
-## Features
-
-### Mixer & graph
-
-- Dynamic **tracks / buses** with mute, solo, listen, and gain
-- **Direct Out / synced Master fan-in** — low-latency Direct (default) or phase-aligned nested buses when Direct is off
-- **Playback** rack — pin apps onto tracks; reclaim onto sticky preferred default after restart
-- **Input** rack — multi HW capture, shared with the desktop / other tracks
-- **Virtual system output / input** — expose tracks as sinks or post-FX capture sources
-- **Desktop lists** — only Master + System virtual outputs / inputs in pavucontrol; helpers use `Audio/Sink/Internal` (sealed, still ported). Optional: `scripts/install-wireplumber-rules.sh`
-- Sealed wet path: `{bus}.monitor → buschain_fx_* → buschain_post_* → [glc δ?] → Master / tracks / HW`
-- **Separated clocks** — HW rate/quantum on Output/Input; BusChain engine rate/quantum under Settings → Audio for higher-quality plugin processing
-- Live hotplug and warm adopt when the graph already matches the session
-
-### Insert FX
-
-- **BusChain builtins** — EQ, Theatre Drive, Room, Soft Clipper, limiter, denoiser, pitch, and more
-- **Hosted formats** — LADSPA, LV2, CLAP, VST3 (in-process DSP; optional SHM sandbox)
-- Per-insert power, wet Mix, reorder; egui param UIs; native VST3 editors via `buschain-plugin-surface`
+```bash
+export BUSCHAIN_CONTROL_USE_GTK_MIXER=0   # force egui popup
+export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
+```
 
 ### Sessions, MIDI & shell
 
 - Named sessions under `~/.config/buschain-control/` with soft HW rebind
 - MIDI devices, routes, and CC learn → insert parameters
-- Waybar pill; compact popup order Quickshell → GTK → egui
-- Tabs: Mixer · Playback · Recording · Output · Input · MIDI · Sessions · Settings
+- Themes under Settings → Appearance (`~/.config/buschain-control/themes/`)
 
 ### Project state
 
@@ -284,6 +249,7 @@ New buses inherit Master's current Direct state. Details: [`docs/TECHNICAL.md`](
 |------|--------|
 | Mixer, routing, virtual I/O, sessions | Stable |
 | Built-in + hosted inserts / VST3 editors | Usable daily; host APIs still deepening |
+| Direct / GLC sync, engine↔HW clocks | Stable for daily use |
 | Compact popup (QS / GTK / egui) | Stable |
 | Distro packages (Arch/Debian repos) | Not yet — Nix or source |
 | Crash / `kill -9` audio restore | Still open (Quit path is solid) |
