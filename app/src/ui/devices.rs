@@ -455,6 +455,11 @@ pub fn draw_output_devices(ui: &mut egui::Ui, state: &mut AppState) {
                             state.session.master_output = Some(sink.name.clone());
                             state.session.master_output_desc =
                                 Some(sink.description.clone());
+                            crate::audio::graph::remember_desktop_hw(
+                                &mut state.session,
+                                &sink.name,
+                                Some(sink.description.as_str()),
+                            );
                             let _ = state.session.save();
                             // Light relink only — clock bind is explicit Apply.
                             state.worker.send(Command::SetMasterHw {

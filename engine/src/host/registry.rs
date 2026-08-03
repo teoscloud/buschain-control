@@ -390,6 +390,17 @@ pub fn teardown_host(bus: &str) {
     super::node_latency::apply_all_pdc_delays();
 }
 
+/// Drop every in-process FX host (PipeWire daemon restart / reconnect).
+pub fn teardown_all_hosts() {
+    let buses: Vec<String> = {
+        let reg = REGISTRY.lock().unwrap();
+        reg.keys().cloned().collect()
+    };
+    for bus in buses {
+        teardown_host(&bus);
+    }
+}
+
 /// Non-RT: set Master-bus PDC delay on the live host.
 pub fn set_host_pdc_delay(bus: &str, samples: u32) {
     let reg = REGISTRY.lock().unwrap();

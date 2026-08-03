@@ -745,6 +745,11 @@ fn draw_tab_output(ui: &mut egui::Ui, state: &mut AppState) {
                 if !is_app_bus && design::button(ui, &theme, "Set HW", is_master).clicked() {
                     state.session.master_output = Some(sink.name.clone());
                     state.session.master_output_desc = Some(sink.description.clone());
+                    crate::audio::graph::remember_desktop_hw(
+                        &mut state.session,
+                        &sink.name,
+                        Some(sink.description.as_str()),
+                    );
                     let _ = state.session.save();
                     state.worker.send(Command::SetMasterHw {
                         name: sink.name.clone(),

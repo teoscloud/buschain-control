@@ -8,6 +8,9 @@ use crate::plan::DesiredState;
 
 /// Move pinned apps onto their buses; reclaim unassigned user apps to preferred default.
 /// Native registry pass when up (sees Internal-hosted streams); single pactl pass otherwise.
+///
+/// Callers must ensure pin-target buses are Pulse-visible (`pulse_export`) before this
+/// runs — see `Engine::promote_pin_buses_pulse_export` / session `virtual_output`.
 pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
     let sinks = list_short_sinks();
     let inputs = if super::native::native_ready() {
@@ -27,13 +30,17 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
         if !sinks.iter().any(|(_, n)| n == bus) {
             continue;
         }
+        // Skip pin move until the target is Pulse-visible (or Master).
+        if !pin_bus_is_ready(bus, &sinks) {
+            continue;
+        }
         for k in keys {
             key_to_bus.insert(k.clone(), bus.clone());
         }
     }
 
     for si in &inputs {
-        if is_desktop_event_stream(&si.application, si.media_role.as_deref()) {
+        if is_anonymous_system_sound(si) {
             continue;
         }
         for (key, bus) in &key_to_bus {
@@ -63,10 +70,11 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
     for si in &inputs {
         // Hold is keepalive only — pull user streams off buschain_hold onto preferred.
         let on_hold = si.sink == "buschain_hold";
-        if si.internal && !on_hold {
+        let unlinked = si.sink.is_empty();
+        if si.internal && !on_hold && !unlinked {
             continue;
         }
-        if is_desktop_event_stream(&si.application, si.media_role.as_deref()) {
+        if is_anonymous_system_sound(si) {
             continue;
         }
         if key_to_bus.keys().any(|k| matches_key(si, k)) {
@@ -77,8 +85,9 @@ pub fn enforce_desired_playback(desired: &DesiredState) -> Result<u32> {
         }
         let on_buschain =
             si.sink.starts_with("buschain_") || si.sink.starts_with("shadow_");
-        // Reclaim HW → preferred BusChain, other buschain sinks / Hold → preferred.
-        if on_hold || on_buschain || pref_is_buschain {
+        // Reclaim Hold / other buschain / empty(unlinked) / HW → preferred when
+        // preferred is a BusChain VO (stream-restore often leaves apps on HW after quit).
+        if on_hold || on_buschain || unlinked || pref_is_buschain {
             if move_si(si.index, pref) {
                 moved += 1;
             }
@@ -98,16 +107,51 @@ struct Si {
     internal: bool,
 }
 
-/// Desktop event / notify streams — pavucontrol "System Sounds" + friends.
-/// Must not be reclaimed onto BusChain preferred sinks (strands corked copies).
-fn is_desktop_event_stream(application: &str, media_role: Option<&str>) -> bool {
-    if application.eq_ignore_ascii_case("System Sounds") {
+/// Anonymous System Sounds only — must not reclaim (strands corked copies).
+/// App-owned streams that happen to set `media.role=event|notify` (Discord
+/// notifications, Electron secondary streams) keep real `bin:` / `id:` / name
+/// identity and must follow preferred / pins like the main stream.
+fn is_anonymous_system_sound(si: &Si) -> bool {
+    if si.application.eq_ignore_ascii_case("System Sounds") {
         return true;
     }
-    matches!(
-        media_role.map(|r| r.to_ascii_lowercase()).as_deref(),
+    let is_event = matches!(
+        si.media_role
+            .as_deref()
+            .map(|r| r.to_ascii_lowercase())
+            .as_deref(),
         Some("event" | "notify" | "notification" | "alert")
+    );
+    if !is_event {
+        return false;
+    }
+    !has_app_identity(
+        &si.application,
+        si.binary.as_deref(),
+        si.app_id.as_deref(),
     )
+}
+
+fn has_app_identity(application: &str, binary: Option<&str>, app_id: Option<&str>) -> bool {
+    if let Some(b) = binary.filter(|s| !s.is_empty()) {
+        if !binary_is_generic(b) {
+            return true;
+        }
+    }
+    if app_id.is_some_and(|id| !id.is_empty()) {
+        return true;
+    }
+    !application.is_empty()
+        && !name_is_generic(application)
+        && !looks_like_stream_label(application)
+}
+
+fn looks_like_stream_label(s: &str) -> bool {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("Stream ") {
+        return rest.chars().all(|c| c.is_ascii_digit());
+    }
+    t.chars().all(|c| c.is_ascii_digit()) && !t.is_empty()
 }
 
 /// Generic runtimes whose binary is useless as an app identity.
@@ -218,7 +262,7 @@ fn list_short_sinks() -> Vec<(u32, String)> {
         }
     }
     // Non-exported / helper buses may be absent from pactl — merge registry names
-    // so PlaceApp/reclaim can still target non-VO tracks.
+    // so PlaceApp/reclaim can still target non-VO tracks after promote.
     if super::native::native_ready() {
         for name in super::native::list_sink_names() {
             if name.starts_with("buschain_") && !v.iter().any(|(_, n)| n == &name) {
@@ -227,6 +271,23 @@ fn list_short_sinks() -> Vec<(u32, String)> {
         }
     }
     v
+}
+
+/// Pulse-visible = appears in `pactl list short sinks`, or Master present in registry.
+fn pin_bus_is_ready(bus: &str, sinks: &[(u32, String)]) -> bool {
+    if let Ok(out) = std::process::Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+    {
+        if String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.split('\t').nth(1) == Some(bus))
+        {
+            return true;
+        }
+    }
+    // Master may briefly only exist in native registry during bring-up.
+    bus == "buschain_master" && sinks.iter().any(|(_, n)| n == bus)
 }
 
 /// Streams from the native registry — sees Internal-hosted streams pactl hides.
@@ -245,6 +306,19 @@ fn list_sink_inputs_native() -> Vec<Si> {
                 })
                 .unwrap_or_else(|| format!("Stream {}", s.serial));
             let media_role = s.media_role.clone();
+            let binary = s.binary.clone();
+            let app_id = s.app_id.clone();
+            let node_name = Some(s.node_name.clone()).filter(|n| !n.is_empty());
+            let anon = is_anonymous_system_sound(&Si {
+                index: s.serial,
+                sink: s.sink.clone(),
+                application: application.clone(),
+                binary: binary.clone(),
+                app_id: app_id.clone(),
+                node_name: node_name.clone(),
+                media_role: media_role.clone(),
+                internal: false,
+            });
             let internal = s.node_virtual
                 || s.sink.starts_with("buschain_fx_")
                 || s.sink.starts_with("buschain_post_")
@@ -257,14 +331,14 @@ fn list_sink_inputs_native() -> Vec<Si> {
                     .as_deref()
                     .is_some_and(|m| m.eq_ignore_ascii_case("buschain-control"))
                 || application.to_lowercase().contains("buschain")
-                || is_desktop_event_stream(&application, media_role.as_deref());
+                || anon;
             Si {
                 index: s.serial,
                 sink: s.sink,
                 application,
-                binary: s.binary,
-                app_id: s.app_id,
-                node_name: Some(s.node_name).filter(|n| !n.is_empty()),
+                binary,
+                app_id,
+                node_name,
                 media_role,
                 internal,
             }
@@ -296,19 +370,32 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
         let g = |k: &str| props.get(k).map(|s| s.trim_matches('"').to_string());
         let application = g("application.name")
             .filter(|s| !s.is_empty())
-            .or_else(|| g("media.name").filter(|m| {
-                let ml = m.to_lowercase();
-                ml != "playback" && ml != "buschain-control"
-            }))
+            .or_else(|| {
+                g("media.name").filter(|m| {
+                    let ml = m.to_lowercase();
+                    ml != "playback" && ml != "buschain-control"
+                })
+            })
             .unwrap_or_else(|| format!("Stream {index}"));
         let binary = g("application.process.binary").filter(|s| !s.is_empty());
         let app_id = g("application.id").filter(|s| !s.is_empty());
         let node_name = g("node.name").filter(|s| !s.is_empty());
         let media = g("media.name").unwrap_or_default();
         let media_role = g("media.role").filter(|s| !s.is_empty());
+        let probe = Si {
+            index,
+            sink: sink.clone(),
+            application: application.clone(),
+            binary: binary.clone(),
+            app_id: app_id.clone(),
+            node_name: node_name.clone(),
+            media_role: media_role.clone(),
+            internal: false,
+        };
+        let anon = is_anonymous_system_sound(&probe);
         // Hold is parking/keepalive — user streams there must be reclaimable.
         // FX/post/rs + BusChain-owned media stay internal.
-        // Event/notify roles are desktop "System Sounds" — never PlaceApp/reclaim.
+        // Anonymous System Sounds only — app-owned event roles stay reclaimable.
         let internal = sink.starts_with("buschain_fx_")
             || sink.starts_with("buschain_post_")
             || sink.starts_with("buschain_rs_")
@@ -317,7 +404,7 @@ fn list_sink_inputs(sinks: &[(u32, String)]) -> Result<Vec<Si>> {
             })
             || media.eq_ignore_ascii_case("buschain-control")
             || application.to_lowercase().contains("buschain")
-            || is_desktop_event_stream(&application, media_role.as_deref());
+            || anon;
         items.push(Si {
             index,
             sink,

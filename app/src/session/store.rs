@@ -266,30 +266,59 @@ pub fn resolve_devices(
 ) -> ResolveReport {
     let mut report = ResolveReport::default();
 
-    // Master HW out
+    // Master HW out — sticky like preferred buschain_*. After PipeWire restart the
+    // real card often appears a few hundred ms late; falling through to
+    // first_hw_sink flipped Master to HDMI/wrong device and idle soft_bind kept
+    // fighting a user-corrected choice.
     if let Some(name) = session.master_output.clone() {
-        if !sink_names.iter().any(|(n, _)| n == &name) {
-            let desc = session.master_output_desc.clone().unwrap_or_default();
-            let fallback = find_by_desc(sink_names, &desc)
-                .or_else(|| first_hw_sink(sink_names));
-            match fallback {
-                Some((n, d)) => {
-                    report.push(format!(
-                        "Master HW rebound {name} → {d}"
-                    ));
-                    session.master_output = Some(n);
-                    session.master_output_desc = Some(d);
-                }
-                None => {
-                    report.push(format!("Master HW missing ({name}) — cleared"));
-                    session.master_output = None;
+        if sink_names.iter().any(|(n, _)| n == &name) {
+            // Live — refresh description if we have a better one.
+            if let Some((_, d)) = sink_names.iter().find(|(n, _)| n == &name) {
+                if !d.is_empty() {
+                    session.master_output_desc = Some(d.clone());
                 }
             }
+        } else {
+            let desc = session.master_output_desc.clone().unwrap_or_default();
+            if let Some((n, d)) = find_by_desc(sink_names, &desc) {
+                report.push(format!("Master HW rebound {name} → {d}"));
+                session.master_output = Some(n);
+                session.master_output_desc = Some(d);
+            } else {
+                // Keep sticky name+desc until the device reappears — do not
+                // auto-pick first_hw_sink (wrong card after restart).
+                report.push(format!(
+                    "Master HW ({name}) not live yet — keeping sticky"
+                ));
+            }
         }
-    } else if let Some((n, d)) = first_hw_sink(sink_names) {
-        session.master_output = Some(n);
-        session.master_output_desc = Some(d);
-        report.push("Master HW auto-picked first hardware sink");
+    } else {
+        // Plug-n-play: desktop HW (pre-BusChain default) before first_hw_sink.
+        let seeded = session
+            .desktop_hw_sink
+            .clone()
+            .and_then(|n| {
+                sink_names
+                    .iter()
+                    .find(|(name, _)| name == &n)
+                    .cloned()
+                    .or_else(|| {
+                        find_by_desc(
+                            sink_names,
+                            session.desktop_hw_desc.as_deref().unwrap_or(""),
+                        )
+                    })
+            })
+            .or_else(|| first_hw_sink(sink_names));
+        if let Some((n, d)) = seeded {
+            session.master_output = Some(n.clone());
+            session.master_output_desc = Some(d.clone());
+            if session.desktop_hw_sink.is_none() {
+                session.desktop_hw_sink = Some(n);
+                session.desktop_hw_desc = Some(d);
+            }
+            report.push("Master HW seeded from desktop / first hardware sink");
+        }
     }
 
     // Preferred default — drop missing HW names; keep sticky buschain_* across
@@ -375,20 +404,12 @@ fn find_by_desc(nodes: &[(String, String)], desc: &str) -> Option<(String, Strin
     if desc.is_empty() {
         return None;
     }
-    let dl = desc.to_ascii_lowercase();
+    // Exact (case-insensitive) only — substring matches rebound Master/inputs
+    // onto generic "Analog Stereo" siblings after a PipeWire restart.
     nodes
         .iter()
         .find(|(_, d)| d.eq_ignore_ascii_case(desc))
         .cloned()
-        .or_else(|| {
-            nodes
-                .iter()
-                .find(|(_, d)| {
-                    let x = d.to_ascii_lowercase();
-                    x.contains(&dl) || dl.contains(&x)
-                })
-                .cloned()
-        })
 }
 
 pub fn ensure_sessions_dir() -> Result<()> {

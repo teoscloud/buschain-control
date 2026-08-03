@@ -102,45 +102,169 @@ struct PlaneInner {
     tx: pw::channel::Sender<Rpc>,
     view: SharedView,
     ready: Arc<AtomicBool>,
-    _join: JoinHandle<()>,
+    join: JoinHandle<()>,
 }
 
-static PLANE: OnceLock<Result<PlaneInner, String>> = OnceLock::new();
+/// Reconnectable control plane (survives `systemctl restart pipewire`).
+struct PlaneSlot {
+    plane: Option<PlaneInner>,
+}
 
-/// Shared registry view (None when plane failed to start).
+static PLANE: OnceLock<std::sync::Mutex<PlaneSlot>> = OnceLock::new();
+static PLANE_DEAD: AtomicBool = AtomicBool::new(false);
+static PLANE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn plane_mutex() -> &'static std::sync::Mutex<PlaneSlot> {
+    PLANE.get_or_init(|| std::sync::Mutex::new(PlaneSlot { plane: None }))
+}
+
+/// Shared registry view (None when plane is absent / dead).
 pub fn shared_view() -> Option<SharedView> {
-    match PLANE.get_or_init(start_plane) {
-        Ok(p) => Some(Arc::clone(&p.view)),
-        Err(_) => None,
+    let _ = ensure_plane_started();
+    if PLANE_DEAD.load(Ordering::Acquire) {
+        return None;
     }
+    let g = plane_mutex().lock().ok()?;
+    g.plane.as_ref().map(|p| Arc::clone(&p.view))
 }
 
 pub fn is_ready() -> bool {
-    PLANE
-        .get_or_init(start_plane)
+    if PLANE_DEAD.load(Ordering::Acquire) {
+        return false;
+    }
+    let _ = ensure_plane_started();
+    let Ok(g) = plane_mutex().lock() else {
+        return false;
+    };
+    g.plane
         .as_ref()
-        .map(|p| p.ready.load(Ordering::Acquire))
-        .unwrap_or(false)
+        .is_some_and(|p| p.ready.load(Ordering::Acquire))
 }
 
-fn sender() -> Result<&'static pw::channel::Sender<Rpc>> {
-    match PLANE.get_or_init(start_plane) {
-        Ok(p) => Ok(&p.tx),
-        Err(e) => Err(anyhow!("native PipeWire control plane: {e}")),
+/// True after core death / mainloop exit until [`reconnect_plane`] succeeds.
+pub fn plane_is_dead() -> bool {
+    PLANE_DEAD.load(Ordering::Acquire)
+}
+
+/// Control-plane generation — bumps on each successful reconnect.
+pub fn plane_generation() -> u64 {
+    PLANE_GEN.load(Ordering::Acquire)
+}
+
+/// Mark the native plane dead and wipe the registry cache (do not spawn yet).
+pub fn mark_dead(reason: &str) {
+    eprintln!("[buschain] native PW plane dead: {reason}");
+    PLANE_DEAD.store(true, Ordering::Release);
+    if let Ok(g) = plane_mutex().lock() {
+        if let Some(p) = g.plane.as_ref() {
+            p.ready.store(false, Ordering::Release);
+            if let Ok(mut v) = p.view.write() {
+                v.clear();
+            }
+        }
     }
+}
+
+/// Shut down the current MainLoop (if any) and start a fresh control plane.
+pub fn reconnect_plane() -> Result<()> {
+    // Take ownership of the old plane outside the lock while joining.
+    let old = {
+        let mut g = plane_mutex()
+            .lock()
+            .map_err(|_| anyhow!("native PW plane lock poisoned"))?;
+        g.plane.take()
+    };
+    if let Some(old) = old {
+        old.ready.store(false, Ordering::Release);
+        if let Ok(mut v) = old.view.write() {
+            v.clear();
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let _ = old.tx.send(Rpc::Shutdown { reply: reply_tx });
+        let _ = reply_rx.recv_timeout(Duration::from_secs(2));
+        // MainLoop may already be gone — don't block forever on join.
+        let _ = old.join.join();
+    }
+    PLANE_DEAD.store(false, Ordering::Release);
+    let new_plane = start_plane().map_err(|e| anyhow!("reconnect plane: {e}"))?;
+    if !new_plane.ready.load(Ordering::Acquire) {
+        PLANE_DEAD.store(true, Ordering::Release);
+        return Err(anyhow!("reconnect plane: registry sync did not become ready"));
+    }
+    {
+        let mut g = plane_mutex()
+            .lock()
+            .map_err(|_| anyhow!("native PW plane lock poisoned"))?;
+        g.plane = Some(new_plane);
+    }
+    PLANE_GEN.fetch_add(1, Ordering::AcqRel);
+    eprintln!("[buschain] native PW plane reconnected (gen={})", plane_generation());
+    Ok(())
+}
+
+fn ensure_plane_started() -> Result<()> {
+    if PLANE_DEAD.load(Ordering::Acquire) {
+        return Err(anyhow!("native PipeWire control plane is dead (awaiting reconnect)"));
+    }
+    {
+        let g = plane_mutex()
+            .lock()
+            .map_err(|_| anyhow!("native PW plane lock poisoned"))?;
+        if g.plane
+            .as_ref()
+            .is_some_and(|p| p.ready.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        if g.plane.is_some() {
+            // Starting or half-up — not ready yet.
+            return Err(anyhow!("native PipeWire control plane not ready"));
+        }
+    }
+    let new_plane = start_plane().map_err(|e| anyhow!("native PipeWire control plane: {e}"))?;
+    let mut g = plane_mutex()
+        .lock()
+        .map_err(|_| anyhow!("native PW plane lock poisoned"))?;
+    if g.plane.is_none() {
+        g.plane = Some(new_plane);
+        PLANE_GEN.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(())
 }
 
 fn call<T>(build: impl FnOnce(SyncSender<T>) -> Rpc, timeout: Duration) -> Result<T>
 where
     T: Send + 'static,
 {
-    let tx = sender()?;
+    ensure_plane_started()?;
+    if PLANE_DEAD.load(Ordering::Acquire) {
+        return Err(anyhow!("native PW control plane is dead"));
+    }
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(build(reply_tx))
-        .map_err(|_| anyhow!("native PW control plane channel closed"))?;
-    reply_rx
-        .recv_timeout(timeout)
-        .map_err(|_| anyhow!("native PW RPC timed out after {timeout:?}"))
+    let rpc = build(reply_tx);
+    {
+        let g = plane_mutex()
+            .lock()
+            .map_err(|_| anyhow!("native PW plane lock poisoned"))?;
+        let p = g
+            .plane
+            .as_ref()
+            .ok_or_else(|| anyhow!("native PW control plane missing"))?;
+        if !p.ready.load(Ordering::Acquire) {
+            return Err(anyhow!("native PW control plane not ready"));
+        }
+        p.tx
+            .send(rpc)
+            .map_err(|_| anyhow!("native PW control plane channel closed"))?;
+    }
+    match reply_rx.recv_timeout(timeout) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            // Sustained timeout often means the daemon died under us.
+            mark_dead("rpc timeout");
+            Err(anyhow!("native PW RPC timed out after {timeout:?}"))
+        }
+    }
 }
 
 pub fn ensure_link(source: &str, sink: &str) -> Result<()> {
@@ -314,13 +438,21 @@ fn start_plane() -> Result<PlaneInner, String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<pw::channel::Sender<Rpc>, String>>(1);
     let view_thread = Arc::clone(&view);
     let ready_flag = Arc::clone(&ready);
+    let view_on_exit = Arc::clone(&view);
 
     let join = thread::Builder::new()
         .name("buschain-pw-ctrl".into())
         .spawn(move || {
-            if let Err(e) = run_loop(view_thread, ready_flag, ready_tx) {
-                // ready_tx may already have fired; ignore.
-                let _ = e;
+            let result = run_loop(view_thread, Arc::clone(&ready_flag), ready_tx);
+            ready_flag.store(false, Ordering::Release);
+            PLANE_DEAD.store(true, Ordering::Release);
+            if let Ok(mut v) = view_on_exit.write() {
+                v.clear();
+            }
+            if let Err(e) = result {
+                eprintln!("[buschain] native PW mainloop exited: {e:#}");
+            } else {
+                eprintln!("[buschain] native PW mainloop exited");
             }
         })
         .map_err(|e| format!("spawn pw-ctrl: {e}"))?;
@@ -343,7 +475,7 @@ fn start_plane() -> Result<PlaneInner, String> {
         tx,
         view,
         ready,
-        _join: join,
+        join,
     })
 }
 
@@ -422,6 +554,7 @@ fn run_loop(
     let ready_flag = Arc::clone(&ready);
     let pending = state.core.sync(0).context("initial sync")?;
     let st_done = Rc::clone(&state);
+    let ready_on_err = Arc::clone(&ready);
     let _core_l = state
         .core
         .add_listener_local()
@@ -439,6 +572,13 @@ fn run_loop(
                         cb(&st_done);
                     }
                 }
+            }
+        })
+        .error(move |id, _seq, res, message| {
+            if id == pw::core::PW_ID_CORE {
+                eprintln!("[buschain] PW core error: res={res} msg={message}");
+                ready_on_err.store(false, Ordering::Release);
+                PLANE_DEAD.store(true, Ordering::Release);
             }
         })
         .register();
@@ -1294,13 +1434,9 @@ mod tests {
         {
             return;
         }
-        match PLANE.get_or_init(start_plane) {
-            Ok(_p) => {
-                // Connected; registry fill may still be racing the first sync.
-            }
-            Err(e) => {
-                eprintln!("native PW plane unavailable (ok in CI): {e}");
-            }
+        match ensure_plane_started() {
+            Ok(()) => {}
+            Err(e) => eprintln!("native PW plane unavailable (ok in CI): {e}"),
         }
     }
 }

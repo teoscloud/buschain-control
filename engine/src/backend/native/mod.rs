@@ -33,7 +33,8 @@ pub use session::{
     cache_node_id as native_cache_node_id, ensure_link as native_ensure_link,
     ensure_null_sink as session_ensure_null_sink, find_node_id as native_find_node_id,
     graph_generation, is_ready as native_ready, link_is_live as native_link_is_live,
-    list_playback_streams, list_sink_names, retarget_stream_serial, retarget_streams,
+    list_playback_streams, list_sink_names, mark_dead as native_mark_dead,
+    plane_generation, plane_is_dead, reconnect_plane, retarget_stream_serial, retarget_streams,
     set_levels as native_set_levels, sink_exists as native_sink_exists, stream_targets_sink,
     unlink as native_unlink, PlaybackStreamInfo,
 };

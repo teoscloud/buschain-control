@@ -170,7 +170,14 @@ pub fn ensure_fx_chain(
     }
 
     if arm_egress && !plan.dest.is_empty() {
-        let dests = [plan.dest.clone()];
+        // Prefer full Desired egress (Master + peers), not only ChainSpec.dest —
+        // a single-dest arm left DualMic on hold when dest briefly mismatched.
+        let dests = desired.egress_dests(bus);
+        let dests = if dests.is_empty() {
+            vec![plan.dest.clone()]
+        } else {
+            dests
+        };
         let _ = arm_track_egress(backend, desired, clock, bus, true, &dests);
     }
 

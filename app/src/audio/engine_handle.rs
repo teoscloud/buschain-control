@@ -162,8 +162,11 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             if !track.kind.is_master() && track.direct_out {
                 eng.desired_mut().glc_direct.insert(bus.clone());
             }
-            // Master always public; tracks only when System virtual output is on.
-            let pulse_export = track.kind.is_master() || track.virtual_output;
+            // Master always public; tracks when VO is on OR Apps-rack pins exist
+            // (pins require Pulse-visible Audio/Sink — same invariant as PlaceApp).
+            let pulse_export = track.kind.is_master()
+                || track.virtual_output
+                || !track.assigned_playback.is_empty();
             eng.desired_mut().ensure_bus(NodeSpec {
                 name: NodeName::new(&bus),
                 description: desc.clone(),
@@ -289,10 +292,63 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                 let _ = eng.teardown_fx_chain(&bus);
             }
         }
-        // Stale FX/Route session snapshots must not clear a hot mute latch and
-        // re-arm DualMic→Master while the UI LED is still red.
+        // Session / mixer authority owns mute. Align latches to what we just wrote
+        // so a prior DualMic mute cannot survive unmute and strip post→Master while
+        // FX meters stay live. Then reinforce only still-latched (UI-muted) buses.
+        eng.align_mute_latches_to_desired();
         eng.reinforce_mute_latches();
     });
+}
+
+/// After PipeWire daemon restart: reconnect native plane is caller's job;
+/// this tears FX hosts and cold-arms Desired (`force_fx`).
+pub fn reconnect_pipewire_graph(session: &mut Session) -> anyhow::Result<String> {
+    let _ = session.ensure_assigned_playback_vo();
+    let _ = session.ensure_buschain_preferred_default();
+    // Sticky Master, else desktop / non-BusChain system default (plug-n-play).
+    let hw = session
+        .master_output
+        .clone()
+        .filter(|n| !n.is_empty() && !n.starts_with("buschain_"))
+        .or_else(|| crate::audio::graph::seed_master_hw_plug_and_play(session))
+        .or_else(|| crate::audio::graph::resolve_hardware_output(session).ok())
+        .unwrap_or_default();
+    if hw.is_empty() {
+        return Err(anyhow::anyhow!(
+            "PipeWire reconnect: no Master HW sink in session"
+        ));
+    }
+    crate::audio::engine_handle::remember_master_hw(&hw);
+    session.master_output = Some(hw.clone());
+    let desc = session.master_output_desc.clone();
+    crate::audio::graph::remember_desktop_hw(session, &hw, desc.as_deref());
+    sync_desired_from_session(session, &hw);
+    let (msg, buses) = with_engine(|eng| {
+        let report = eng.apply(Intent::ReconnectPipeWire)?;
+        let buses: Vec<String> = eng.desired().buses.keys().cloned().collect();
+        Ok::<_, anyhow::Error>((report.join(), buses))
+    })?;
+    for bus in &buses {
+        let wet = with_engine(|eng| eng.chain_is_wet(bus));
+        set_wet_cached(bus, wet);
+    }
+    for track in &session.tracks {
+        let bus = track.expected_sink_name();
+        if track.inserts.is_empty() {
+            continue;
+        }
+        if let Some(spec) =
+            crate::audio::insert_map::chain_spec_for_track(session, track.id, &hw)
+        {
+            let _ = with_engine(|eng| eng.push_fx_controls(&bus, spec.inserts));
+        }
+    }
+    let _ = crate::audio::graph::apply_track_levels(session);
+    if let Some(pref) = session.preferred_default_sink.clone() {
+        let _ = crate::audio::graph::set_default_sink_if_needed(&pref);
+    }
+    let _ = sync_playback(session);
+    Ok(msg)
 }
 
 /// Full Apply / launch — warm-adopts a healthy live graph; otherwise sealed cold arm.
@@ -583,7 +639,9 @@ pub fn patch_bus_playback(session: &Session, track_id: uuid::Uuid) {
 }
 
 /// One-shot Apps place: sync Desired → `Intent::SyncPlayback` (single list pass).
-pub fn sync_playback(session: &Session) -> anyhow::Result<String> {
+pub fn sync_playback(session: &mut Session) -> anyhow::Result<String> {
+    // Pins require Pulse-visible VO buses — same invariant as PlaceApp.
+    let _ = session.ensure_assigned_playback_vo();
     let hw = crate::audio::graph::resolve_hardware_output(session)
         .unwrap_or_else(|_| session.master_output.clone().unwrap_or_default());
     sync_desired_from_session(session, &hw);

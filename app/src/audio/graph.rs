@@ -503,13 +503,23 @@ fn stream_from_props(index: u32, props: &[(String, String)], sink_key: &str) -> 
 
     let name = media.clone().unwrap_or_else(|| application.clone());
     let media_role = prop_key(props, "media.role").map(clean_pw_str);
-    // Desktop event streams — pavucontrol "System Sounds"; never Apps/reclaim bait.
+    // Anonymous System Sounds only — app-owned event/notify streams (Discord
+    // notifications, Electron secondary) keep real bin:/id:/name identity and
+    // must stay visible for Apps rack + reclaim onto preferred.
+    let event_role = matches!(
+        media_role.as_deref().map(|r| r.to_ascii_lowercase()).as_deref(),
+        Some("event" | "notify" | "notification" | "alert")
+    );
+    let has_identity = binary
+        .as_deref()
+        .is_some_and(|b| !b.is_empty() && !binary_is_generic(b))
+        || app_id.as_deref().is_some_and(|id| !id.is_empty())
+        || (!application.is_empty()
+            && !name_is_generic(&application)
+            && !looks_like_stream_id_label(&application));
     let desktop_event = application.eq_ignore_ascii_case("System Sounds")
         || restore == "sink-input-by-media-role:event"
-        || matches!(
-            media_role.as_deref().map(|r| r.to_ascii_lowercase()).as_deref(),
-            Some("event" | "notify" | "notification" | "alert")
-        );
+        || (event_role && !has_identity);
 
     let internal = virtual_node
         || desktop_event
@@ -866,6 +876,57 @@ pub fn set_default_sink_if_needed(name: &str) -> Result<bool> {
     Ok(pactl_info_default("Default Sink:").as_deref() == Some(name))
 }
 
+/// True when `pactl info` succeeds (pipewire-pulse is answering).
+pub fn pulse_daemon_up() -> bool {
+    std::process::Command::new("pactl")
+        .args(["info"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Block until Pulse answers or `timeout` elapses (PipeWire restart settle).
+pub fn wait_for_pipewire(timeout: std::time::Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut backoff = std::time::Duration::from_millis(200);
+    while std::time::Instant::now() < deadline {
+        if pulse_daemon_up() {
+            return Ok(());
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
+    Err(anyhow!(
+        "PipeWire/Pulse did not come back within {timeout:?}"
+    ))
+}
+
+/// Session owns a mixer but `buschain_master` is missing / native plane is dead
+/// while desktop PipeWire is already up — needs [`Command::ReconnectPipeWire`].
+pub fn session_graph_is_hollow(session: &crate::session::Session) -> bool {
+    if session.tracks.is_empty() {
+        return false;
+    }
+    // Never treat cold first-bring-up as hollow — only when we previously stamped
+    // live buses or a sticky BusChain preferred default.
+    let expected_live = session
+        .preferred_default_sink
+        .as_deref()
+        .is_some_and(|p| p.starts_with("buschain_") || p.starts_with("shadow_"))
+        || session.tracks.iter().any(|t| t.sink_name.is_some());
+    if !expected_live {
+        return false;
+    }
+    // Still mid-restart — not hollow yet (detector waits for Pulse up).
+    if !pulse_daemon_up() {
+        return false;
+    }
+    if buschain_engine::backend::plane_is_dead() || !buschain_engine::backend::native_ready() {
+        return true;
+    }
+    !buschain_engine::backend::sink_exists("buschain_master")
+}
+
 pub fn set_default_source(name: &str) -> Result<()> {
     run_ok("pactl", &["set-default-source", name])
 }
@@ -1119,6 +1180,117 @@ fn is_real_hw_sink(name: &str) -> bool {
         && !name.contains("auto_null")
 }
 
+/// Live Pulse Default Sink when it is real hardware (not a BusChain bus).
+pub fn current_desktop_hw_default() -> Option<(String, String)> {
+    let def = pactl_info_default("Default Sink:")?;
+    if !is_real_hw_sink(&def) {
+        return None;
+    }
+    let sinks = list_sinks().unwrap_or_default();
+    let desc = sinks
+        .iter()
+        .find(|s| s.name == def)
+        .map(|s| s.description.clone())
+        .unwrap_or_default();
+    if sinks.iter().any(|s| s.name == def) {
+        Some((def, desc))
+    } else {
+        None
+    }
+}
+
+/// Remember a desktop (non-BusChain) HW sink — quit restore + Master seed.
+pub fn remember_desktop_hw(session: &mut Session, name: &str, desc: Option<&str>) {
+    if !is_real_hw_sink(name) {
+        return;
+    }
+    session.desktop_hw_sink = Some(name.to_string());
+    if let Some(d) = desc.filter(|s| !s.is_empty()) {
+        session.desktop_hw_desc = Some(d.to_string());
+    } else if session.desktop_hw_desc.is_none() {
+        if let Ok(sinks) = list_sinks() {
+            if let Some(s) = sinks.iter().find(|s| s.name == name) {
+                if !s.description.is_empty() {
+                    session.desktop_hw_desc = Some(s.description.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Capture Pulse's non-BusChain default into `desktop_hw_*` when available.
+/// Returns the captured (name, desc) pair.
+pub fn capture_desktop_hw_default(session: &mut Session) -> Option<(String, String)> {
+    let (name, desc) = current_desktop_hw_default()?;
+    remember_desktop_hw(session, &name, Some(desc.as_str()).filter(|s| !s.is_empty()));
+    Some((name, desc))
+}
+
+/// Plug-n-play Master HW seeding.
+///
+/// - Always capture a live non-BusChain Pulse default into `desktop_hw_*`.
+/// - Never overwrite an existing sticky `master_output` (even if not live yet).
+/// - When Master is empty, adopt desktop HW (live or persisted).
+///
+/// Call on cold Apply / start. For reconnect after a wait, also call
+/// [`adopt_desktop_as_master`] when sticky Master never became live.
+pub fn seed_master_hw_plug_and_play(session: &mut Session) -> Option<String> {
+    let _ = capture_desktop_hw_default(session);
+
+    if let Some(m) = session
+        .master_output
+        .clone()
+        .filter(|n| is_real_hw_sink(n))
+    {
+        // Keep sticky Master; mirror into desktop_hw for quit restore.
+        let desc = session.master_output_desc.clone();
+        remember_desktop_hw(session, &m, desc.as_deref());
+        return Some(m);
+    }
+
+    adopt_desktop_as_master(session)
+}
+
+/// Set Master HW from the remembered / live desktop system default.
+pub fn adopt_desktop_as_master(session: &mut Session) -> Option<String> {
+    let sinks = list_sinks().unwrap_or_default();
+    let sink_live = |name: &str| sinks.iter().any(|s| s.name == name);
+
+    let picked = capture_desktop_hw_default(session).or_else(|| {
+        let name = session.desktop_hw_sink.clone()?;
+        if !is_real_hw_sink(&name) {
+            return None;
+        }
+        let desc = session.desktop_hw_desc.clone().unwrap_or_default();
+        if sink_live(&name) {
+            return Some((name, desc));
+        }
+        resolve_device(
+            Some(&name),
+            session.desktop_hw_desc.as_deref(),
+            &sinks,
+            |d| is_real_hw_sink(&d.name),
+        )
+        .map(|n| {
+            let d = sinks
+                .iter()
+                .find(|s| s.name == n)
+                .map(|s| s.description.clone())
+                .unwrap_or(desc);
+            (n, d)
+        })
+    })?;
+
+    let (name, desc) = picked;
+    session.master_output = Some(name.clone());
+    if !desc.is_empty() {
+        session.master_output_desc = Some(desc);
+    }
+    let master_desc = session.master_output_desc.clone();
+    remember_desktop_hw(session, &name, master_desc.as_deref());
+    Some(name)
+}
+
 fn resolve_restore_hw_sink(preferred_hw: Option<&str>) -> Option<String> {
     let sinks = list_sinks().unwrap_or_default();
     if let Some(pref) = preferred_hw {
@@ -1126,6 +1298,8 @@ fn resolve_restore_hw_sink(preferred_hw: Option<&str>) -> Option<String> {
             return Some(pref.to_string());
         }
     }
+    // Prefer remembered desktop HW (pre-BusChain / Master) over arbitrary first card.
+    // Caller may pass session.master_output; desktop is handled via preferred_hw from restore.
     if let Some(cur) = pactl_info_default("Default Sink:") {
         if is_real_hw_sink(&cur) && sinks.iter().any(|s| s.name == cur) {
             return Some(cur);
@@ -1311,13 +1485,45 @@ pub fn restore_system_audio(preferred_hw: Option<&str>) -> Result<String> {
     let _ = buschain_engine::backend::unload_buschain_pulse_loopbacks();
 
     let mut moved = 0u32;
+    let mut moved_serials: std::collections::HashSet<u32> = std::collections::HashSet::new();
     if let Some(ref hw) = hw_sink {
+        // Native retarget by sink NAME first — writes resolvable `target.object` to HW
+        // before BusChain nodes are destroyed. Leaving a dead buschain_* target corks
+        // Chromium/Electron until the app recreates its stream.
+        if buschain_engine::backend::native_ready() {
+            for stream in buschain_engine::backend::list_playback_streams() {
+                let on_bc = stream.sink.starts_with("buschain_")
+                    || stream.sink.starts_with("shadow_");
+                if !on_bc {
+                    continue;
+                }
+                if stream.node_name.starts_with("buschain_")
+                    || stream
+                        .media_name
+                        .as_deref()
+                        .is_some_and(|m| m.eq_ignore_ascii_case("buschain-control"))
+                {
+                    continue;
+                }
+                if buschain_engine::backend::pulse_compat::move_sink_input(stream.serial, hw)
+                    .unwrap_or(false)
+                {
+                    if moved_serials.insert(stream.serial) {
+                        moved += 1;
+                    }
+                }
+            }
+        }
         if let Ok(inputs) = list_sink_inputs() {
             for si in inputs {
                 if si.sink_or_source.starts_with("buschain_")
                     || si.sink_or_source.starts_with("shadow_")
                 {
+                    if moved_serials.contains(&si.index) {
+                        continue;
+                    }
                     if move_sink_input(si.index, hw).is_ok() {
+                        moved_serials.insert(si.index);
                         moved += 1;
                     }
                 }
@@ -1832,7 +2038,11 @@ pub fn apply_track_levels(session: &Session) -> Result<()> {
     Ok(())
 }
 
-/// Fuzzy-match a device by saved name and/or description (PipeWire renames often).
+/// Match a device by saved name and/or description (PipeWire renames often).
+///
+/// Exact name / exact description (case-insensitive) first, then stable USB id
+/// chunks in the node name. Never use substring description matches — generic
+/// labels like "Analog Stereo" rebound Master HW to the wrong card after restart.
 pub fn resolve_device(
     preferred_name: Option<&str>,
     preferred_desc: Option<&str>,
@@ -1848,34 +2058,16 @@ pub fn resolve_device(
             return Some(d.name.clone());
         }
     }
-    if let Some(desc) = preferred_desc {
-        let desc_l = desc.to_lowercase();
-        if let Some(d) = devices.iter().find(|d| d.description == *desc) {
-            return Some(d.name.clone());
-        }
+    if let Some(desc) = preferred_desc.filter(|d| !d.is_empty()) {
         if let Some(d) = devices
             .iter()
-            .find(|d| d.description.to_lowercase() == desc_l)
+            .find(|d| d.description.eq_ignore_ascii_case(desc))
         {
-            return Some(d.name.clone());
-        }
-        if let Some(d) = devices.iter().find(|d| {
-            let dd = d.description.to_lowercase();
-            !desc_l.is_empty() && (dd.contains(&desc_l) || desc_l.contains(&dd))
-        }) {
             return Some(d.name.clone());
         }
     }
     if let Some(name) = preferred_name {
-        // alsa_output.pci-0000_0x.HiFi__hw_xxx__sink ↔ partial / reordered
-        let name_l = name.to_lowercase();
-        if let Some(d) = devices.iter().find(|d| {
-            let n = d.name.to_lowercase();
-            n.contains(&name_l) || name_l.contains(&n)
-        }) {
-            return Some(d.name.clone());
-        }
-        // Match stable USB id chunks
+        // Match stable USB / card id chunks (e.g. Focusrite_Scarlett_Solo_…)
         for part in name.split(['.', '_', '-']).filter(|p| p.len() >= 6) {
             let p = part.to_lowercase();
             if let Some(d) = devices.iter().find(|d| d.name.to_lowercase().contains(&p)) {
@@ -1888,11 +2080,26 @@ pub fn resolve_device(
 
 /// Real hardware (or non-BusChain) sink Master should play to.
 /// Never returns a `buschain_*` sink — those are mixer buses, not devices.
+///
+/// When the session already remembers a Master HW preference, do **not** fall
+/// through to Pulse Default Sink / first card — that flipped Master after
+/// PipeWire restart while the real device was still enumerating.
+///
+/// With no Master preference: desktop_hw (pre-BusChain default) → live
+/// non-BusChain Default Sink → first HW.
 pub fn resolve_hardware_output(session: &Session) -> Result<String> {
     let sinks = list_sinks().unwrap_or_default();
-    let is_hw = |d: &DeviceNode| {
-        !d.name.starts_with("buschain_") && !d.name.is_empty()
-    };
+    let is_hw = |d: &DeviceNode| is_real_hw_sink(&d.name);
+
+    let sticky = session
+        .master_output
+        .as_deref()
+        .filter(|n| is_real_hw_sink(n));
+    let has_preference = sticky.is_some()
+        || session
+            .master_output_desc
+            .as_deref()
+            .is_some_and(|d| !d.is_empty());
 
     if let Some(name) = resolve_device(
         session.master_output.as_deref(),
@@ -1902,14 +2109,29 @@ pub fn resolve_hardware_output(session: &Session) -> Result<String> {
     ) {
         return Ok(name);
     }
+    if has_preference {
+        return Err(anyhow!(
+            "Master HW ({}) not available yet",
+            sticky.unwrap_or("preferred")
+        ));
+    }
+    // Plug-n-play: remembered desktop (pre-BusChain) system default.
+    if let Some(name) = resolve_device(
+        session.desktop_hw_sink.as_deref(),
+        session.desktop_hw_desc.as_deref(),
+        &sinks,
+        is_hw,
+    ) {
+        return Ok(name);
+    }
     if let Some(def) = pactl_info_default("Default Sink:") {
-        if !def.starts_with("buschain_") && sinks.iter().any(|s| s.name == def) {
+        if is_real_hw_sink(&def) && sinks.iter().any(|s| s.name == def) {
             return Ok(def);
         }
     }
     sinks
         .into_iter()
-        .find(|s| is_hw(s))
+        .find(|s| is_hw(&s))
         .map(|s| s.name)
         .ok_or_else(|| {
             anyhow!(
@@ -2025,7 +2247,7 @@ pub fn place_app_on_sink_with(
 /// One-shot via engine `Intent::SyncPlayback` (single pactl list). Without this,
 /// `module-stream-restore` leaves Chromium/Brave on Master while the system-default
 /// bus sits idle.
-pub fn enforce_playback_placements(session: &Session) -> Result<u32> {
+pub fn enforce_playback_placements(session: &mut Session) -> Result<u32> {
     let msg = crate::audio::engine_handle::sync_playback(session)?;
     // Parse "playback placed N" when present.
     if let Some(rest) = msg.split("playback placed ").nth(1) {
@@ -2183,6 +2405,8 @@ pub fn apply_session(
         }
     }
 
+    // Before claiming buschain_* preferred: capture desktop default → Master HW.
+    let _ = seed_master_hw_plug_and_play(session);
     let hw_sink = resolve_hardware_output(session)?;
     crate::audio::engine_handle::remember_master_hw(&hw_sink);
     if let Ok(all_sinks) = list_sinks() {
@@ -2191,14 +2415,21 @@ pub fn apply_session(
             if !d.description.is_empty() {
                 session.master_output_desc = Some(d.description.clone());
             }
+            remember_desktop_hw(session, &hw_sink, Some(d.description.as_str()));
         } else {
             session.master_output = Some(hw_sink.clone());
+            remember_desktop_hw(session, &hw_sink, None);
         }
     } else {
         session.master_output = Some(hw_sink.clone());
+        remember_desktop_hw(session, &hw_sink, None);
     }
 
     let mut warnings: Vec<String> = Vec::new();
+    // Apps-rack pins require Pulse-visible VO — flip before preferred/Desired sync.
+    if session.ensure_assigned_playback_vo() {
+        warnings.push("Apps pins → System virtual output enabled".into());
+    }
     // Sticky preferred + Desired (incl. VO pulse_export) *before* pin so ensure
     // creates Master/VO as Audio/Sink and helpers as Audio/Sink/Internal.
     if session.ensure_buschain_preferred_default() {

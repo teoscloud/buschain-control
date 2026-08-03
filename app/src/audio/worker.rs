@@ -134,6 +134,8 @@ pub enum Command {
     },
     /// Idle reconcile / cold bring-up (LiveChange::Reconcile). Never moves streams.
     ApplySession(Session),
+    /// PipeWire daemon restarted — reconnect native plane + cold-arm session graph.
+    ReconnectPipeWire,
     /// Link-only route rewire for every track (never respawn FX).
     RewireSessionRoutes(Session),
     /// Per-insert slot sync for one track (add/remove/reorder).
@@ -516,6 +518,7 @@ fn command_lane(cmd: &Command) -> Lane {
         | Command::BindMasterClock(_)
         | Command::BindDeviceClock { .. }
         | Command::ApplySession(_)
+        | Command::ReconnectPipeWire
         | Command::RewireSessionRoutes(_)
         | Command::HotplugSession(_)
         | Command::RewireTrackFx { .. }
@@ -719,6 +722,11 @@ fn coalesce_commands(mut cmds: Vec<Command>) -> Vec<Command> {
                 track_id,
             } => {
                 rewire_fx.insert(track_id, session);
+            }
+            // One reconnect wins the batch — drop duplicate ApplySession noise.
+            Command::ReconnectPipeWire => {
+                class_c.retain(|c| !matches!(c, Command::ReconnectPipeWire | Command::ApplySession(_)));
+                class_c.insert(0, Command::ReconnectPipeWire);
             }
             other => class_c.push(other),
         }
@@ -967,6 +975,7 @@ fn interactive_loop(
     let mut session_gen: u64 = 0;
     let mut place_retry: HashMap<String, PlaceRetry> = HashMap::new();
     let mut default_reclaim_until: Option<Instant> = None;
+    let mut graph_suppressed = false;
     let midi_session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
     let ms_sink = Arc::clone(&midi_session);
     let ms_bus = Arc::clone(&midi_session);
@@ -1061,6 +1070,7 @@ fn interactive_loop(
                         &mut props_retry,
                         &mut place_retry,
                         &mut default_reclaim_until,
+                        &mut graph_suppressed,
                         &tx,
                         &fx_job_tx,
                         true,
@@ -1094,6 +1104,7 @@ fn interactive_loop(
             &mut props_retry,
             &mut place_retry,
             &mut default_reclaim_until,
+            &mut graph_suppressed,
             &tx,
             &fx_job_tx,
             true,
@@ -1124,6 +1135,11 @@ fn supervisor_loop(
     let mut last_cmd_at = Instant::now();
     // After Full Apply, reclaim a few more times while buschain sinks finish registering.
     let mut default_reclaim_until: Option<Instant> = None;
+    let mut last_playback_gen: Option<u64> = None;
+    let mut hollow_since: Option<Instant> = None;
+    let mut reconnect_in_flight = false;
+    // After explicit Teardown, do not auto-reconnect until Apply/Reconnect.
+    let mut graph_suppressed = false;
     let _ = tx.send(Event::Status(
         "Worker ready — supervisor lane online".into(),
     ));
@@ -1180,6 +1196,7 @@ fn supervisor_loop(
                         &mut props_retry,
                         &mut place_retry,
                         &mut default_reclaim_until,
+                        &mut graph_suppressed,
                         &tx,
                         &fx_job_tx,
                         false,
@@ -1195,14 +1212,56 @@ fn supervisor_loop(
                 {
                     continue;
                 }
-                if let Some(ref session) = last_session {
+                // Hollow graph after PipeWire restart — debounce then reconnect.
+                if !reconnect_in_flight && !graph_suppressed {
+                    let hollow = last_session
+                        .as_ref()
+                        .is_some_and(graph::session_graph_is_hollow);
+                    if hollow {
+                        let since = hollow_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_millis(1500) {
+                            reconnect_in_flight = true;
+                            hollow_since = None;
+                            let _ = tx.send(Event::Status(
+                                "PipeWire graph hollow — reconnecting…".into(),
+                            ));
+                            // Process inline (same as a queued command) so we don't
+                            // race with a second detect tick.
+                            if process_command_batch(
+                                vec![Command::ReconnectPipeWire],
+                                &mut fx,
+                                &mut last_session,
+                                &mut session_gen,
+                                &shared_session,
+                                &mut muted_buses,
+                                &mut level_revs,
+                                &mut props_retry,
+                                &mut place_retry,
+                                &mut default_reclaim_until,
+                                &mut graph_suppressed,
+                                &tx,
+                                &fx_job_tx,
+                                false,
+                            ) {
+                                return;
+                            }
+                            reconnect_in_flight = false;
+                            publish_shared_session(&shared_session, &last_session, session_gen);
+                            continue;
+                        }
+                    } else {
+                        hollow_since = None;
+                    }
+                }
+                if let Some(ref mut session) = last_session {
                     if idle_ticks % 16 == 0 && rx.try_recv().is_err() {
                         sync_engine_clock(session);
+                        // Sticky session Master only — never fall back to
+                        // resolve_hardware_output inventing another card mid-session.
                         let hw = session
                             .master_output
                             .clone()
-                            .filter(|n| !n.is_empty() && !n.starts_with("buschain_"))
-                            .or_else(|| graph::resolve_hardware_output(session).ok());
+                            .filter(|n| !n.is_empty() && !n.starts_with("buschain_"));
                         if let Some(hw) = hw {
                             let _ = crate::audio::engine_handle::with_engine_supervisor(|eng| {
                                 eng.set_profile(&session.performance);
@@ -1216,8 +1275,26 @@ fn supervisor_loop(
                     if default_reclaim_until.is_some_and(|until| Instant::now() >= until) {
                         default_reclaim_until = None;
                     }
+                    // Also reclaim when new Stream/Output/Audio nodes appear after the
+                    // burst window (late Discord/Spotify streams, notification pops).
+                    let gen = buschain_engine::backend::native_graph_generation();
+                    let gen_bumped = match (gen, last_playback_gen) {
+                        (Some(g), Some(prev)) if g != prev => true,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if let Some(g) = gen {
+                        last_playback_gen = Some(g);
+                    }
                     let reclaim_now = if burst_reclaim {
                         idle_ticks % 4 == 0
+                    } else if gen_bumped
+                        && session
+                            .preferred_default_sink
+                            .as_deref()
+                            .is_some_and(|p| p.starts_with("buschain_"))
+                    {
+                        true
                     } else {
                         idle_ticks % 120 == 0
                     };
@@ -1240,6 +1317,11 @@ fn supervisor_loop(
                                 }
                             }
                         }
+                        let vo_before: Vec<(uuid::Uuid, bool)> = session
+                            .tracks
+                            .iter()
+                            .map(|t| (t.id, t.virtual_output))
+                            .collect();
                         match crate::audio::engine_handle::sync_playback(session) {
                             Ok(msg) if msg.contains("placed") => {
                                 let _ = tx.send(Event::Status(msg));
@@ -1248,6 +1330,14 @@ fn supervisor_loop(
                                 }
                             }
                             _ => {}
+                        }
+                        let vo_flipped = session.tracks.iter().any(|t| {
+                            vo_before
+                                .iter()
+                                .any(|(id, vo)| *id == t.id && *vo != t.virtual_output)
+                        });
+                        if vo_flipped {
+                            publish_shared_session(&shared_session, &last_session, session_gen);
                         }
                     }
                 }
@@ -1273,6 +1363,7 @@ fn supervisor_loop(
             &mut props_retry,
             &mut place_retry,
             &mut default_reclaim_until,
+            &mut graph_suppressed,
             &tx,
             &fx_job_tx,
             false,
@@ -1295,6 +1386,7 @@ fn process_command_batch(
     props_retry: &mut HashMap<String, PropsRetry>,
     place_retry: &mut HashMap<String, PlaceRetry>,
     default_reclaim_until: &mut Option<Instant>,
+    graph_suppressed: &mut bool,
     tx: &Sender<Event>,
     fx_job_tx: &Sender<FxEnsureJob>,
     restore_on_shutdown: bool,
@@ -1306,9 +1398,12 @@ fn process_command_batch(
                     if restore_on_shutdown {
                         // Quit must not leave WirePlumber on a dead buschain_* default or a
                         // muted Master HW — that silences YouTube / the whole desktop.
-                        let hw = last_session
-                            .as_ref()
-                            .and_then(|s| s.master_output.clone());
+                        let hw = last_session.as_ref().and_then(|s| {
+                            s.master_output
+                                .clone()
+                                .filter(|n| !n.is_empty() && !n.starts_with("buschain_"))
+                                .or_else(|| s.desktop_hw_sink.clone())
+                        });
                         if let Err(e) = graph::restore_system_audio(hw.as_deref()) {
                             let _ = tx.send(Event::Error(format!("restore audio on quit: {e:#}")));
                         }
@@ -1320,10 +1415,14 @@ fn process_command_batch(
                 }
                 Command::Teardown => {
                     fx.stop_all();
+                    *graph_suppressed = true;
                     // Full reset: hand audio back to HW + destroy linger nodes.
-                    let hw = last_session
-                        .as_ref()
-                        .and_then(|s| s.master_output.clone());
+                    let hw = last_session.as_ref().and_then(|s| {
+                        s.master_output
+                            .clone()
+                            .filter(|n| !n.is_empty() && !n.starts_with("buschain_"))
+                            .or_else(|| s.desktop_hw_sink.clone())
+                    });
                     match graph::restore_system_audio(hw.as_deref()) {
                         Ok(msg) => {
                             let _ = tx.send(Event::Status(msg));
@@ -1331,6 +1430,124 @@ fn process_command_batch(
                         }
                         Err(e) => {
                             let _ = tx.send(Event::Error(format!("teardown: {e:#}")));
+                        }
+                    }
+                }
+                Command::ReconnectPipeWire => {
+                    *graph_suppressed = false;
+                    let Some(mut session) = last_session.clone() else {
+                        let _ = tx.send(Event::Error(
+                            "PipeWire reconnect: no session loaded".into(),
+                        ));
+                        continue;
+                    };
+                    let _ = tx.send(Event::Status(
+                        "PipeWire reconnecting — waiting for audio daemon…".into(),
+                    ));
+                    if let Err(e) = graph::wait_for_pipewire(Duration::from_secs(15)) {
+                        let _ = tx.send(Event::Error(format!("PipeWire reconnect: {e:#}")));
+                        continue;
+                    }
+                    // Capture WirePlumber's restored HW default *before* we reclaim
+                    // preferred buschain_* (Pulse default becomes a mixer bus after).
+                    let _ = graph::capture_desktop_hw_default(&mut session);
+                    let _ = graph::seed_master_hw_plug_and_play(&mut session);
+                    // Wait for sticky Master HW to reappear before soft-bind/arm —
+                    // early sink lists after restart are incomplete and used to pick
+                    // the wrong card (then idle soft_bind kept fighting the user).
+                    let sticky_hw = session
+                        .master_output
+                        .clone()
+                        .filter(|n| !n.is_empty() && !n.starts_with("buschain_"));
+                    if let Some(ref want) = sticky_hw {
+                        let deadline = Instant::now() + Duration::from_secs(8);
+                        let mut backoff = Duration::from_millis(100);
+                        let mut appeared = false;
+                        while Instant::now() < deadline {
+                            if graph::list_sinks()
+                                .ok()
+                                .is_some_and(|s| s.iter().any(|d| d.name == *want))
+                            {
+                                appeared = true;
+                                break;
+                            }
+                            // USB id chunk rename after firmware/profile change.
+                            if graph::resolve_hardware_output(&session).is_ok() {
+                                appeared = true;
+                                break;
+                            }
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(Duration::from_millis(500));
+                        }
+                        // Sticky never came back — plug-n-play from desktop default.
+                        if !appeared {
+                            if let Some(hw) = graph::adopt_desktop_as_master(&mut session) {
+                                let _ = tx.send(Event::Status(format!(
+                                    "Master HW → desktop default ({hw})"
+                                )));
+                            }
+                        }
+                    } else if let Some(hw) = graph::adopt_desktop_as_master(&mut session) {
+                        let _ = tx.send(Event::Status(format!(
+                            "Master HW → desktop default ({hw})"
+                        )));
+                    }
+                    if let Ok(sinks) = graph::list_sinks() {
+                        let sources = graph::list_sources().unwrap_or_default();
+                        let sink_pairs: Vec<_> = sinks
+                            .iter()
+                            .map(|s| (s.name.clone(), s.description.clone()))
+                            .collect();
+                        let source_pairs: Vec<_> = sources
+                            .iter()
+                            .map(|s| (s.name.clone(), s.description.clone()))
+                            .collect();
+                        let report = crate::session::resolve_devices(
+                            &mut session,
+                            &sink_pairs,
+                            &source_pairs,
+                        );
+                        if !report.messages.is_empty() {
+                            let _ = tx.send(Event::Status(report.join()));
+                        }
+                    }
+                    match buschain_engine::backend::reconnect_plane() {
+                        Ok(()) => {}
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!(
+                                "PipeWire reconnect plane: {e:#}"
+                            )));
+                            continue;
+                        }
+                    }
+                    sync_engine_clock(&session);
+                    fx.stop_all();
+                    match crate::audio::engine_handle::reconnect_pipewire_graph(&mut session) {
+                        Ok(message) => {
+                            for t in &mut session.tracks {
+                                t.sink_name = Some(t.expected_sink_name());
+                            }
+                            *last_session = Some(session.clone());
+                            publish_shared_session_authority(
+                                shared_session,
+                                last_session,
+                                session_gen,
+                            );
+                            *default_reclaim_until =
+                                Some(Instant::now() + Duration::from_secs(10));
+                            let _ = tx.send(Event::SessionApplied {
+                                session,
+                                message: format!(
+                                    "PipeWire reconnected — graph rebuilt · {message}"
+                                ),
+                                kind: SessionAppliedKind::Full,
+                            });
+                            let _ = tx.send(Event::Snapshot(graph::refresh_snapshot()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!(
+                                "PipeWire reconnect arm: {e:#}"
+                            )));
                         }
                     }
                 }
@@ -1468,6 +1685,7 @@ fn process_command_batch(
                     }
                 }
                 Command::ApplySession(mut session) => {
+                    *graph_suppressed = false;
                     sync_engine_clock(&session);
                     session.normalize();
                     // Stale clones must not reset post faders / Desired to 0 dB.
@@ -1518,7 +1736,7 @@ fn process_command_batch(
                                     }
                                 }
                             }
-                            match crate::audio::engine_handle::sync_playback(&session) {
+                            match crate::audio::engine_handle::sync_playback(&mut session) {
                                 Ok(msg) if msg.contains("placed") => {
                                     let _ = tx.send(Event::Status(msg));
                                 }
@@ -1718,7 +1936,7 @@ fn process_command_batch(
                     match graph::ensure_live_track(&mut session, track_id) {
                         Ok(message) => {
                             // One-shot SyncPlayback now that the bus exists.
-                            match crate::audio::engine_handle::sync_playback(&session) {
+                            match crate::audio::engine_handle::sync_playback(&mut session) {
                                 Ok(msg) if msg.contains("placed") => {
                                     let _ = tx.send(Event::Status(msg));
                                 }
@@ -2011,9 +2229,9 @@ fn process_command_batch(
                         }
                     }
                 }
-                Command::SyncPlayback(session) => {
+                Command::SyncPlayback(mut session) => {
                     *last_session = Some(session.clone());
-                    match crate::audio::engine_handle::sync_playback(&session) {
+                    match crate::audio::engine_handle::sync_playback(&mut session) {
                         Ok(msg) => {
                             let _ = tx.send(Event::Status(msg));
                             if let Ok(inputs) = graph::refresh_sink_inputs_only() {
@@ -2024,6 +2242,7 @@ fn process_command_batch(
                             let _ = tx.send(Event::Error(format!("sync playback: {e:#}")));
                         }
                     }
+                    *last_session = Some(session);
                 }
                 Command::SetDefaultSink(name) => {
                     if let Some(ref mut s) = last_session {
@@ -2050,7 +2269,7 @@ fn process_command_batch(
                         }
                     }
                     // Immediate reclaim so apps leave HW/legacy sinks when default is BusChain.
-                    if let Some(session) = last_session.as_ref() {
+                    if let Some(session) = last_session.as_mut() {
                         match crate::audio::engine_handle::sync_playback(session) {
                             Ok(msg) if msg.contains("placed") => {
                                 let _ = tx.send(Event::Status(msg));
@@ -2082,7 +2301,18 @@ fn process_command_batch(
                         if let Some(d) = desc.clone() {
                             s.master_output_desc = Some(d);
                         }
+                        graph::remember_desktop_hw(
+                            s,
+                            &name,
+                            desc.as_deref(),
+                        );
+                        let _ = s.save();
                     }
+                    publish_shared_session_authority(
+                        shared_session,
+                        last_session,
+                        session_gen,
+                    );
                     match crate::audio::engine_handle::set_master_hw_light(&name) {
                         Ok(msg) => {
                             let _ = tx.send(Event::Status(if msg.is_empty() {
@@ -2090,6 +2320,15 @@ fn process_command_batch(
                             } else {
                                 msg
                             }));
+                            // Push authoritative session so UI/daemon soft_bind cannot
+                            // clobber the user pick with a stale reconnect clone.
+                            if let Some(session) = last_session.clone() {
+                                let _ = tx.send(Event::SessionApplied {
+                                    session,
+                                    message: format!("Master HW → {name}"),
+                                    kind: SessionAppliedKind::Route,
+                                });
+                            }
                         }
                         Err(e) => {
                             let _ = tx.send(Event::Error(format!("master hw: {e:#}")));

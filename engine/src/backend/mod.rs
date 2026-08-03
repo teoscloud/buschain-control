@@ -35,8 +35,8 @@ pub use fx_chain::{
 
 pub use native::{
     graph_generation as native_graph_generation, list_midi_nodes, list_playback_streams,
-    native_ready, native_set_levels, stream_targets_sink, PipewireNativeBackend,
-    PlaybackStreamInfo,
+    native_mark_dead, native_ready, native_set_levels, plane_generation, plane_is_dead,
+    reconnect_plane, stream_targets_sink, PipewireNativeBackend, PlaybackStreamInfo,
 };
 
 use anyhow::{anyhow, Context, Result};

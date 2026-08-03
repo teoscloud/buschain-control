@@ -189,6 +189,13 @@ Settings → Session: Save / Save as… / Load / Delete.
 
 ## Master HW volume
 
+Master HW is the real device Master plays to. While the mixer owns the desktop,
+Pulse **system default** is usually a sticky `buschain_*` bus. Before claiming
+that preferred default, BusChain stores the live non-`buschain_*` Pulse default
+as `desktop_hw_sink` and seeds Master HW from it (plug-n-play on start /
+reconnect when Master is unset). Manual Master HW picks update both fields;
+quit/teardown restores that desktop HW.
+
 **One writer:** tray daemon `AdjustHwVolume` / `apply_master_hw_volume` (hard
 cap 100%, ±5% grid). No bash `pactl` dual-path.
 
@@ -362,6 +369,7 @@ Quant handover: [`HANDOVER-QUICKSHELL.md`](HANDOVER-QUICKSHELL.md) · stubs in [
 | VST3 editor tiled (Hyprland) | Ensure `hyprctl` works; add the optional `windowrulev2` above |
 | VST3 missing `.so` | Expand `vst3PluginRuntimeLibs` in `flake.nix` |
 | Desktop silent after Quit / kill | `buschain-ctl recover-audio` · see [PIN](#pin--quit-leaves-system-audio-broken). Blunt: `systemctl --user restart wireplumber` |
+| Graph empty after `systemctl restart pipewire…` | Auto-reconnect within ~2s (status “PipeWire reconnecting”); or Config → Reconcile now |
 
 ```bash
 buschain-waybar status
@@ -385,6 +393,7 @@ command -v buschain-plugin-surface
 **Mitigations in tree:**
 
 - Quit / Teardown → `restore_system_audio` + linger destroy; **keep sticky `preferred_default_sink` as buschain_*** across quit (live PW default still restored to HW). Reopen reasserts preferred + reclaim burst so apps rewire without clicking System default.
+- **PipeWire daemon restart (on-the-fly):** native control plane is reconnectable (`reconnect_plane`). Supervisor detects hollow graph (sticky preferred / stamped `sink_name` expected, Pulse up, `buschain_master` missing or plane dead) after ~1.5s debounce → `Command::ReconnectPipeWire` → wait Pulse → capture non-`buschain_*` Pulse default into sticky `desktop_hw_*` → seed Master HW (plug-n-play) → wait sticky Master HW sink → reconnect MainLoop → `teardown_all_hosts` → `Intent::ReconnectPipeWire` (`ArmSession { force_fx: true }`) → preferred + reclaim burst. UI stays up; Reconcile escalates to the same path when hollow. Explicit Teardown sets `graph_suppressed` so auto-reconnect does not fight intentional unload. Master HW is sticky across soft_bind / incomplete sink lists (never auto-pick first HW or fuzzy “Analog Stereo”); with no Master set, BusChain adopts the previous desktop system default (excluding `buschain_*`). `resolve_hardware_output` does not fall through to Default Sink while a remembered card is still enumerating.
 - **Dual-lane preferred ownership:** Supervisor Full Apply publishes an authoritative shared-session generation after `ensure_buschain_preferred_default`. Interactive must not overwrite a newer gen (ApplyMidiConfig is MIDI-only merge). Supervisor only adopts shared when `shared.gen >= local.gen`. Reopen is not done until Pulse `Default Sink` matches sticky `buschain_*` and reclaim has run.
 - **Verify-after-set:** native metadata set-default is provisional; success requires Pulse (`pactl info`) agreement, else fall through to pactl/wpctl. Apply + ~10s reclaim burst retry both `set_default_sink_if_needed` and `sync_playback`.
 - Surgical commits (`EnsureTrack` / `Route` / `VirtualInput` / `FxRewire`) **never** escalate to Full Apply when the snapshot looks cold — only `Reconcile` may ArmSession
@@ -399,7 +408,7 @@ command -v buschain-plugin-surface
 - Desired `buschain_rs_*` kept during capture purge; sink-side dual-path prune when bridging
 - `relink_routes` never ArmSession / ForceRespawn (soft-arm latch only)
 - **Mic Pulse flap sealed:** `link_is_live` / `ensure_link` treat live `module-loopback` as already-ok (no unload→reload silence); wait for `buschain_rs_*` ports after create
-- **Apps rack:** PlaceApp / `Intent::SyncPlayback` only (no ApplyLevels HOL); **move/retarget** onto the track bus (never clone/loopback). **Discovery is native-first**: `list_sink_inputs` reads `Stream/Output/Audio` nodes + app props from the native registry (`list_playback_streams`) so streams on `Audio/Sink/Internal` buses stay visible even when pipewire-pulse hides them; pactl only enriches volume/mute. Observer Class C is generation-driven (registry bump → refresh within ~300ms; 5s max interval; 1.5s cadence only in Pulse-fallback mode). Engine reclaim (`enforce_desired_playback`) uses the same native list and the same `app_key` cascade (`binary_is_generic` shared semantics). Streams parked on Hold stay user-visible for reclaim. PlaceApp goes through `pulse_compat::move_sink_input` (native `target.object` retarget first — required for `Audio/Sink/Internal` non-VO tracks); after a successful place on an FX track, one-shot wet `arm_track_egress`.
+- **Apps rack:** PlaceApp / `Intent::SyncPlayback` only (no ApplyLevels HOL); **move/retarget** onto the track bus (never clone/loopback). **Discovery is native-first**: `list_sink_inputs` reads `Stream/Output/Audio` nodes + app props from the native registry (`list_playback_streams`) so streams on `Audio/Sink/Internal` buses stay visible even when pipewire-pulse hides them; pactl only enriches volume/mute. Observer Class C is generation-driven (registry bump → refresh within ~300ms; 5s max interval; 1.5s cadence only in Pulse-fallback mode). Engine reclaim (`enforce_desired_playback`) uses the same native list and the same `app_key` cascade (`binary_is_generic` shared semantics). Streams parked on Hold stay user-visible for reclaim. PlaceApp goes through `pulse_compat::move_sink_input` (native `target.object` retarget first — required for `Audio/Sink/Internal` non-VO tracks); after a successful place on an FX track, one-shot wet `arm_track_egress`. **Pins always imply Pulse-visible VO** on Apply / SyncPlayback (`ensure_assigned_playback_vo` + Desired `pulse_export`), not only on the PlaceApp hot path. **Reclaim** pulls unpinned user streams from HW / Hold / other `buschain_*` / empty(unlinked) onto sticky preferred; registry generation bumps also trigger reclaim after the reopen burst so late Spotify/Discord streams are caught. **Quit** native-retargets every buschain-hosted stream to HW by sink name before destroy so `target.object` never points at a dead bus.
 - **Null-sink exposure:** Master / VO use `media.class = Audio/Sink` (Pulse-visible). Helpers (Hold, Post, rate-bridge, vin feed, non-VO tracks) use standard **`Audio/Sink/Internal`** — ports work (unlike custom `BusChain/Internal`, which is forbidden) and stay out of pavucontrol. Also stamp `buschain.pulse.export` + optional WirePlumber rules (`pipewire/wireplumber/…` / `scripts/install-wireplumber-rules.sh`). PlaceApp/reclaim prefer native `target.node` retarget. Pulse `module-loopback` onto Hold/helpers is forbidden; Apply sweeps leftover BusChain loopbacks.
 - **Meters:** wet strips use in-process FX host peaks; dry strips use a native `{bus}.monitor → buschain_mtr_*` peak tap. Pulse `meter-*` streams stay opt-in only (`BUSCHAIN_PULSE_METERS=1`).
 - **VO toggle** flips `pulse_export` → recreate null-sink as `Audio/Sink` ↔ `Audio/Sink/Internal` (stream remount) without ArmSession / ForceRespawn. RT path hop count unchanged.
@@ -409,11 +418,13 @@ command -v buschain-plugin-surface
 
 - **Apps require a Pulse-visible track (`virtual_output` / `Audio/Sink`).** Chromium and Electron (Equibop, Vesktop, Cider, …) talk through `pipewire-pulse` and **hang forever** when retargeted onto `Audio/Sink/Internal` — the client never finishes the move and cannot switch devices until the pin is removed. Assigning an app auto-enables System virtual output and recreates the bus as `Audio/Sink` before place. Native-only clients (e.g. Brave) can survive Internal, which is why some apps "worked" and others froze.
 - **Electron identity:** `application.name = "Chromium"` is treated as generic; keys prefer real `application.process.binary` / `application.id` so Equibop ≠ Brave. Retarget is a no-op when the stream is already linked (Chromium pauses on every rewrite).
+- **App-owned `media.role=event|notify` streams reclaim.** Only anonymous System Sounds (`application.name` / restore `sink-input-by-media-role:event` with no real `bin:` / `id:` / name identity) stay excluded — Discord notifications and Electron secondary streams follow preferred / pins like the main stream.
 - **`target.object` must be the node NAME (or `object.serial`), never the node id.** WirePlumber resolves `target.object` by matching `node.name`/`object.serial` and it takes precedence over the legacy `target.node` (which *is* the node id). Writing the node id into `target.object` made every target unresolvable, so WirePlumber silently fell back to the default sink — apps appeared to ignore their track assignment and stayed on the system default. `set_stream_target_node` now writes `target.object` = name (`Spa:String`) plus `target.node` = id (`Spa:Id`).
 - **Filter nodes must not declare a `media.class`.** `PwFxNode` (FX hosts and `buschain_mtr_*` taps) sets only `media.type/category/role` + `node.virtual`. Stamping `media.class = Audio/Duplex` made pipewire-pulse register every filter as a device that never reports sample/map/volume, logging `sink not ready` in a hot loop (700k+ lines/day) and wedging the whole Pulse layer: `pactl list sink-inputs` returned empty, `parec` produced zero bytes, and new Pulse clients were never routed. That single property was the real cause of "no apps show" / "apps not placed on tracks".
 - **Non-finite guard:** the FX host scrubs NaN/Inf on both sides of the rack. Non-finite state in an IIR/delay never decays, so one bad block would silence a bus permanently.
 
 - **Output to… may omit Master.** Empty destinations mean hold-only (intermediate bus / track→track without a master send). New tracks still default to Master; Listen (AFL) still forces Master. Desired `bus_egress` empty is authoritative — it must not fall through to a Master default.
+- **Mute latch vs session unmute.** Track strip meters/scope read the FX host (pre-fader) and can move while `post→Master` is stripped. A stale mute latch after unmute / PipeWire reconnect used to re-mute DualMic in Desired every sync (`reinforce_mute_latches`), so idle heal kept the track hold-only. Session sync now aligns latches to mixer authority before reinforce; reconnect clears latches.
 - **System virtual input does not imply Master.** The vin-feed sink (`buschain_vinf_*`) is a remap-source only — its monitor must stay hold-only (plus Pulse `input.buschain_vin_*` capture). Idle heal used to default helper buses to Master (`vinf.monitor → buschain_master`), so toggling virtual input re-audibled DualMic on Master even with Output empty. Helpers never get a Master egress default; reconcile surgically unlinks feed→Master/track leaks only (never wipe-all — that stripped remap capture and silenced `buschain_vin_*`). `ensure_virtual_input` bounces the remap module if feed.monitor→input.vin hops are missing.
 
 ### Standard track wiring contract
@@ -505,8 +516,10 @@ Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
 | Delete track feeding Master | Master stops that feed immediately (silence-first prune) |
 | Assign app to track (Apps rack) | Stream on target bus within ~1s; no ApplyLevels HOL |
 | Unpin app from track | Leaves track quickly (preferred default / Master) |
+| Quit → reopen with Spotify/Discord/Mailspring/Brave playing | Sticky preferred reclaim; apps audible on VO without manual System default; Discord notifs follow preferred |
+| Pin app, restart BusChain | Pin bus is Pulse-visible VO; stream still on that track |
 | pavucontrol Output | HW + Master + VO tracks only (no Post/Hold/RS/non-VO) |
-| pavucontrol Playback/Recording | No `loopback-*` / `buschain-control-meters`; event/"System Sounds" not reclaimed onto BusChain |
+| pavucontrol Playback/Recording | No `loopback-*` / `buschain-control-meters`; anonymous System Sounds not reclaimed; app-owned event/notify streams may be on BusChain |
 | VO toggle | No ArmSession; streams remount; FX edit latency unchanged |
 
 ### Structural edit latency budget

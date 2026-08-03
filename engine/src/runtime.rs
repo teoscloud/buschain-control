@@ -523,10 +523,30 @@ impl Engine {
                 );
             }
             Intent::SyncPlayback => {
+                // Pins require Pulse-visible buses — promote Desired pulse_export and
+                // recreate Internal→Audio/Sink before any retarget (PlaceApp invariant).
+                self.promote_pin_buses_pulse_export(&mut report);
                 match crate::backend::enforce_desired_playback(&self.desired) {
                     Ok(n) if n > 0 => report.push(format!("playback placed {n}")),
                     Ok(_) => report.push("playback synced"),
                     Err(e) => report.push(format!("playback: {e:#}")),
+                }
+            }
+            Intent::ReconnectPipeWire => {
+                // Hosts hold their own MainLoops against the old daemon — drop them
+                // before cold arm so ForceRespawn recreates filters on the new core.
+                crate::host::registry::teardown_all_hosts();
+                self.desired.speakers_armed = false;
+                self.desired.fx_failed.clear();
+                self.capture_applied = false;
+                self.last_applied_bus_inputs.clear();
+                // Stale mute latches survived reconnect and left DualMic hold-only
+                // (FX meters live, post→Master stripped every idle tick).
+                self.applied_monitor_mute.clear();
+                report.push("PipeWire reconnect — cold arm");
+                let r = self.arm_session(true)?;
+                for m in r.messages {
+                    report.push(m);
                 }
             }
             Intent::BindDeviceClock {
@@ -1889,6 +1909,7 @@ impl Engine {
         self.reapply_muted_egress(&mut report);
         self.reconcile_master_and_default(&mut report)?;
         // Reclaim unpinned / Hold / HW streams onto preferred (session owns default).
+        self.promote_pin_buses_pulse_export(&mut report);
         match crate::backend::enforce_desired_playback(&self.desired) {
             Ok(n) if n > 0 => report.push(format!("playback reclaim: {n} placed")),
             Ok(_) => {}
@@ -2082,12 +2103,45 @@ impl Engine {
         // (common when sink_has_input flaked during the barrier window).
         crate::backend::invalidate_probe_caches();
         self.reconcile_master_and_default(&mut report)?;
+        self.promote_pin_buses_pulse_export(&mut report);
         match crate::backend::enforce_desired_playback(&self.desired) {
             Ok(n) if n > 0 => report.push(format!("playback reclaim: {n} placed")),
             Ok(_) => {}
             Err(e) => report.push(format!("playback reclaim: {e:#}")),
         }
         Ok(report)
+    }
+
+    /// Apps-rack pins require Pulse-visible track buses. Flip Desired `pulse_export`
+    /// and recreate Internal→`Audio/Sink` before SyncPlayback / reclaim moves.
+    fn promote_pin_buses_pulse_export(&mut self, report: &mut ApplyReport) {
+        let pin_buses: Vec<String> = self.desired.bus_playback.keys().cloned().collect();
+        if pin_buses.is_empty() {
+            return;
+        }
+        let clock = self.desired.clock.clone();
+        for bus in pin_buses {
+            if bus == "buschain_master" || !bus.starts_with("buschain_track_") {
+                continue;
+            }
+            let Some(spec) = self.desired.buses.get(&bus).cloned() else {
+                continue;
+            };
+            if spec.pulse_export {
+                continue;
+            }
+            let mut promoted = spec;
+            promoted.pulse_export = true;
+            match self.backend.ensure_node(&promoted, &clock) {
+                Ok(_) => {
+                    self.desired.ensure_bus(promoted);
+                    report.push(format!("pin bus VO expose: {bus}"));
+                }
+                Err(e) => {
+                    report.push(format!("pin bus VO expose {bus}: {e:#}"));
+                }
+            }
+        }
     }
 
     /// Master spine ready + every unmuted non-master insert track is Wet or Failed.
@@ -2376,9 +2430,10 @@ impl Engine {
         self.applied_monitor_mute.insert(bus.to_string(), muted);
     }
 
-    /// Hot mute latch wins over stale session sync (async FX jobs with mute=false).
-    /// Restores Desired.mixer_mute and re-disarms egress for every latched track.
-    /// Never latches Master (speakers_armed owns Master→HW).
+    /// Hot mute latch wins over stale Desired clears (async FX jobs with mute=false)
+    /// **only while the latch is still armed**. Callers that sync from session /
+    /// mixer authority must [`Self::align_mute_latches_to_desired`] first so an
+    /// unmuted DualMic is not re-muted and left hold-only (meters live, Master silent).
     pub fn reinforce_mute_latches(&mut self) {
         let latched: Vec<String> = self
             .applied_monitor_mute
@@ -2397,6 +2452,21 @@ impl Engine {
             // Full sweep on sync (rare) — clears Pulse leftovers after FX rewire.
             pipeline::arm::disarm_track_egress(&mut self.backend, &bus, true);
             self.applied_monitor_mute.insert(bus, true);
+        }
+    }
+
+    /// Point mute latches at Desired `mixer_mute` (session / UI authority).
+    /// Prevents a prior DualMic mute from surviving unmute + sync/reconnect.
+    pub fn align_mute_latches_to_desired(&mut self) {
+        let buses: Vec<(String, bool)> = self
+            .desired
+            .buses
+            .iter()
+            .filter(|(_, s)| matches!(s.role, NodeRole::TrackBus))
+            .map(|(bus, _)| (bus.clone(), self.mixer_muted(bus)))
+            .collect();
+        for (bus, muted) in buses {
+            self.applied_monitor_mute.insert(bus, muted);
         }
     }
 
@@ -2697,25 +2767,58 @@ mod mute_latch_tests {
     #[test]
     fn reinforce_mute_latches_restores_desired_after_stale_clear() {
         let mut eng = Engine::new();
+        use crate::domain::{NodeName, NodeRole, NodeSpec};
+        eng.desired_mut().ensure_bus(NodeSpec {
+            name: NodeName::new("buschain_track_dualmic"),
+            description: "DualMic".into(),
+            role: NodeRole::TrackBus,
+            start_muted: false,
+            pulse_export: false,
+        });
         eng.desired_mut().set_bus_level(
-            "buschain_dualmic",
+            "buschain_track_dualmic",
             BusLevel {
                 gain_db: 0.0,
                 mixer_mute: true,
             },
         );
-        eng.mark_monitor_mute_applied("buschain_dualmic", true);
+        eng.mark_monitor_mute_applied("buschain_track_dualmic", true);
         // Stale FX sync cleared Desired while UI LED stayed muted.
         eng.desired_mut().set_bus_level(
-            "buschain_dualmic",
+            "buschain_track_dualmic",
             BusLevel {
                 gain_db: 0.0,
                 mixer_mute: false,
             },
         );
-        assert!(!eng.mixer_muted_public("buschain_dualmic"));
+        assert!(!eng.mixer_muted_public("buschain_track_dualmic"));
         eng.reinforce_mute_latches();
-        assert!(eng.mixer_muted_public("buschain_dualmic"));
+        assert!(eng.mixer_muted_public("buschain_track_dualmic"));
+    }
+
+    #[test]
+    fn align_mute_latches_allows_session_unmute() {
+        let mut eng = Engine::new();
+        use crate::domain::{NodeName, NodeRole, NodeSpec};
+        eng.desired_mut().ensure_bus(NodeSpec {
+            name: NodeName::new("buschain_track_dualmic"),
+            description: "DualMic".into(),
+            role: NodeRole::TrackBus,
+            start_muted: false,
+            pulse_export: false,
+        });
+        eng.mark_monitor_mute_applied("buschain_track_dualmic", true);
+        eng.desired_mut().set_bus_level(
+            "buschain_track_dualmic",
+            BusLevel {
+                gain_db: 0.0,
+                mixer_mute: false,
+            },
+        );
+        // Session sync aligns latches before reinforce — unmute must stick.
+        eng.align_mute_latches_to_desired();
+        eng.reinforce_mute_latches();
+        assert!(!eng.mixer_muted_public("buschain_track_dualmic"));
     }
 }
 

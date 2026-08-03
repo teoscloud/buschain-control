@@ -844,6 +844,7 @@ impl DaemonState {
                 let structural = matches!(
                     cmd,
                     Command::ApplySession(_)
+                        | Command::ReconnectPipeWire
                         | Command::BindMasterClock(_)
                         | Command::BindDeviceClock { .. }
                         | Command::RewireSessionRoutes(_)
@@ -1045,6 +1046,11 @@ impl DaemonState {
                     .unwrap_or_else(|| name.clone());
                 self.session.master_output = Some(name.clone());
                 self.session.master_output_desc = Some(desc.clone());
+                crate::audio::graph::remember_desktop_hw(
+                    &mut self.session,
+                    &name,
+                    Some(desc.as_str()),
+                );
                 self.hw_vol_cache = None;
                 let _ = self.session.save();
                 // Light relink only — never ApplySession / ForceRespawn.

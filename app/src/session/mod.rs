@@ -153,6 +153,13 @@ pub struct Session {
     /// Description of Master HW out — used when the sink name changes after reboot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_output_desc: Option<String>,
+    /// Last known non-BusChain system default (desktop HW). Captured before we
+    /// claim a `buschain_*` preferred default; used to seed Master HW plug-n-play
+    /// on start / PipeWire reconnect when Master is unset or not live yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_hw_sink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_hw_desc: Option<String>,
     /// Preferred system default sink (usually a BusChain track bus). Re-applied on graph apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_default_sink: Option<String>,
@@ -248,6 +255,8 @@ impl Default for Session {
             ],
             master_output: None,
             master_output_desc: None,
+            desktop_hw_sink: None,
+            desktop_hw_desc: None,
             preferred_default_sink: None,
             autostart_graph: false,
             ladspa_paths: vec![],
@@ -304,6 +313,13 @@ impl Session {
             .is_some_and(|d| d.trim().is_empty())
         {
             self.master_output_desc = None;
+        }
+        if self
+            .desktop_hw_desc
+            .as_ref()
+            .is_some_and(|d| d.trim().is_empty())
+        {
+            self.desktop_hw_desc = None;
         }
     }
 }
@@ -450,6 +466,23 @@ impl Session {
         }
         name == "buschain_master"
             || self.tracks.iter().any(|t| t.expected_sink_name() == name)
+    }
+
+    /// Apps-rack pins require Pulse-visible track buses (`Audio/Sink`). Flip
+    /// `virtual_output` on any non-master track that has `assigned_playback` so
+    /// SyncPlayback / reopen match the PlaceApp VO invariant. Returns true when changed.
+    pub fn ensure_assigned_playback_vo(&mut self) -> bool {
+        let mut changed = false;
+        for t in &mut self.tracks {
+            if t.kind.is_master() || t.assigned_playback.is_empty() {
+                continue;
+            }
+            if !t.virtual_output {
+                t.virtual_output = true;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// While the session owns the mixer, preferred default must be a BusChain bus —

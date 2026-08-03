@@ -29,7 +29,8 @@ pub struct StreamProps {
     pub app_id: Option<String>,
     pub media_name: Option<String>,
     pub icon_name: Option<String>,
-    /// `media.role` — event/notify/alert must not be reclaimed onto BusChain.
+    /// `media.role` — anonymous event/notify (System Sounds) stay out of reclaim;
+    /// app-owned event streams still reclaim when they have real identity.
     pub media_role: Option<String>,
     pub node_virtual: bool,
 }
@@ -72,6 +73,12 @@ pub struct GraphView {
 impl GraphView {
     pub fn bump(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Wipe registry cache (PipeWire daemon died / control plane reconnect).
+    pub fn clear(&mut self) {
+        *self = Self::default();
+        self.bump();
     }
 
     pub fn node_id(&self, name: &str) -> Option<u32> {

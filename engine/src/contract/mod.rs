@@ -73,6 +73,9 @@ pub enum Intent {
     /// Apply Desired `bus_playback` pins (move sink-inputs onto session buses).
     /// Caller must sync Desired first — never Full Apply / ForceRespawn.
     SyncPlayback,
+    /// PipeWire daemon came back empty: tear FX hosts, keep Desired topology,
+    /// cold `ArmSession { force_fx: true }`. Caller must [`reconnect_plane`] first.
+    ReconnectPipeWire,
 }
 
 /// Result fragment for UI status lines.

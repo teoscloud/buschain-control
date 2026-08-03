@@ -306,6 +306,15 @@ impl AppState {
             self.pending_level_track = None;
             self.levels_pending_full = false;
             crate::daemon::overlay_track_mixer_authority(&mut self.session);
+            if crate::audio::graph::session_graph_is_hollow(&self.session)
+                || buschain_engine::backend::plane_is_dead()
+            {
+                self.worker
+                    .send(crate::audio::worker::Command::ReconnectPipeWire);
+                self.graph_loading = true;
+                self.status = "PipeWire reconnecting — rebuilding graph…".into();
+                return;
+            }
             self.worker
                 .send(Command::ApplySession(self.session.clone()));
             self.graph_loading = true;
@@ -399,10 +408,19 @@ impl AppState {
                 self.params_track = None;
                 self.pending_level_track = None;
                 self.levels_pending_full = false;
-                self.worker
-                    .send(Command::ApplySession(self.session.clone()));
-                self.status =
-                    "Reconcile graph (idle ensure — won’t move streams)…".into();
+                if crate::audio::graph::session_graph_is_hollow(&self.session)
+                    || buschain_engine::backend::plane_is_dead()
+                {
+                    self.worker
+                        .send(crate::audio::worker::Command::ReconnectPipeWire);
+                    self.graph_loading = true;
+                    self.status = "PipeWire reconnecting — rebuilding graph…".into();
+                } else {
+                    self.worker
+                        .send(Command::ApplySession(self.session.clone()));
+                    self.status =
+                        "Reconcile graph (idle ensure — won’t move streams)…".into();
+                }
                 self.dirty = false;
             }
         }
@@ -446,10 +464,10 @@ impl AppState {
     /// Also refreshes Master HW caps for the device panel (does not clamp engine to HW).
     pub fn refresh_performance_from_device(&mut self) {
         use buschain_engine::{probe_master_hw, resolve_engine_profile, AudioPreset};
+        // resolve_hardware_output keeps sticky Master — never invents Default/first
+        // while a remembered card is still enumerating.
         if let Ok(hw) = crate::audio::graph::resolve_hardware_output(&self.session) {
-            if self.session.master_output.as_deref() != Some(hw.as_str()) {
-                self.session.master_output = Some(hw.clone());
-            }
+            self.session.master_output = Some(hw.clone());
             if let Some(d) = self.snapshot.sinks.iter().find(|s| s.name == hw) {
                 if !d.description.is_empty() {
                     self.session.master_output_desc = Some(d.description.clone());
@@ -1567,6 +1585,13 @@ impl AppState {
                     self.snapshot.sink_inputs = inputs;
                 }
                 Event::Status(s) => {
+                    let reconnecting = s.contains("PipeWire reconnect")
+                        || s.contains("PipeWire graph hollow");
+                    if reconnecting {
+                        self.graph_loading = true;
+                        self.meters.set_targets(vec![]);
+                        self.meter_targets_sig = 0;
+                    }
                     let skipped = s.starts_with("Live params skipped");
                     let live_ok = s.starts_with("Live params →");
                     let missing = skipped && s.contains("not found");

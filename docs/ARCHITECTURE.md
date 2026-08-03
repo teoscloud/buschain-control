@@ -68,6 +68,13 @@ libpipewire MainLoop + registry cache for links / null-sinks / node lookup / lev
 (SPA Props) / default sink (Metadata). Pulse remains only for stream-move
 (`PulseCompat`) and emergency fallbacks.
 
+**Reconnect:** the control plane is reconnectable (`mark_dead` / `reconnect_plane`).
+After `systemctl --user restart pipewire pipewire-pulse wireplumber`, the supervisor
+detects a hollow graph (`buschain_master` missing while Pulse is up, or plane dead),
+reconnects the MainLoop, tears in-process FX hosts, cold-arms via
+`Intent::ReconnectPipeWire`, then reasserts preferred default + reclaim — without
+quitting the UI. Explicit Teardown suppresses auto-reconnect until the next Apply.
+
 ```
 Apps ──assign──► Track null sinks ──► buschain_fx_* (in-process host) ──► post ──┬──► [glc δ?] ──► Master ──► HW
                                                                                  └──► other tracks (no GLC)
