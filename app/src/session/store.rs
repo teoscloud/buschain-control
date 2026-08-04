@@ -82,14 +82,18 @@ pub fn read_active_slug() -> String {
     fs::read_to_string(active_path())
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| valid_slug(s))
         .unwrap_or_else(|| "default".into())
 }
 
 pub fn write_active_slug(slug: &str) -> Result<()> {
+    let slug = slug.trim();
+    if !valid_slug(slug) {
+        return Err(anyhow!("invalid session slug: {slug}"));
+    }
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
-    fs::write(active_path(), slug.trim())?;
+    fs::write(active_path(), slug)?;
     Ok(())
 }
 
@@ -145,6 +149,10 @@ pub fn list_sessions() -> Result<Vec<SessionMeta>> {
 
 pub fn load_slug(slug: &str) -> Result<Session> {
     migrate_legacy_if_needed()?;
+    let slug = slug.trim();
+    if !valid_slug(slug) {
+        return Err(anyhow!("invalid session slug: {slug}"));
+    }
     let path = session_path(slug);
     let mut session = if path.is_file() {
         let text = fs::read_to_string(&path)?;
@@ -194,6 +202,9 @@ pub fn load_active() -> Session {
 pub fn save_session_as(session: &mut Session, slug: &str, name: Option<&str>) -> Result<()> {
     migrate_legacy_if_needed()?;
     let slug = slugify(slug);
+    if !valid_slug(&slug) {
+        return Err(anyhow!("invalid session slug: {slug}"));
+    }
     session.slug = slug.clone();
     if let Some(n) = name {
         session.name = n.to_string();
@@ -225,8 +236,8 @@ pub fn save_active(session: &mut Session) -> Result<()> {
 
 pub fn delete_slug(slug: &str) -> Result<()> {
     let slug = slug.trim();
-    if slug.is_empty() {
-        return Err(anyhow!("empty slug"));
+    if !valid_slug(slug) {
+        return Err(anyhow!("invalid session slug: {slug}"));
     }
     let path = session_path(slug);
     if path.is_file() {
@@ -245,8 +256,15 @@ pub fn delete_slug(slug: &str) -> Result<()> {
 }
 
 pub fn rename_slug(old: &str, new_name: &str) -> Result<String> {
+    let old = old.trim();
+    if !valid_slug(old) {
+        return Err(anyhow!("invalid session slug: {old}"));
+    }
     let mut session = load_slug(old)?;
     let new_slug = slugify(new_name);
+    if !valid_slug(&new_slug) {
+        return Err(anyhow!("invalid session slug: {new_slug}"));
+    }
     if new_slug != old && session_path(&new_slug).is_file() {
         return Err(anyhow!("session already exists: {new_slug}"));
     }

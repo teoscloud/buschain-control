@@ -739,10 +739,11 @@ fn open_shm(name: &str, size: usize) -> Result<std::fs::File> {
             return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
         }
     }
-    let path = std::env::var_os("XDG_RUNTIME_DIR")
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(format!("buschain-{}.shm", name.trim_start_matches('/')));
+        .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR unset — refuse temp-dir shm fallback"))?;
+    let path = base.join(format!("buschain-{}.shm", name.trim_start_matches('/')));
     OpenOptions::new()
         .read(true)
         .write(true)

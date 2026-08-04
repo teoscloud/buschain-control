@@ -227,8 +227,10 @@ pub fn build_mixer_json(
 
 /// Touch `$XDG_RUNTIME_DIR/buschain-control/mixer.tick` so QS can FileView-wake.
 pub fn touch_mixer_tick() {
-    let path = crate::ipc::runtime_dir().join("mixer.tick");
-    let _ = std::fs::create_dir_all(crate::ipc::runtime_dir());
+    let Ok(dir) = crate::ipc::ensure_runtime_dir() else {
+        return;
+    };
+    let path = dir.join("mixer.tick");
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .write(true)

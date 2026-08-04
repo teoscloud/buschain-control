@@ -263,8 +263,12 @@ pub fn close_editor(slot_id: Uuid) {
 
 fn editor_socket_path(slot_id: Uuid) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| {
+            // Must not land under /tmp; helper open will fail loudly if unset.
+            PathBuf::from("/run/user/invalid")
+        });
     base.join(format!("buschain-editor-{}.sock", slot_id.simple()))
 }
 

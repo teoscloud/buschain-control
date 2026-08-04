@@ -1,6 +1,7 @@
 //! Unix-socket JSON line protocol for daemon ↔ UI / ctl / waybar.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,15 +13,33 @@ use crate::audio::graph::PwSnapshot;
 use crate::audio::worker::Command;
 use crate::session::Session;
 
-pub fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
+/// `$XDG_RUNTIME_DIR/buschain-control` — never falls back to `/tmp`.
+pub fn try_runtime_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("buschain-control")
+        .ok_or_else(|| {
+            anyhow!("XDG_RUNTIME_DIR is unset — refusing /tmp fallback for BusChain IPC")
+        })?;
+    Ok(base.join("buschain-control"))
 }
 
-pub fn socket_path() -> PathBuf {
-    runtime_dir().join("daemon.sock")
+/// Create the runtime dir with mode `0700` (same class as Pulse/PipeWire runtime dirs).
+pub fn ensure_runtime_dir() -> Result<PathBuf> {
+    let dir = try_runtime_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create runtime dir {}", dir.display()))?;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    Ok(dir)
+}
+
+/// Canonical runtime dir (requires `XDG_RUNTIME_DIR`).
+pub fn runtime_dir() -> Result<PathBuf> {
+    try_runtime_dir()
+}
+
+pub fn socket_path() -> Result<PathBuf> {
+    Ok(try_runtime_dir()?.join("daemon.sock"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,7 +160,7 @@ pub struct Client;
 
 impl Client {
     pub fn connect() -> Result<UnixStream> {
-        let path = socket_path();
+        let path = socket_path()?;
         UnixStream::connect(&path).with_context(|| format!("connect {}", path.display()))
     }
 
@@ -182,14 +201,47 @@ impl Client {
     }
 }
 
+/// Reject peers whose UID does not match ours (SO_PEERCRED). Same-UID malware
+/// still wins; this only blocks cross-user connects if the socket were somehow
+/// reachable outside a private runtime dir.
+pub fn peer_uid_ok(stream: &UnixStream) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd;
+        let mut cred = MaybeUninit::<libc::ucred>::uninit();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        let cred = unsafe { cred.assume_init() };
+        cred.uid == unsafe { libc::getuid() }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        true
+    }
+}
+
 pub fn bind_listener() -> Result<UnixListener> {
-    let dir = runtime_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = socket_path();
+    let dir = ensure_runtime_dir()?;
+    let path = dir.join("daemon.sock");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     // Stale-socket friendly.
     listener.set_nonblocking(true)?;
+    // Socket mode: owner-only (dir is already 0700).
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     Ok(listener)
 }
 

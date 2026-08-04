@@ -37,27 +37,26 @@ fn lat_trace(msg: &str) {
     append_spawn_log(&format!("lat {msg}"));
 }
 
-fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("buschain-control")
+fn runtime_dir() -> Option<PathBuf> {
+    crate::ipc::ensure_runtime_dir().ok()
 }
 
-fn mixer_pid_path() -> PathBuf {
-    runtime_dir().join("mixer.pid")
+fn mixer_pid_path() -> Option<PathBuf> {
+    Some(runtime_dir()?.join("mixer.pid"))
 }
 
-fn mixer_spawn_log_path() -> PathBuf {
-    runtime_dir().join("mixer-spawn.log")
+fn mixer_spawn_log_path() -> Option<PathBuf> {
+    Some(runtime_dir()?.join("mixer-spawn.log"))
 }
 
 fn append_spawn_log(line: &str) {
-    let _ = fs::create_dir_all(runtime_dir());
+    let Some(path) = mixer_spawn_log_path() else {
+        return;
+    };
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(mixer_spawn_log_path())
+        .open(path)
     {
         let _ = writeln!(f, "{line}");
     }
@@ -120,7 +119,7 @@ fn proc_looks_like_mixer(pid: u32) -> bool {
 
 /// Live mixer PID from pidfile, or `None` after clearing stale/zombie entries.
 fn live_mixer_pid() -> Option<u32> {
-    let path = mixer_pid_path();
+    let path = mixer_pid_path()?;
     let Ok(text) = fs::read_to_string(&path) else {
         return None;
     };
@@ -137,7 +136,9 @@ fn live_mixer_pid() -> Option<u32> {
 }
 
 fn clear_mixer_pidfile_if(pid: u32) {
-    let path = mixer_pid_path();
+    let Some(path) = mixer_pid_path() else {
+        return;
+    };
     if let Ok(text) = fs::read_to_string(&path) {
         if text.trim().parse::<u32>().ok() == Some(pid) {
             let _ = fs::remove_file(&path);
@@ -184,8 +185,14 @@ const LATE_DEATH_WATCH: Duration = Duration::from_millis(700);
 
 /// Spawn mixer **open** path; poll readiness instead of blind sleeps. Reaps child.
 fn spawn_mixer_open(mixer: &Path) -> bool {
-    let _ = fs::create_dir_all(runtime_dir());
-    let log_path = mixer_spawn_log_path();
+    let Some(dir) = runtime_dir() else {
+        append_spawn_log("spawn-open aborted: XDG_RUNTIME_DIR unset");
+        return false;
+    };
+    let _ = dir; // ensure_runtime_dir already created it
+    let Some(log_path) = mixer_spawn_log_path() else {
+        return false;
+    };
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)

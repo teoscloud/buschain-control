@@ -174,7 +174,7 @@ impl RemoteProcessor {
         }
         self.map = Some(map);
 
-        let sock_path = runtime_dir().join(format!("bc-dsp-{pid}-{uniq}.sock"));
+        let sock_path = runtime_dir()?.join(format!("bc-dsp-{pid}-{uniq}.sock"));
         ensure_unix_sock_path(&sock_path)?;
         let _ = std::fs::remove_file(&sock_path);
 
@@ -207,7 +207,7 @@ impl RemoteProcessor {
             .stderr(Stdio::inherit());
 
         if let Some(slot_id) = surface_slot {
-            let editor_sock = runtime_dir().join(format!(
+            let editor_sock = runtime_dir()?.join(format!(
                 "buschain-editor-{}.sock",
                 slot_id.simple()
             ));
@@ -217,7 +217,7 @@ impl RemoteProcessor {
                 .arg(&editor_sock);
             if let Some(blob) = state_blob.filter(|b| !b.is_empty()) {
                 let state_path =
-                    runtime_dir().join(format!("buschain-state-{}.bin", slot_id.simple()));
+                    runtime_dir()?.join(format!("buschain-state-{}.bin", slot_id.simple()));
                 std::fs::write(&state_path, &blob)?;
                 cmd.arg("--state-file").arg(&state_path);
             }
@@ -419,10 +419,15 @@ fn ensure_unix_sock_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
+fn runtime_dir() -> anyhow::Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .ok_or_else(|| {
+            anyhow::anyhow!("XDG_RUNTIME_DIR is unset — refusing temp-dir fallback for DSP IPC")
+        })?;
+    let dir = base; // keep socks under XDG_RUNTIME_DIR (not a shared /tmp tree)
+    Ok(dir)
 }
 
 fn find_helper_binary(name: &str) -> Option<PathBuf> {
@@ -475,7 +480,7 @@ fn shm_open_create(name: &str, size: usize) -> anyhow::Result<std::fs::File> {
             return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
         }
     }
-    let path = runtime_dir().join(format!("buschain-{}.shm", sanitize(name)));
+    let path = runtime_dir()?.join(format!("buschain-{}.shm", sanitize(name)));
     let f = OpenOptions::new()
         .read(true)
         .write(true)

@@ -431,23 +431,24 @@ impl DaemonState {
         }
     }
 
-    fn waybar_runtime_dir() -> std::path::PathBuf {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join("buschain-control")
+    fn waybar_runtime_dir() -> anyhow::Result<std::path::PathBuf> {
+        crate::ipc::ensure_runtime_dir()
     }
 
     /// Mark an active Master HW scroll gesture for pill / RTMIN cool-down.
     fn touch_waybar_scroll_marker() {
-        let dir = Self::waybar_runtime_dir();
-        let _ = std::fs::create_dir_all(&dir);
+        let Ok(dir) = Self::waybar_runtime_dir() else {
+            return;
+        };
         let marker = dir.join("waybar-scroll-ms");
         let _ = std::fs::write(&marker, b"1");
     }
 
     fn waybar_scroll_marker_hot() -> bool {
-        let marker = Self::waybar_runtime_dir().join("waybar-scroll-ms");
+        let Ok(dir) = Self::waybar_runtime_dir() else {
+            return false;
+        };
+        let marker = dir.join("waybar-scroll-ms");
         std::fs::metadata(&marker)
             .and_then(|m| m.modified())
             .map(|t| {
@@ -1430,6 +1431,10 @@ fn serve_loop(state: Arc<Mutex<DaemonState>>, listener: std::os::unix::net::Unix
 
         match listener.accept() {
             Ok((stream, _)) => {
+                if !ipc::peer_uid_ok(&stream) {
+                    eprintln!("buschain-control: rejected IPC peer (UID mismatch)");
+                    continue;
+                }
                 let st = state.clone();
                 std::thread::spawn(move || handle_client(st, stream));
             }
@@ -1456,7 +1461,9 @@ pub fn run() -> Result<()> {
 
     eprintln!(
         "buschain-daemon listening on {}",
-        ipc::socket_path().display()
+        ipc::socket_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(no XDG_RUNTIME_DIR)".into())
     );
     crate::scroll_strip::spawn_scroll_strip_async();
     serve_loop(state, listener);
@@ -1474,7 +1481,9 @@ pub fn start_embedded(cmd_tx: Sender<Command>) -> Result<()> {
     let state = Arc::new(Mutex::new(DaemonState::new_embedded(cmd_tx)));
     eprintln!(
         "buschain-control: embedded IPC on {}",
-        ipc::socket_path().display()
+        ipc::socket_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "(no XDG_RUNTIME_DIR)".into())
     );
     std::thread::Builder::new()
         .name("buschain-ipc".into())

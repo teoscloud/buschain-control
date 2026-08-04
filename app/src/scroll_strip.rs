@@ -80,7 +80,10 @@ fn resolve_scroll_strip() -> Option<PathBuf> {
 }
 
 fn kill_existing_strip() {
-    let path = ipc::runtime_dir().join("scroll-strip.pid");
+    let Ok(dir) = ipc::runtime_dir() else {
+        return;
+    };
+    let path = dir.join("scroll-strip.pid");
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(pid) = text.trim().parse::<i32>() {
             if pid > 1 {

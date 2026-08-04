@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::store::{config_dir, slugify};
+use super::store::{config_dir, slugify, valid_slug};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemePreset {
@@ -77,12 +77,20 @@ pub fn save_theme(name: &str, accent_rgb: [u8; 3]) -> Result<ThemeMeta> {
 }
 
 pub fn load_theme(slug: &str) -> Result<ThemePreset> {
+    let slug = slug.trim();
+    if !valid_slug(slug) {
+        return Err(anyhow!("invalid theme slug: {slug}"));
+    }
     let path = theme_path(slug);
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
 pub fn delete_theme(slug: &str) -> Result<()> {
+    let slug = slug.trim();
+    if !valid_slug(slug) {
+        return Err(anyhow!("invalid theme slug: {slug}"));
+    }
     let path = theme_path(slug);
     if path.exists() {
         fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;

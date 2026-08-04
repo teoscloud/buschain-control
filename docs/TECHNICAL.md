@@ -94,6 +94,25 @@ Standalone Nix flake — build and run from this repository.
 | `buschain-daemon` | Legacy headless supervisor (**debug only** — do not enable as a user unit) |
 
 IPC: `$XDG_RUNTIME_DIR/buschain-control/daemon.sock` (newline JSON), served by the tray app.
+Requires `XDG_RUNTIME_DIR` (no `/tmp` fallback); runtime dir mode `0700`, socket `0600`.
+Accepts only same-UID peers (`SO_PEERCRED`).
+
+---
+
+## Security / threat model
+
+BusChain runs as your user — same privilege class as PipeWire / pipewire-pulse /
+WirePlumber clients. No setuid, polkit, or network listeners.
+
+| Boundary | Notes |
+|----------|--------|
+| Privilege | User session only; deprecated systemd unit is a no-op stub |
+| IPC | Local Unix socket under `$XDG_RUNTIME_DIR` — any **same-UID** process can drive the mixer (mute, route, load session, Shutdown). Same class as local `pactl`/`pw-cli`, concentrated in one control plane |
+| Plugins | LADSPA / LV2 / CLAP / VST3 load **in-process by default** (like a DAW). Optional SHM helpers (`BUSCHAIN_SANDBOX_*` / session `sandbox_untrusted`) are **crash isolation**, not a security sandbox |
+| Sessions | Slugs must be a single path segment (`valid_slug`); load/delete reject `..` / separators |
+
+Treat `daemon.sock` as full control of this user’s audio + BusChain config. Do not
+run without `XDG_RUNTIME_DIR`. Do not treat third-party plugins as trusted code.
 
 ---
 

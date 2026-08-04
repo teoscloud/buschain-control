@@ -124,10 +124,12 @@ fn stop_leftover_daemons(root: &Path) {
     }
     thread::sleep(Duration::from_millis(200));
     let runtime = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let sock = runtime.join("buschain-control/daemon.sock");
-    let _ = std::fs::remove_file(&sock);
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    if let Some(runtime) = runtime {
+        let sock = runtime.join("buschain-control/daemon.sock");
+        let _ = std::fs::remove_file(&sock);
+    }
 }
 
 /// Run once at process start for local `cargo run` workflows.
