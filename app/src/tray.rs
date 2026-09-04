@@ -59,15 +59,24 @@ impl ksni::Tray for BusChainTray {
         "BusChain Control".into()
     }
 
+    fn icon_theme_path(&self) -> String {
+        crate::brand::tray_icon_theme_path()
+    }
+
     fn icon_name(&self) -> String {
-        "audio-volume-high".into()
+        crate::brand::tray_icon_name()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        crate::brand::tray_icon_pixmap()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
+            icon_name: crate::brand::tray_icon_name(),
+            icon_pixmap: crate::brand::tray_icon_pixmap(),
             title: "BusChain Control".into(),
             description: "Mixer — left-click popup · right-click for full app".into(),
-            ..Default::default()
         }
     }
 

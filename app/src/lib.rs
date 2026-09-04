@@ -2,6 +2,7 @@
 
 pub mod app_state;
 pub mod audio;
+pub mod brand;
 pub mod daemon;
 pub mod design;
 pub mod ipc;

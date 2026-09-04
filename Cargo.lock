@@ -2173,8 +2173,6 @@ dependencies = [
 [[package]]
 name = "lilv"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06e14c13e0d64ed27265d0cc41563b131cd8499cde811618b646dd309763906d"
 dependencies = [
  "lilv-sys",
  "lv2_raw",

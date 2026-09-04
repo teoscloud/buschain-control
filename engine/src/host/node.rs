@@ -1,7 +1,7 @@
 //! PipeWire filter node — process() runs inside the PW RT data callback.
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -315,7 +315,7 @@ fn run_filter_loop(
             c"true".as_ptr(),
             c"clock.quantum-limit".as_ptr(),
             q_c.as_ptr(),
-            ptr::null::<i8>(),
+            ptr::null::<c_char>(),
         );
 
         let mut userdata = Box::new(FilterUserData {
@@ -421,7 +421,7 @@ unsafe fn add_dsp_port(
         c"32 bit float mono audio".as_ptr(),
         c"port.name".as_ptr(),
         name_c.as_ptr(),
-        ptr::null::<i8>(),
+        ptr::null::<c_char>(),
     );
     let port = pw_sys::pw_filter_add_port(
         filter,
@@ -442,7 +442,7 @@ unsafe extern "C" fn on_state_changed(
     data: *mut c_void,
     _old: pw_sys::pw_filter_state,
     state: pw_sys::pw_filter_state,
-    _error: *const i8,
+    _error: *const c_char,
 ) {
     if data.is_null() {
         return;

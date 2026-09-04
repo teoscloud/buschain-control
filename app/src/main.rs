@@ -3,6 +3,7 @@ use std::time::Duration;
 use eframe::egui;
 use buschain_control::app_state::AppState;
 use buschain_control::audio;
+use buschain_control::brand;
 use buschain_control::design::Theme;
 use buschain_control::tray::{self, HeadlessWait};
 use buschain_control::ui;
@@ -54,7 +55,7 @@ fn main() -> eframe::Result<()> {
         None
     };
 
-    let icon = window_icon();
+    let icon = brand::window_icon();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1100.0, 720.0])
         .with_min_inner_size([800.0, 480.0])
@@ -112,7 +113,7 @@ fn run_popup(args: &[String]) -> eframe::Result<()> {
         .map(|w| w[1].as_str())
         .unwrap_or("playback");
 
-    let icon = window_icon();
+    let icon = brand::window_icon();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([480.0, 560.0])
         .with_min_inner_size([360.0, 320.0])
@@ -146,17 +147,6 @@ fn run_popup(args: &[String]) -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
-}
-
-fn window_icon() -> Option<egui::IconData> {
-    let bytes = include_bytes!("../../assets/icons/buschain-control.png");
-    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
-    let (w, h) = img.dimensions();
-    Some(egui::IconData {
-        rgba: img.into_raw(),
-        width: w,
-        height: h,
-    })
 }
 
 struct BusChainApp {
