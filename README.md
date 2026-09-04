@@ -18,7 +18,7 @@ Closing the window minimizes to the tray. Quit from the tray (or Settings) tears
 - Hyprland / Wayland rices (Quickshell, Waybar) and general desktops via GTK / egui popup
 - Anyone routing browsers, games, Discord, mics, and hardware through per-app buses with FX
 
-**Needs:** PipeWire (+ `pactl`), Wayland session. Optional GTK mixer strip via Nix / package deps.
+**Needs:** PipeWire (+ `pactl`), Wayland session. Optional GTK mixer strip via Nix / package deps. Nix flake targets **`x86_64-linux`** and **`aarch64-linux`** natively; most commercial VST3/CLAP Linux builds remain x86_64-only.
 
 ---
 

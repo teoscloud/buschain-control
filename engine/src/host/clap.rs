@@ -207,6 +207,12 @@ impl ClapInstance {
         if sample_rate == 0 || max_block == 0 {
             bail!("invalid audio config sr={sample_rate} max_block={max_block}");
         }
+        if !crate::host::arch::elf_matches_host(Path::new(path)) {
+            bail!(
+                "CLAP ELF arch mismatch (need {}): {path}",
+                crate::host::arch::host_arch_label()
+            );
+        }
 
         let host_info = HostInfo::new(
             "BusChain Control",

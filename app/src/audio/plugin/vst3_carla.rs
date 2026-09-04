@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use buschain_engine::host::vst3_bundle_has_host_binary;
+
 use super::{PluginBackend, PluginDescriptor, PluginFormat, PluginId};
 
 pub struct CarlaVst3Backend;
@@ -77,8 +79,11 @@ fn walk_vst3_bundles(
             } else {
                 continue;
             };
-            // Skip empty / invalid bundles (no linux binary).
-            if path.is_dir() && !bundle_has_linux_binary(&path) {
+            // Skip bundles that lack a host-arch Linux binary (e.g. x86-only on aarch64).
+            if path.is_dir() && !vst3_bundle_has_host_binary(&path) {
+                continue;
+            }
+            if path.is_file() && !buschain_engine::host::elf_matches_host(&path) {
                 continue;
             }
             let key = path.display().to_string();
@@ -107,31 +112,4 @@ fn walk_vst3_bundles(
             walk_vst3_bundles(&p, out, seen, depth + 1);
         }
     }
-}
-
-fn bundle_has_linux_binary(bundle: &Path) -> bool {
-    let candidates = [
-        bundle.join("Contents/x86_64-linux"),
-        bundle.join("Contents/aarch64-linux"),
-        bundle.join("Contents/i386-linux"),
-    ];
-    for dir in candidates {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("so") {
-                    return true;
-                }
-            }
-        }
-    }
-    // Some bundles ship a top-level .so
-    if let Ok(rd) = std::fs::read_dir(bundle) {
-        for e in rd.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("so") {
-                return true;
-            }
-        }
-    }
-    false
 }

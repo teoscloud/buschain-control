@@ -177,9 +177,28 @@ nix profile install github:teoscloud/buschain-control   # optional
 | CLAP | `CLAP_PATH`, `~/.clap` |
 | VST3 | `VST3_PATH`, `~/.vst3`, `~/.local/lib/vst3`, `/usr/lib/vst3` (recursive) |
 
-If a VST3 fails with `lib….so: not found`, `ldd` the `.so` under
-`Plugin.vst3/Contents/x86_64-linux/` and add that package to
-`vst3PluginRuntimeLibs` in [`flake.nix`](../flake.nix).
+Scan and load keep **host-native** binaries only: VST3 under
+`Plugin.vst3/Contents/x86_64-linux/` or `Contents/aarch64-linux/` matching the
+CPU, and CLAP/LADSPA `.so`/`.clap` whose ELF `e_machine` matches the process.
+Wrong-arch commercial Linux plugins (almost always x86_64-only) are skipped
+rather than listed and failing at `dlopen`.
+
+If a VST3 fails with `lib….so: not found`, `ldd` the `.so` under the host
+Contents dir above and add that package to `vst3PluginRuntimeLibs` in
+[`flake.nix`](../flake.nix).
+
+### Supported architectures
+
+Flake packages / `nix develop` export **`x86_64-linux`** and **`aarch64-linux`**
+(native builds per system — no FEX/box64 in the audio path). Core app, GTK
+mixer, and in-tree LADSPA/LV2 builtins are expected to work on both. Third-party
+VST3/CLAP availability on aarch64 depends on the vendor shipping an ARM Linux
+build.
+
+On an aarch64 machine, `nix develop` and `nix build` use the matching outputs
+automatically. From x86_64, building aarch64 packages requires qemu-user
+binfmt (e.g. NixOS `boot.binfmt.emulatedSystems = [ "aarch64-linux" ];`) or a
+remote/CI aarch64 builder — evaluation alone does not need emulation.
 
 ### Hyprland + floating VST3 editors
 

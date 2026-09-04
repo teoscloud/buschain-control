@@ -1,0 +1,40 @@
+# Native Nix builds for x86_64-linux and aarch64-linux.
+name: nix
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: nix build (${{ matrix.system }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            os: ubuntu-latest
+          - system: aarch64-linux
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build package
+        run: nix build -L ".#packages.${{ matrix.system }}.default"
+
+      - name: Check ELF arch
+        run: |
+          set -euo pipefail
+          bin=result/bin/buschain-control
+          file -b "$bin"
+          case "${{ matrix.system }}" in
+            x86_64-linux)  file -b "$bin" | grep -qi 'x86-64\|x86_64\|AMD64' ;;
+            aarch64-linux) file -b "$bin" | grep -qi 'aarch64\|ARM aarch64' ;;
+          esac

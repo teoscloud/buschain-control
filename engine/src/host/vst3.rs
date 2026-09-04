@@ -50,6 +50,20 @@ impl Vst3Instance {
             bail!("invalid audio config sr={sample_rate} max_block={max_block}");
         }
 
+        let p = std::path::Path::new(path);
+        if p.is_dir() && !crate::host::arch::vst3_bundle_has_host_binary(p) {
+            bail!(
+                "VST3 has no {} binary (wrong arch): {path}",
+                crate::host::arch::host_arch_label()
+            );
+        }
+        if p.is_file() && !crate::host::arch::elf_matches_host(p) {
+            bail!(
+                "VST3 ELF arch mismatch (need {}): {path}",
+                crate::host::arch::host_arch_label()
+            );
+        }
+
         let mut host = Vst3Host::builder()
             .sample_rate(sample_rate as f64)
             .block_size(max_block as usize)
@@ -328,12 +342,22 @@ fn resolve_module_path(path: &str) -> String {
         return path.to_string();
     }
     if p.is_dir() {
+        // Prefer host-arch Contents/ first so multi-arch bundles load natively.
+        let host_sub = crate::host::arch::host_vst3_contents_subdir();
+        let mut subs: Vec<&str> = vec![host_sub];
         for sub in ["Contents/x86_64-linux", "Contents/aarch64-linux", "Contents/i386-linux"] {
+            if sub != host_sub {
+                subs.push(sub);
+            }
+        }
+        for sub in subs {
             let dir = p.join(sub);
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let cand = e.path();
-                    if cand.extension().and_then(|x| x.to_str()) == Some("so") {
+                    if cand.extension().and_then(|x| x.to_str()) == Some("so")
+                        && crate::host::arch::elf_matches_host(&cand)
+                    {
                         // vst3-host wants the bundle path, not the .so — keep bundle.
                         return path.to_string();
                     }

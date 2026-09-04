@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use buschain_engine::host::elf_matches_host;
+
 use super::{PluginBackend, PluginDescriptor, PluginFormat, PluginId};
 
 /// CLAP scanner (filesystem .clap bundles). Instantiation lands in a later pass.
@@ -50,6 +52,9 @@ fn walk_clap(dir: &Path, out: &mut Vec<PluginDescriptor>) {
         if path.is_dir() {
             walk_clap(&path, out);
         } else if path.extension().and_then(|x| x.to_str()) == Some("clap") {
+            if !elf_matches_host(&path) {
+                continue;
+            }
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())

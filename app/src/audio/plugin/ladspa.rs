@@ -35,7 +35,9 @@ impl LadspaBackend {
                     for e in rd.flatten() {
                         let f = e.path();
                         if f.extension().and_then(|x| x.to_str()) == Some("so") {
-                            out.push(f);
+                            if buschain_engine::host::elf_matches_host(&f) {
+                                out.push(f);
+                            }
                         }
                     }
                 }

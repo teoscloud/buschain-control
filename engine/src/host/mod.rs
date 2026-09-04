@@ -1,5 +1,6 @@
 //! In-process insert DSP host — RT-safe rack, LADSPA/LV2/CLAP/VST3, PipeWire filter node.
 
+pub mod arch;
 mod clap;
 mod control;
 mod denormal;
@@ -25,6 +26,10 @@ pub mod registry;
 
 pub use spectrum::{SpectrumFrame, SpectrumBus, ANALYSIS_N, FFT_N, HOP, MAG_N};
 
+pub use arch::{
+    elf_machine, elf_matches_host, host_arch_label, host_elf_machine, host_vst3_contents_subdir,
+    vst3_bundle_has_host_binary,
+};
 pub use clap::{has_clap_entry, probe_clap_params, ClapInstance, ClapParamInfo};
 pub use control::{ControlMsg, ControlQueue};
 pub use denormal::DenormalGuard;
