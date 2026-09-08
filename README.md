@@ -264,6 +264,7 @@ export BUSCHAIN_CONTROL_SCROLL_STRIP=1    # opt-in GTK Master HW strip
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Live graph / engine contract |
 | [`docs/HANDOVER-QUICKSHELL.md`](docs/HANDOVER-QUICKSHELL.md) | Quickshell rice contract |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Done / planned work |
+| [`docs/MACOS-PORT.md`](docs/MACOS-PORT.md) | Apple Silicon / macOS feasibility (investigation only — not supported) |
 
 ---
 

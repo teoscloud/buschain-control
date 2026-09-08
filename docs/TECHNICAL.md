@@ -200,6 +200,10 @@ automatically. From x86_64, building aarch64 packages requires qemu-user
 binfmt (e.g. NixOS `boot.binfmt.emulatedSystems = [ "aarch64-linux" ];`) or a
 remote/CI aarch64 builder — evaluation alone does not need emulation.
 
+**macOS / `aarch64-darwin` is out of scope for the flake.** A faithful Control
+port is not a compile target (PipeWire system mixer). Feasibility, blockers, and
+limited port shapes: [`MACOS-PORT.md`](MACOS-PORT.md).
+
 ### Hyprland + floating VST3 editors
 
 When `HYPRLAND_INSTANCE_SIGNATURE` is set, BusChain runs
