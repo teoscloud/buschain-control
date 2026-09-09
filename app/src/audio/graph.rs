@@ -827,6 +827,48 @@ pub fn move_sink_input_if_needed(index: u32, sink: &str, current: &str) -> Resul
     Ok(true)
 }
 
+/// Pactl/wpctl only — never takes ENGINE. Used by Quit restore.
+fn set_default_sink_raw(name: &str) -> Result<()> {
+    match run_ok("pactl", &["set-default-sink", name]) {
+        Ok(()) => {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if pactl_info_default("Default Sink:").as_deref() == Some(name) {
+                return Ok(());
+            }
+            run_ok("pactl", &["set-default-sink", name])
+        }
+        Err(e) => {
+            if let Some(id) = sink_index_by_name(name) {
+                let _ = Command::new("wpctl")
+                    .args(["set-default", &id.to_string()])
+                    .status();
+                if pactl_info_default("Default Sink:").as_deref() == Some(name) {
+                    return Ok(());
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+fn set_sink_mute_raw(name: &str, mute: bool) {
+    let _ = run_ok(
+        "pactl",
+        &["set-sink-mute", name, if mute { "1" } else { "0" }],
+    );
+}
+
+fn set_source_mute_raw(name: &str, mute: bool) {
+    let _ = run_ok(
+        "pactl",
+        &[
+            "set-source-mute",
+            name,
+            if mute { "1" } else { "0" },
+        ],
+    );
+}
+
 pub fn set_default_sink(name: &str) -> Result<()> {
     if crate::audio::engine_handle::set_default_sink(name).unwrap_or(false) {
         return Ok(());
@@ -919,6 +961,10 @@ pub fn session_graph_is_hollow(session: &crate::session::Session) -> bool {
     }
     // Still mid-restart — not hollow yet (detector waits for Pulse up).
     if !pulse_daemon_up() {
+        return false;
+    }
+    // Mid clock bind / bus migrate: master sink is briefly gone — not hollow.
+    if buschain_engine::clock_mutation_in_flight() {
         return false;
     }
     if buschain_engine::backend::plane_is_dead() || !buschain_engine::backend::native_ready() {
@@ -1475,72 +1521,38 @@ pub fn sweep_orphan_buschain_at_startup() -> String {
     )
 }
 
-/// Hand PipeWire back to real hardware and destroy linger BusChain nodes.
-/// Call on Quit / Shutdown / Teardown — not on hide-to-tray.
-pub fn restore_system_audio(preferred_hw: Option<&str>) -> Result<String> {
+/// Hand PipeWire back to real hardware **without** taking ENGINE.
+/// Safe on the UI / exit thread while the worker still holds the mutex.
+pub fn restore_desktop_now(preferred_hw: Option<&str>) -> String {
     let hw_sink = resolve_restore_hw_sink(preferred_hw);
     let hw_src = resolve_restore_hw_source();
 
-    // Drop Pulse loopback clutter before moving apps off BusChain sinks.
-    let _ = buschain_engine::backend::unload_buschain_pulse_loopbacks();
+    let _ = buschain_engine::clear_graph_force_clock();
 
     let mut moved = 0u32;
-    let mut moved_serials: std::collections::HashSet<u32> = std::collections::HashSet::new();
     if let Some(ref hw) = hw_sink {
-        // Native retarget by sink NAME first — writes resolvable `target.object` to HW
-        // before BusChain nodes are destroyed. Leaving a dead buschain_* target corks
-        // Chromium/Electron until the app recreates its stream.
-        if buschain_engine::backend::native_ready() {
-            for stream in buschain_engine::backend::list_playback_streams() {
-                let on_bc = stream.sink.starts_with("buschain_")
-                    || stream.sink.starts_with("shadow_");
-                if !on_bc {
-                    continue;
-                }
-                if stream.node_name.starts_with("buschain_")
-                    || stream
-                        .media_name
-                        .as_deref()
-                        .is_some_and(|m| m.eq_ignore_ascii_case("buschain-control"))
-                {
-                    continue;
-                }
-                if buschain_engine::backend::pulse_compat::move_sink_input(stream.serial, hw)
-                    .unwrap_or(false)
-                {
-                    if moved_serials.insert(stream.serial) {
-                        moved += 1;
-                    }
-                }
-            }
-        }
         if let Ok(inputs) = list_sink_inputs() {
             for si in inputs {
-                if si.sink_or_source.starts_with("buschain_")
-                    || si.sink_or_source.starts_with("shadow_")
+                if run_ok(
+                    "pactl",
+                    &["move-sink-input", &si.index.to_string(), hw],
+                )
+                .is_ok()
                 {
-                    if moved_serials.contains(&si.index) {
-                        continue;
-                    }
-                    if move_sink_input(si.index, hw).is_ok() {
-                        moved_serials.insert(si.index);
-                        moved += 1;
-                    }
+                    moved += 1;
                 }
             }
         }
-        let _ = set_default_sink(hw);
-        let _ = set_sink_mute(hw, false);
+        let _ = set_default_sink_raw(hw);
+        set_sink_mute_raw(hw, false);
+        let _ = run_ok("pactl", &["set-sink-volume", hw, "80%"]);
     }
 
     if let Some(ref src) = hw_src {
-        let _ = set_default_source(src);
-        let _ = set_source_mute(src, false);
+        let _ = run_ok("pactl", &["set-default-source", src]);
+        set_source_mute_raw(src, false);
     }
 
-    // Clear DesiredState + destroy OBJECT_LINGER nodes while the engine is up.
-    let _ = crate::audio::engine_handle::engine_teardown();
-    silence_buschain_nodes();
     let to_unload = collect_buschain_modules_quit();
     let mut unloaded = 0u32;
     for idx in to_unload {
@@ -1548,23 +1560,62 @@ pub fn restore_system_audio(preferred_hw: Option<&str>) -> Result<String> {
             unloaded += 1;
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(60));
+    // Stacked linger nodes need more than one pw-cli pass.
+    for _ in 0..3 {
+        destroy_buschain_nodes_via_pw_cli();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
     destroy_remaining_buschain_nodes();
 
-    // Re-assert defaults after unload (WirePlumber can bounce to a dead buschain_*).
     if let Some(ref hw) = hw_sink {
-        let _ = set_default_sink(hw);
-        let _ = set_sink_mute(hw, false);
+        let _ = set_default_sink_raw(hw);
+        set_sink_mute_raw(hw, false);
     }
     if let Some(ref src) = hw_src {
-        let _ = set_default_source(src);
-        let _ = set_source_mute(src, false);
+        let _ = run_ok("pactl", &["set-default-source", src]);
+        set_source_mute_raw(src, false);
     }
 
-    Ok(format!(
+    format!(
         "Restored system audio → {} (moved {moved} stream(s), unloaded {unloaded} module(s))",
         hw_sink.as_deref().unwrap_or("(no HW sink found)"),
-    ))
+    )
+}
+
+/// Startup: leftover force-rate / default on a destroyed `buschain_*` silences
+/// the desktop and leaves the next boot stuck on the loading overlay.
+pub fn heal_leftover_graph_at_startup() -> String {
+    let _ = buschain_engine::clear_graph_force_clock();
+    let def = pactl_info_default("Default Sink:");
+    let sinks = list_sinks().unwrap_or_default();
+    let master_live = sinks.iter().any(|s| s.name == "buschain_master");
+    let dead_bc_default = def.as_deref().is_some_and(|d| {
+        (d.starts_with("buschain_") || d.starts_with("shadow_"))
+            && !sinks.iter().any(|s| s.name == *d)
+    });
+    if dead_bc_default || (!master_live && def.as_deref().is_some_and(|d| d.starts_with("buschain_")))
+    {
+        return restore_desktop_now(None);
+    }
+    String::new()
+}
+
+/// Hand PipeWire back to real hardware and destroy linger BusChain nodes.
+/// Call on Quit / Shutdown / Teardown — not on hide-to-tray.
+pub fn restore_system_audio(preferred_hw: Option<&str>) -> Result<String> {
+    let msg = restore_desktop_now(preferred_hw);
+    // Desired + linger proxies — may block if ENGINE is held; desktop is already restored.
+    let _ = crate::audio::engine_handle::engine_teardown();
+    destroy_remaining_buschain_nodes();
+    if let Some(hw) = resolve_restore_hw_sink(preferred_hw) {
+        let _ = set_default_sink_raw(&hw);
+        set_sink_mute_raw(&hw, false);
+    }
+    if let Some(src) = resolve_restore_hw_source() {
+        let _ = run_ok("pactl", &["set-default-source", &src]);
+        set_source_mute_raw(&src, false);
+    }
+    Ok(msg)
 }
 
 /// True for pre-rebrand Shadow Audio nodes (`shadow_*` / ShadowAudio_*).
@@ -2407,7 +2458,20 @@ pub fn apply_session(
 
     // Before claiming buschain_* preferred: capture desktop default → Master HW.
     let _ = seed_master_hw_plug_and_play(session);
-    let hw_sink = resolve_hardware_output(session)?;
+    let mut warnings: Vec<String> = Vec::new();
+    let hw_sink = match resolve_hardware_output(session) {
+        Ok(h) => h,
+        Err(e) => match resolve_restore_hw_sink(session.desktop_hw_sink.as_deref())
+            .or_else(|| resolve_restore_hw_sink(None))
+        {
+            Some(h) => {
+                warnings.push(format!("Master HW fallback → {h} ({e:#})"));
+                session.master_output = Some(h.clone());
+                h
+            }
+            None => return Err(e),
+        },
+    };
     crate::audio::engine_handle::remember_master_hw(&hw_sink);
     if let Ok(all_sinks) = list_sinks() {
         if let Some(d) = all_sinks.iter().find(|s| s.name == hw_sink) {
@@ -2425,7 +2489,6 @@ pub fn apply_session(
         remember_desktop_hw(session, &hw_sink, None);
     }
 
-    let mut warnings: Vec<String> = Vec::new();
     // Apps-rack pins require Pulse-visible VO — flip before preferred/Desired sync.
     if session.ensure_assigned_playback_vo() {
         warnings.push("Apps pins → System virtual output enabled".into());
@@ -2528,7 +2591,21 @@ pub fn apply_session(
             crate::audio::engine_handle::rewire_session_routes(session, &hw_sink)
         }
         ApplyKind::ClockBind => {
-            crate::audio::engine_handle::reconcile(session, &hw_sink)
+            let rec = crate::audio::engine_handle::reconcile(session, &hw_sink);
+            match crate::audio::engine_handle::arm_master_hw_after_clock() {
+                Ok(arm) if !arm.is_empty() => rec.map(|m| {
+                    if m.is_empty() {
+                        arm
+                    } else {
+                        format!("{m} · {arm}")
+                    }
+                }),
+                Ok(_) => rec,
+                Err(e) => {
+                    warnings.push(format!("master egress after clock: {e:#}"));
+                    rec
+                }
+            }
         }
     };
     match supervisor {

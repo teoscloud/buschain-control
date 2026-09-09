@@ -115,6 +115,7 @@ pub struct AppState {
     pub viz_live: bool,
     /// Cold ApplySession / ArmSession in flight — show loading chrome until done.
     pub graph_loading: bool,
+    graph_loading_since: Instant,
     /// Live MIDI device list + activity meters.
     pub midi_snapshot: buschain_engine::MidiSnapshot,
     /// Selected device for route matrix / learn filter.
@@ -229,6 +230,7 @@ impl AppState {
             request_hide: false,
             viz_live: true,
             graph_loading: !via_daemon,
+            graph_loading_since: Instant::now(),
             midi_snapshot: buschain_engine::MidiSnapshot::default(),
             midi_selected_device: None,
             midi_learn: None,
@@ -252,6 +254,26 @@ impl AppState {
             &self.session.clap_paths,
             self.session.vst3_enabled,
         );
+    }
+
+    fn mark_graph_loading(&mut self) {
+        self.graph_loading = true;
+        self.graph_loading_since = Instant::now();
+    }
+
+    /// Quit / process exit: restore HW default immediately (no ENGINE), then stop workers.
+    pub fn restore_desktop_and_stop_worker(&self) {
+        let hw = self
+            .session
+            .master_output
+            .clone()
+            .filter(|n| !n.is_empty() && !n.starts_with("buschain_"))
+            .or_else(|| self.session.desktop_hw_sink.clone());
+        let msg = crate::audio::graph::restore_desktop_now(hw.as_deref());
+        if !msg.is_empty() {
+            eprintln!("buschain-control: {msg}");
+        }
+        self.worker.send(Command::Shutdown);
     }
 
     pub fn graph_is_live(&self) -> bool {
@@ -306,18 +328,19 @@ impl AppState {
             self.pending_level_track = None;
             self.levels_pending_full = false;
             crate::daemon::overlay_track_mixer_authority(&mut self.session);
-            if crate::audio::graph::session_graph_is_hollow(&self.session)
-                || buschain_engine::backend::plane_is_dead()
+            if !buschain_engine::clock_mutation_in_flight()
+                && (crate::audio::graph::session_graph_is_hollow(&self.session)
+                    || buschain_engine::backend::plane_is_dead())
             {
                 self.worker
                     .send(crate::audio::worker::Command::ReconnectPipeWire);
-                self.graph_loading = true;
+                self.mark_graph_loading();
                 self.status = "PipeWire reconnecting — rebuilding graph…".into();
                 return;
             }
             self.worker
                 .send(Command::ApplySession(self.session.clone()));
-            self.graph_loading = true;
+            self.mark_graph_loading();
             self.status = format!(
                 "Loading audio graph ({}) — streams stay on buses…",
                 change.label()
@@ -408,12 +431,13 @@ impl AppState {
                 self.params_track = None;
                 self.pending_level_track = None;
                 self.levels_pending_full = false;
-                if crate::audio::graph::session_graph_is_hollow(&self.session)
-                    || buschain_engine::backend::plane_is_dead()
+                if !buschain_engine::clock_mutation_in_flight()
+                    && (crate::audio::graph::session_graph_is_hollow(&self.session)
+                        || buschain_engine::backend::plane_is_dead())
                 {
                     self.worker
                         .send(crate::audio::worker::Command::ReconnectPipeWire);
-                    self.graph_loading = true;
+                    self.mark_graph_loading();
                     self.status = "PipeWire reconnecting — rebuilding graph…".into();
                 } else {
                     self.worker
@@ -1588,7 +1612,7 @@ impl AppState {
                     let reconnecting = s.contains("PipeWire reconnect")
                         || s.contains("PipeWire graph hollow");
                     if reconnecting {
-                        self.graph_loading = true;
+                        self.mark_graph_loading();
                         self.meters.set_targets(vec![]);
                         self.meter_targets_sig = 0;
                     }
@@ -1605,7 +1629,11 @@ impl AppState {
                     }
                     let _ = missing;
                 }
-                Event::Error(e) => self.status = e,
+                Event::Error(e) => {
+                    self.status = e;
+                    // Failed Apply must not trap the mixer behind the loading veil.
+                    self.graph_loading = false;
+                }
                 Event::MidiSnapshot(s) => {
                     self.midi_snapshot = s;
                 }
@@ -1725,6 +1753,12 @@ impl AppState {
                     }
                 }
             }
+        }
+
+        if self.graph_loading
+            && (self.graph_is_live() || self.graph_loading_since.elapsed() > Duration::from_secs(20))
+        {
+            self.graph_loading = false;
         }
 
         if let Some(deadline) = self.meter_rebind_deadline {

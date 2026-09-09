@@ -20,9 +20,10 @@ pub use fx_busy::{is_rebuilding as fx_is_rebuilding, RebuildGuard as FxRebuildGu
 pub use fx_gen::{any_gen_live, heal_live_gen, live_fx_name, live_post_name};
 
 pub use clock::{
-    engine_rate_is_extreme, invalidate_clock_probe_caches, probe_endpoint_caps,
-    probe_master_hw_from_sinks, probe_rates_pw, probe_sink_running_rate, probe_source_running_rate,
-    resolve_engine_profile, resolve_profile, set_graph_force_clock, wait_hw_running_rate,
+    clear_graph_force_clock, clock_mutation_in_flight, engine_rate_is_extreme,
+    invalidate_clock_probe_caches, probe_endpoint_caps, probe_master_hw_from_sinks,
+    probe_rates_pw, probe_sink_running_rate, probe_source_running_rate, resolve_engine_profile,
+    resolve_profile, set_graph_force_clock, wait_hw_running_rate,
     AudioPreset, DeviceCaps, EndpointCaps, GraphClock, PerformanceProfile, ENGINE_QUANTUMS,
     ENGINE_RATES, ENGINE_RATE_WARN_ABOVE,
 };

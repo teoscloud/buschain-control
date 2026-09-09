@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use eframe::egui;
 use buschain_control::app_state::AppState;
-use buschain_control::audio;
 use buschain_control::brand;
 use buschain_control::design::Theme;
 use buschain_control::tray::{self, HeadlessWait};
@@ -236,7 +235,7 @@ impl eframe::App for BusChainApp {
         // preferred_default_sink with HW or reopen cannot reclaim apps.
         let _ = self.state.session.save();
         self.state.meters.shutdown();
-        self.state.worker.send(audio::worker::Command::Shutdown);
+        self.state.restore_desktop_and_stop_worker();
         tray::shutdown();
     }
 }

@@ -105,6 +105,24 @@ fn ensure_ctl(root: &Path, target: &Path) {
 
 fn stop_leftover_daemons(root: &Path) {
     let _ = root;
+    // A live tray instance still owns the graph. Stealing its socket used to
+    // start a second worker on leftover buschain_* nodes (silent desktop +
+    // stuck Loading overlay). Ask it to Quit+restore first.
+    if buschain_control::ipc::Client::ping() {
+        eprintln!("buschain-control: previous instance is live — asking it to quit…");
+        let _ = buschain_control::ipc::Client::call(&buschain_control::ipc::Request::Shutdown);
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while std::time::Instant::now() < deadline {
+            if !buschain_control::ipc::Client::ping() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(120));
+        }
+        if buschain_control::ipc::Client::ping() {
+            eprintln!("buschain-control: previous instance wedged — restoring desktop audio");
+            let _ = buschain_control::audio::graph::restore_desktop_now(None);
+        }
+    }
     // Headless daemon only — never pkill buschain-control (would kill us / tray).
     let _ = Command::new("pkill").args(["-x", "buschain-daemon"]).status();
     let _ = Command::new("pkill").args(["-f", "/buschain-daemon"]).status();
@@ -128,7 +146,9 @@ fn stop_leftover_daemons(root: &Path) {
         .map(PathBuf::from);
     if let Some(runtime) = runtime {
         let sock = runtime.join("buschain-control/daemon.sock");
-        let _ = std::fs::remove_file(&sock);
+        if !buschain_control::ipc::Client::ping() {
+            let _ = std::fs::remove_file(&sock);
+        }
     }
 }
 

@@ -1073,15 +1073,17 @@ fn interactive_loop(
                         &mut graph_suppressed,
                         &tx,
                         &fx_job_tx,
-                        true,
+                        false,
                     ) {
                         publish_shared_session(&shared_session, &last_session, session_gen);
                         return;
                     }
+                    crate::audio::engine_handle::apply_pending_dry_meters();
                     publish_shared_session(&shared_session, &last_session, session_gen);
                     continue;
                 }
                 // Interactive idle: retries only. Supervisor = reconcile; Observer = snapshot.
+                crate::audio::engine_handle::apply_pending_dry_meters();
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1107,11 +1109,12 @@ fn interactive_loop(
             &mut graph_suppressed,
             &tx,
             &fx_job_tx,
-            true,
+            false,
         ) {
             publish_shared_session(&shared_session, &last_session, session_gen);
             return;
         }
+        crate::audio::engine_handle::apply_pending_dry_meters();
         publish_shared_session(&shared_session, &last_session, session_gen);
     }
 }
@@ -1140,6 +1143,14 @@ fn supervisor_loop(
     let mut reconnect_in_flight = false;
     // After explicit Teardown, do not auto-reconnect until Apply/Reconnect.
     let mut graph_suppressed = false;
+    let heal = graph::heal_leftover_graph_at_startup();
+    if !heal.is_empty() {
+        let _ = tx.send(Event::Status(heal));
+    }
+    let sweep = graph::sweep_orphan_buschain_at_startup();
+    if !sweep.is_empty() {
+        let _ = tx.send(Event::Status(sweep));
+    }
     let _ = tx.send(Event::Status(
         "Worker ready — supervisor lane online".into(),
     ));
@@ -1199,21 +1210,26 @@ fn supervisor_loop(
                         &mut graph_suppressed,
                         &tx,
                         &fx_job_tx,
-                        false,
+                        true,
                     ) {
                         return;
                     }
+                    crate::audio::engine_handle::apply_pending_dry_meters();
                     publish_shared_session(&shared_session, &last_session, session_gen);
                     continue;
                 }
                 idle_ticks = idle_ticks.wrapping_add(1);
+                crate::audio::engine_handle::apply_pending_dry_meters();
                 if last_cmd_at.elapsed() < Duration::from_secs(2)
                     || crate::audio::engine_handle::class_a_is_recent()
                 {
                     continue;
                 }
                 // Hollow graph after PipeWire restart — debounce then reconnect.
-                if !reconnect_in_flight && !graph_suppressed {
+                if !reconnect_in_flight
+                    && !graph_suppressed
+                    && !buschain_engine::clock_mutation_in_flight()
+                {
                     let hollow = last_session
                         .as_ref()
                         .is_some_and(graph::session_graph_is_hollow);
@@ -1241,7 +1257,7 @@ fn supervisor_loop(
                                 &mut graph_suppressed,
                                 &tx,
                                 &fx_job_tx,
-                                false,
+                                true,
                             ) {
                                 return;
                             }
@@ -1366,10 +1382,11 @@ fn supervisor_loop(
             &mut graph_suppressed,
             &tx,
             &fx_job_tx,
-            false,
+            true,
         ) {
             return;
         }
+        crate::audio::engine_handle::apply_pending_dry_meters();
         publish_shared_session(&shared_session, &last_session, session_gen);
     }
 }
@@ -1596,6 +1613,22 @@ fn process_command_batch(
                     ) {
                         Ok(clock_msg) => {
                             if bind_buschain {
+                                // Poll HW rate with ENGINE unlocked. Sleeping inside
+                                // bind_master_hw_clock used to ANR the egui thread.
+                                if !device.is_empty()
+                                    && !buschain_engine::wait_hw_running_rate(
+                                        &device,
+                                        sample_rate,
+                                        Duration::from_secs(3),
+                                    )
+                                {
+                                    let live = buschain_engine::probe_sink_running_rate(&device)
+                                        .map(|r| r.to_string())
+                                        .unwrap_or_else(|| "?".into());
+                                    let _ = tx.send(Event::Status(format!(
+                                        "HW still {live} Hz (wanted {sample_rate}) — GraphClock unchanged"
+                                    )));
+                                }
                                 // Master HW force-rate only — rebuild Master→HW egress
                                 // (direct or buschain_rs_out_*) without FX ForceRespawn,
                                 // then heal capture hops (mic domain often moves with HW).

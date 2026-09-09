@@ -25,6 +25,18 @@ Hyprland: `exec-once = buschain-control --hidden`. Do **not** run a separate
 `buschain-daemon` unit — that forces a laggy thin-client hop.
 `--daemon-client` remains a debug escape hatch only.
 
+## Hard rule — UI never takes the engine mutex
+
+The egui thread must not `lock()` `ENGINE`. Clock bind, Apply, and PipeWire RPCs
+hold that mutex for hundreds of milliseconds to seconds; a blocking UI wait is a
+GNOME **Application Not Responding** dialog.
+
+- Meters / wetness: lock-free caches only
+- Dry-meter ensure/teardown: UI writes a want list; the worker applies it
+- Desired patches from clicks (`patch_bus_egress`): `try_lock` or skip — the
+  following Route/Apply command syncs Desired from session
+- One PW RPC timeout is not plane death (especially during clock mutate)
+
 ## Hard rule — no naked APIs in app
 
 Application code must **not** add new `pactl` / `pw-link` / `pw-cli` / `pipewire` spawn sites.

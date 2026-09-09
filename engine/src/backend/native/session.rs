@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -36,6 +36,28 @@ fn ensure_pw_init() {
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_millis(800);
+/// One 800ms miss is normal during clock migrate / node churn. Kill the plane
+/// only after a sustained stall — a single timeout used to trip hollow reconnect
+/// and freeze the UI (GNOME ANR).
+const RPC_TIMEOUT_DEATH: u32 = 8;
+static RPC_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+
+fn note_rpc_ok() {
+    RPC_TIMEOUTS.store(0, Ordering::Release);
+}
+
+/// Whether a timeout should mark the control plane dead.
+fn timeout_kills_plane(consecutive: u32, mutation_in_flight: bool) -> bool {
+    !mutation_in_flight && consecutive >= RPC_TIMEOUT_DEATH
+}
+
+fn rpc_timeout_is_fatal() -> bool {
+    if crate::clock::clock_mutation_in_flight() {
+        return false;
+    }
+    let n = RPC_TIMEOUTS.fetch_add(1, Ordering::AcqRel) + 1;
+    timeout_kills_plane(n, false)
+}
 
 #[derive(Debug)]
 pub enum Rpc {
@@ -242,6 +264,7 @@ where
     }
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     let rpc = build(reply_tx);
+    let mut send_failed = false;
     {
         let g = plane_mutex()
             .lock()
@@ -253,15 +276,27 @@ where
         if !p.ready.load(Ordering::Acquire) {
             return Err(anyhow!("native PW control plane not ready"));
         }
-        p.tx
-            .send(rpc)
-            .map_err(|_| anyhow!("native PW control plane channel closed"))?;
+        if p.tx.send(rpc).is_err() {
+            send_failed = true;
+        }
+    }
+    if send_failed {
+        mark_dead("rpc channel closed");
+        return Err(anyhow!("native PW control plane channel closed"));
     }
     match reply_rx.recv_timeout(timeout) {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            // Sustained timeout often means the daemon died under us.
-            mark_dead("rpc timeout");
+        Ok(v) => {
+            note_rpc_ok();
+            Ok(v)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            mark_dead("rpc channel closed");
+            Err(anyhow!("native PW RPC channel closed"))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if rpc_timeout_is_fatal() {
+                mark_dead("rpc timeout");
+            }
             Err(anyhow!("native PW RPC timed out after {timeout:?}"))
         }
     }
@@ -575,8 +610,20 @@ fn run_loop(
             }
         })
         .error(move |id, _seq, res, message| {
-            if id == pw::core::PW_ID_CORE {
-                eprintln!("[buschain] PW core error: res={res} msg={message}");
+            if id != pw::core::PW_ID_CORE {
+                return;
+            }
+            // Stale DESTROY after rate-change teardown (gone node/link).
+            // res=-2 ENOENT; op:7 = PW_CORE_METHOD_DESTROY. Not a dead daemon.
+            if res == -libc::ENOENT || message.contains("unknown resource") {
+                return;
+            }
+            eprintln!("[buschain] PW core error: res={res} msg={message}");
+            let fatal = res == -libc::EPIPE
+                || res == -libc::ECONNRESET
+                || message.contains("connection")
+                || message.contains("core gone");
+            if fatal {
                 ready_on_err.store(false, Ordering::Release);
                 PLANE_DEAD.store(true, Ordering::Release);
             }
@@ -912,14 +959,16 @@ fn begin_ensure_link(
     drop(view);
 
     for (out_port, in_port) in pairs {
-        if let Some(link_id) = st
+        // Copy the id out so `if let` does not keep GraphView borrowed across DESTROY
+        // (PW global_remove also borrow_mut — that aborted the control thread).
+        let existing = st
             .local
             .borrow()
             .links_by_ports
             .get(&(out_port, in_port))
-            .copied()
-        {
-            let _ = st.registry.destroy_global(link_id);
+            .copied();
+        if let Some(link_id) = existing {
+            destroy_global_if_live(st, link_id);
         }
         match st.core.create_object::<pw::link::Link>(
             &factory,
@@ -1069,7 +1118,7 @@ fn do_unlink(st: &CtrlState, source: &str, sink: &str) -> Result<()> {
         .collect();
     drop(view);
     for id in ids {
-        let _ = st.registry.destroy_global(id);
+        destroy_global_if_live(st, id);
     }
     Ok(())
 }
@@ -1125,22 +1174,43 @@ fn do_unlink_except(st: &CtrlState, source: &str, allow_sinks: &[&str]) -> u32 {
     drop(view);
     let n = kill.len() as u32;
     for id in kill {
-        let _ = st.registry.destroy_global(id);
+        destroy_global_if_live(st, id);
     }
     n
 }
 
+/// DESTROY only if the registry snapshot still has this id — avoids ENOENT
+/// `unknown resource … op:7` after rate-change teardown already removed it.
+fn destroy_global_if_live(st: &CtrlState, id: u32) {
+    let known = match st.local.try_borrow() {
+        Ok(v) => v.has_global(id),
+        Err(_) => true,
+    };
+    if !known {
+        return;
+    }
+    let _ = st.registry.destroy_global(id);
+    // global_remove may already have cleared the cache; never panic on the PW thread.
+    if let Ok(mut v) = st.local.try_borrow_mut() {
+        v.remove_global(id);
+    }
+    if let Ok(mut g) = st.shared.write() {
+        g.remove_global(id);
+    }
+    if let Ok(mut linger) = st.linger.try_borrow_mut() {
+        linger.remove(&id);
+    }
+}
+
 fn do_destroy_node(st: &CtrlState, name: &str) -> Result<()> {
-    let id = st
-        .local
-        .borrow()
-        .node_id(name)
-        .ok_or_else(|| anyhow!("node `{name}` not in registry"))?;
-    st.registry
-        .destroy_global(id)
-        .into_result()
-        .map_err(|e| anyhow!("destroy `{name}`: {e}"))?;
-    st.linger.borrow_mut().remove(&id);
+    let id = {
+        let view = st.local.borrow();
+        match view.node_id(name) {
+            Some(id) => id,
+            None => return Err(anyhow!("node `{name}` not in registry")),
+        }
+    };
+    destroy_global_if_live(st, id);
     Ok(())
 }
 
@@ -1425,6 +1495,19 @@ fn do_set_node_props(st: &CtrlState, name: &str, entries: &[(String, String)]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_rpc_timeout_is_not_fatal_during_clock_mutation() {
+        assert!(!timeout_kills_plane(1, true));
+        assert!(!timeout_kills_plane(RPC_TIMEOUT_DEATH, true));
+    }
+
+    #[test]
+    fn sustained_rpc_timeouts_are_fatal_when_idle() {
+        assert!(!timeout_kills_plane(1, false));
+        assert!(!timeout_kills_plane(RPC_TIMEOUT_DEATH - 1, false));
+        assert!(timeout_kills_plane(RPC_TIMEOUT_DEATH, false));
+    }
 
     #[test]
     fn control_plane_starts_when_pipewire_available() {

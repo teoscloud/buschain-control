@@ -45,6 +45,32 @@ pub fn invalidate_clock_probe_caches() {
     }
 }
 
+fn clock_mutation_until() -> &'static Mutex<Option<Instant>> {
+    static C: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
+/// Hollow detect must not fire `ReconnectPipeWire` while buses are mid-migrate.
+pub fn mark_clock_mutation(hold: Duration) {
+    if let Ok(mut g) = clock_mutation_until().lock() {
+        let until = Instant::now() + hold;
+        *g = Some(g.map(|prev| prev.max(until)).unwrap_or(until));
+    }
+}
+
+pub fn clock_mutation_in_flight() -> bool {
+    match clock_mutation_until().lock() {
+        Ok(g) => g.is_some_and(|until| Instant::now() < until),
+        Err(_) => false,
+    }
+}
+
+pub fn clear_clock_mutation() {
+    if let Ok(mut g) = clock_mutation_until().lock() {
+        *g = None;
+    }
+}
+
 /// User-facing performance preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -850,6 +876,11 @@ pub fn set_graph_force_clock(rate: u32, quantum: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Release session-wide `clock.force-*` so desktop audio is not stuck after Quit.
+pub fn clear_graph_force_clock() -> Result<(), String> {
+    set_graph_force_clock(0, 0)
+}
+
 fn set_settings_meta(key: &str, value: &str) -> Result<(), String> {
     let out = std::process::Command::new("pw-metadata")
         .args(["-n", "settings", "0", key, value])
@@ -933,5 +964,14 @@ mod tests {
         let p = resolve_engine_profile(AudioPreset::Custom, Some(50_000), Some(200), true);
         assert!(ENGINE_RATES.contains(&p.sample_rate));
         assert!(ENGINE_QUANTUMS.contains(&p.quantum));
+    }
+
+    #[test]
+    fn clock_mutation_flag_holds_then_clears() {
+        clear_clock_mutation();
+        mark_clock_mutation(Duration::from_secs(2));
+        assert!(clock_mutation_in_flight());
+        clear_clock_mutation();
+        assert!(!clock_mutation_in_flight());
     }
 }

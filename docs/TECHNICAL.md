@@ -434,7 +434,7 @@ command -v buschain-plugin-surface
 
 **Mitigations in tree:**
 
-- Quit / Teardown → `restore_system_audio` + linger destroy; **keep sticky `preferred_default_sink` as buschain_*** across quit (live PW default still restored to HW). Reopen reasserts preferred + reclaim burst so apps rewire without clicking System default.
+- Quit / Teardown → `restore_desktop_now` on the **exit thread** (clear `clock.force-*`, move streams, HW default, destroy linger) **before** workers die; supervisor then `engine_teardown`. **keep sticky `preferred_default_sink` as buschain_*** across quit. Reopen heals a leftover dead `buschain_*` default. `cargo run` asks a live instance to Quit first (does not steal its socket).
 - **PipeWire daemon restart (on-the-fly):** native control plane is reconnectable (`reconnect_plane`). Supervisor detects hollow graph (sticky preferred / stamped `sink_name` expected, Pulse up, `buschain_master` missing or plane dead) after ~1.5s debounce → `Command::ReconnectPipeWire` → wait Pulse → capture non-`buschain_*` Pulse default into sticky `desktop_hw_*` → seed Master HW (plug-n-play) → wait sticky Master HW sink → reconnect MainLoop → `teardown_all_hosts` → `Intent::ReconnectPipeWire` (`ArmSession { force_fx: true }`) → preferred + reclaim burst. UI stays up; Reconcile escalates to the same path when hollow. Explicit Teardown sets `graph_suppressed` so auto-reconnect does not fight intentional unload. Master HW is sticky across soft_bind / incomplete sink lists (never auto-pick first HW or fuzzy “Analog Stereo”); with no Master set, BusChain adopts the previous desktop system default (excluding `buschain_*`). `resolve_hardware_output` does not fall through to Default Sink while a remembered card is still enumerating.
 - **Dual-lane preferred ownership:** Supervisor Full Apply publishes an authoritative shared-session generation after `ensure_buschain_preferred_default`. Interactive must not overwrite a newer gen (ApplyMidiConfig is MIDI-only merge). Supervisor only adopts shared when `shared.gen >= local.gen`. Reopen is not done until Pulse `Default Sink` matches sticky `buschain_*` and reclaim has run.
 - **Verify-after-set:** native metadata set-default is provisional; success requires Pulse (`pactl info`) agreement, else fall through to pactl/wpctl. Apply + ~10s reclaim burst retry both `set_default_sink_if_needed` and `sync_playback`.
@@ -606,6 +606,11 @@ Interactive control-plane gate (`BUSCHAIN_CONTROL_LAT_TRACE=1`):
 ---
 
 ## Architecture
+
+The **egui thread must never `lock()` ENGINE**. Clock bind / Apply / PW RPCs hold
+that mutex for hundreds of ms to seconds; a blocking UI wait is a GNOME ANR.
+Dry meters: UI writes a want list, worker applies. One RPC timeout is not plane
+death (8 in a row, and never during clock mutate).
 
 One `buschain-control` process owns the graph via a **dual-thread control plane**:
 

@@ -116,8 +116,21 @@ fn recover_desktop_audio() -> i32 {
         }
     }
 
+    // Drop leftover clock.force-rate from a prior Master HW Apply.
+    let _ = Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-rate", "0"])
+        .status();
+    let _ = Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-quantum", "0"])
+        .status();
+
     // Native / Internal helpers are invisible to pactl — destroy via pw-cli.
-    let destroyed = destroy_buschain_pw_nodes();
+    // Stacked linger nodes need more than one pass.
+    let mut destroyed = 0u32;
+    for _ in 0..3 {
+        destroyed += destroy_buschain_pw_nodes();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
     println!("recover-audio: default sink → {hw_sink} (unmuted)");
     if !hw_src.is_empty() {
         println!("recover-audio: default source → {hw_src} (unmuted)");

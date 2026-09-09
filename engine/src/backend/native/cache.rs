@@ -197,6 +197,12 @@ impl GraphView {
         self.bump();
     }
 
+    pub fn has_global(&self, id: u32) -> bool {
+        self.nodes_by_id.contains_key(&id)
+            || self.links_by_id.contains_key(&id)
+            || self.ports_by_id.contains_key(&id)
+    }
+
     pub fn remove_global(&mut self, id: u32) {
         if let Some(n) = self.nodes_by_id.remove(&id) {
             if self.nodes_by_name.get(&n.name) == Some(&id) {

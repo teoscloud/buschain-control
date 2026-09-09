@@ -560,12 +560,7 @@ pub fn ensure_egress_clocked_route(
 
     let bridge = DesiredState::egress_bridge_name(src_rate, hw_rate, source, sink);
     let bridge_name = bridge.as_str().to_string();
-    // Never leave direct source→HW beside the converter (dual-path / silence).
-    let _ = backend.unlink_raw(source, sink);
-    desired.routes.remove(&(source.to_string(), sink.to_string()));
-
-    let mut bridge_clock = clock.clone();
-    bridge_clock.sample_rate = hw_rate;
+    let mon = format!("{bridge_name}.monitor");
     let spec = NodeSpec {
         name: bridge.clone(),
         description: format!("BusChainControl_EgressBridge_{src_rate}_to_{hw_rate}"),
@@ -573,13 +568,50 @@ pub fn ensure_egress_clocked_route(
         start_muted: false,
         pulse_export: false,
     };
+
+    // Adopt a healthy named bridge — relink only. Recreate + 200ms port wait
+    // is an audible hole when GraphClock ≠ HW (idle used to hit this every tick).
+    if sink_exists(&bridge_name) {
+        let live_rate = crate::clock::probe_sink_running_rate(&bridge_name).unwrap_or(0);
+        if live_rate == hw_rate {
+            if link_is_live(source, sink) {
+                let _ = backend.unlink_raw(source, sink);
+            }
+            desired.routes.remove(&(source.to_string(), sink.to_string()));
+            desired.ensure_bus(spec);
+            desired.bridges.insert(bridge_name.clone(), (src_rate, hw_rate));
+            if !link_is_live(source, &bridge_name) {
+                backend.ensure_link_raw(source, &bridge_name)?;
+            }
+            if !link_is_live(&mon, sink) {
+                backend.ensure_link_raw(&mon, sink)?;
+            }
+            desired.ensure_route(&LinkSpec {
+                source: source.to_string(),
+                sink: bridge_name.clone(),
+                exclusive: false,
+            });
+            desired.ensure_route(&LinkSpec {
+                source: mon,
+                sink: sink.to_string(),
+                exclusive: false,
+            });
+            return Ok(());
+        }
+    }
+
+    // Never leave direct source→HW beside the converter (dual-path / silence).
+    let _ = backend.unlink_raw(source, sink);
+    desired.routes.remove(&(source.to_string(), sink.to_string()));
+
+    let mut bridge_clock = clock.clone();
+    bridge_clock.sample_rate = hw_rate;
     backend.ensure_node(&spec, &bridge_clock)?;
     desired.ensure_bus(spec);
     desired.bridges.insert(bridge_name.clone(), (src_rate, hw_rate));
     invalidate_probe_caches();
     let _ = wait_sink_playback_ports(&bridge_name, std::time::Duration::from_millis(200));
 
-    let mon = format!("{bridge_name}.monitor");
     let _ = backend.unlink_raw(source, &bridge_name);
     let _ = backend.unlink_raw(&mon, sink);
     backend.ensure_link_raw(source, &bridge_name)?;
@@ -686,6 +718,68 @@ fn ensure_clocked_route_inner(
     // Bridge at GraphClock rate — only the inbound hop runs at the foreign rate.
     let bridge = DesiredState::bridge_name(src_rate, dst_rate, source, sink);
     let bridge_name = bridge.as_str().to_string();
+    let mon = format!("{bridge_name}.monitor");
+    let spec = NodeSpec {
+        name: bridge.clone(),
+        description: format!("BusChainControl_RateBridge_{src_rate}_to_{dst_rate}"),
+        role: NodeRole::RateBridge,
+        start_muted: false,
+        pulse_export: false,
+    };
+
+    // Adopt a live Desired inbound bridge — relink only (force still recreates).
+    if !force && sink_exists(&bridge_name) {
+        let hops_live = link_is_live(source, &bridge_name) && link_is_live(&mon, sink);
+        let live_rate = crate::clock::probe_sink_running_rate(&bridge_name).unwrap_or(0);
+        let rate_ok = live_rate == dst_rate || live_rate == clock.sample_rate;
+        if hops_live && (desired.bridges.contains_key(&bridge_name) || rate_ok) {
+            desired.ensure_bus(spec);
+            desired.bridges.insert(bridge_name.clone(), (src_rate, dst_rate));
+            desired.ensure_route(&LinkSpec {
+                source: source.to_string(),
+                sink: bridge_name.clone(),
+                exclusive,
+            });
+            desired.ensure_route(&LinkSpec {
+                source: mon,
+                sink: sink.to_string(),
+                exclusive: false,
+            });
+            return Ok(());
+        }
+        if rate_ok {
+            if link_is_live(source, sink) {
+                let _ = backend.unlink_raw(source, sink);
+            }
+            desired.routes.remove(&(source.to_string(), sink.to_string()));
+            if exclusive {
+                let _ = backend.unlink_from_source_except(
+                    source,
+                    &[bridge_name.as_str(), "buschain_hold"],
+                );
+            }
+            desired.ensure_bus(spec);
+            desired.bridges.insert(bridge_name.clone(), (src_rate, dst_rate));
+            if !link_is_live(source, &bridge_name) {
+                backend.ensure_link_raw(source, &bridge_name)?;
+            }
+            if !link_is_live(&mon, sink) {
+                backend.ensure_link_raw(&mon, sink)?;
+            }
+            desired.ensure_route(&LinkSpec {
+                source: source.to_string(),
+                sink: bridge_name.clone(),
+                exclusive,
+            });
+            desired.ensure_route(&LinkSpec {
+                source: mon,
+                sink: sink.to_string(),
+                exclusive: false,
+            });
+            return Ok(());
+        }
+    }
+
     // Sink-side dual-path prune: never leave dry source→sink beside source→rs→sink.
     // Shared mics stay non-exclusive (no unlink_from_source_except).
     let _ = backend.unlink_raw(source, sink);
@@ -697,13 +791,6 @@ fn ensure_clocked_route_inner(
             &[bridge_name.as_str(), "buschain_hold"],
         );
     }
-    let spec = NodeSpec {
-        name: bridge.clone(),
-        description: format!("BusChainControl_RateBridge_{src_rate}_to_{dst_rate}"),
-        role: NodeRole::RateBridge,
-        start_muted: false,
-        pulse_export: false,
-    };
     backend.ensure_node(&spec, clock)?;
     desired.ensure_bus(spec);
     desired.bridges.insert(bridge_name.clone(), (src_rate, dst_rate));
@@ -712,7 +799,6 @@ fn ensure_clocked_route_inner(
     invalidate_probe_caches();
     let _ = wait_sink_playback_ports(&bridge_name, std::time::Duration::from_millis(200));
 
-    let mon = format!("{bridge_name}.monitor");
     if force {
         // Destroy ghost bridge hop first so Add cannot attach to a dead rs.
         let _ = backend.unlink_raw(source, &bridge_name);

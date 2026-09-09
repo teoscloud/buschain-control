@@ -10,7 +10,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::app_state::AppState;
-use crate::audio::worker::Command as WorkerCommand;
 use crate::daemon;
 use eframe::egui::Context;
 
@@ -180,7 +179,7 @@ fn teardown_headless(mut state: AppState) {
     // Shutdown → restore_system_audio (HW default + stream move-off).
     let _ = state.session.save();
     state.meters.shutdown();
-    state.worker.send(WorkerCommand::Shutdown);
+    state.restore_desktop_and_stop_worker();
     shutdown();
 }
 

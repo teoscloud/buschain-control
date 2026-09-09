@@ -6,13 +6,13 @@
 //! lock-free cache updated only by the worker after FX ensure/teardown/probe.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use buschain_engine::{
-    BusLevel, ChainEnsureMode, ChainSpec, ChainState,
-    Engine, InsertSlot, Intent, NodeName, NodeRole, NodeSpec, PerformanceProfile,
+    BusLevel, ChainEnsureMode, ChainSpec, ChainState, Engine, GraphClock, InsertSlot, Intent,
+    NodeName, NodeRole, NodeSpec, PerformanceProfile,
 };
 
 use crate::session::Session;
@@ -20,6 +20,13 @@ use crate::session::Session;
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
 /// Bus → wet. Read from UI; written from worker after FX ops.
 static WET_CACHE: OnceLock<RwLock<HashMap<String, bool>>> = OnceLock::new();
+/// Dry-meter want list — UI writes, worker applies (never PW RPC on the UI thread).
+static DRY_WANT: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static DRY_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Last GraphClock seen under ENGINE — dry meters must not lock for this.
+static CACHED_SR: AtomicU32 = AtomicU32::new(48_000);
+static CACHED_Q: AtomicU32 = AtomicU32::new(256);
+static CACHED_SOFT: AtomicBool = AtomicBool::new(true);
 /// Monotonic ms since process start of last Interactive Class A engine touch.
 static LAST_CLASS_A_MS: AtomicU64 = AtomicU64::new(0);
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -34,6 +41,26 @@ fn engine_mutex() -> &'static Mutex<Engine> {
 
 fn wet_cache() -> &'static RwLock<HashMap<String, bool>> {
     WET_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn dry_want() -> &'static Mutex<Vec<String>> {
+    DRY_WANT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cache_clock_from(clock: &GraphClock) {
+    CACHED_SR.store(clock.sample_rate, Ordering::Release);
+    CACHED_Q.store(clock.quantum, Ordering::Release);
+    CACHED_SOFT.store(clock.soft_quantum, Ordering::Release);
+}
+
+fn cached_graph_clock() -> GraphClock {
+    GraphClock {
+        sample_rate: CACHED_SR.load(Ordering::Acquire).max(8_000),
+        quantum: CACHED_Q.load(Ordering::Acquire).max(64),
+        soft_quantum: CACHED_SOFT.load(Ordering::Acquire),
+        force_suspend_timeout_zero: false,
+        bound_device: String::new(),
+    }
 }
 
 /// Mark Interactive Class A activity (mute/fader/Props) for Supervisor backoff.
@@ -83,8 +110,31 @@ pub fn set_chain_wet_cached(bus: &str, wet: bool) {
 }
 
 pub fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
-    let mut g = engine_mutex().lock().expect("buschain-engine lock");
-    f(&mut g)
+    let mut g = match engine_mutex().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let r = f(&mut g);
+    cache_clock_from(g.clock());
+    r
+}
+
+/// UI-safe: never block. Returns `None` if the worker holds ENGINE (clock bind, apply).
+pub fn with_engine_try<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
+    match engine_mutex().try_lock() {
+        Ok(mut g) => {
+            let r = f(&mut g);
+            cache_clock_from(g.clock());
+            Some(r)
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            let mut g = p.into_inner();
+            let r = f(&mut g);
+            cache_clock_from(g.clock());
+            Some(r)
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 /// Supervisor path: backoff while Interactive Class A is hot (&lt;100ms).
@@ -95,18 +145,25 @@ pub fn with_engine_supervisor<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> 
             continue;
         }
         match engine_mutex().try_lock() {
-            Ok(mut g) => return Some(f(&mut g)),
+            Ok(mut g) => {
+                let r = f(&mut g);
+                cache_clock_from(g.clock());
+                return Some(r);
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(std::sync::TryLockError::Poisoned(p)) => {
                 let mut g = p.into_inner();
-                return Some(f(&mut g));
+                let r = f(&mut g);
+                cache_clock_from(g.clock());
+                return Some(r);
             }
         }
     }
-    // Last resort — Interactive quiet enough or we waited out.
-    Some(with_engine(f))
+    // Never fall through to a blocking lock — that is how idle reconcile
+    // stacked behind clock bind and the UI ANR'd on the same mutex.
+    None
 }
 
 /// Sync session performance into the engine before graph mutations.
@@ -578,7 +635,8 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
     };
     if track.kind.is_master() {
         // Master Direct toggles global GLC disable.
-        with_engine(|eng| {
+        // UI click — never block behind clock bind / apply.
+        let _ = with_engine_try(|eng| {
             eng.desired_mut().glc_disabled = track.direct_out;
         });
         return;
@@ -612,7 +670,7 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
             dests.push(feed);
         }
     }
-    with_engine(|eng| {
+    let _ = with_engine_try(|eng| {
         eng.desired_mut().set_bus_egress(&bus, dests);
         if track.direct_out {
             eng.desired_mut().glc_direct.insert(bus.clone());
@@ -797,6 +855,14 @@ pub fn set_master_hw_light(hw: &str) -> anyhow::Result<String> {
     })
 }
 
+/// After engine ClockBind: rebuild Master→HW via clocked egress (not raw pw-link).
+pub fn arm_master_hw_after_clock() -> anyhow::Result<String> {
+    with_engine(|eng| {
+        let report = eng.arm_master_hw_egress()?;
+        Ok(report.messages.join(" · "))
+    })
+}
+
 pub fn push_fx_controls(bus: &str, inserts: Vec<InsertSlot>) -> anyhow::Result<()> {
     // In-process host control queue — lock-free of Engine ForceRespawn mutex.
     buschain_engine::host::registry::push_host_controls(bus, &inserts)?;
@@ -892,12 +958,29 @@ pub fn dry_meter_is_live(bus: &str) -> bool {
     buschain_engine::host::dry_meter::dry_meter_is_live(bus)
 }
 
-/// Ensure dry peak taps for buses without a live FX host.
+/// UI: request dry peak taps. Never takes ENGINE or talks to PipeWire.
 pub fn sync_dry_meters(buses: &[String]) {
-    with_engine(|eng| {
-        let clock = eng.clock().clone();
-        buschain_engine::host::dry_meter::sync_dry_meters(buses, &clock);
-    });
+    if let Ok(mut g) = dry_want().lock() {
+        g.clear();
+        g.extend(buses.iter().cloned());
+    }
+    DRY_DIRTY.store(true, Ordering::Release);
+}
+
+/// Worker: create/tear dry taps. Skip while clock mutate so we don't add PW churn.
+pub fn apply_pending_dry_meters() {
+    if buschain_engine::clock_mutation_in_flight() {
+        return;
+    }
+    if !DRY_DIRTY.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let buses = dry_want()
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    buschain_engine::host::dry_meter::sync_dry_meters(&buses, &cached_graph_clock());
 }
 
 /// Keep FFT running for `bus` and return a spectrum snapshot (post-FX when `post`).
