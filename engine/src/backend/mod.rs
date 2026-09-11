@@ -546,6 +546,9 @@ pub fn ensure_egress_clocked_route(
             let _ = backend.unlink_raw(source, &bridge);
             let _ = backend.destroy_node(&bridge);
             desired.bridges.remove(&bridge);
+            // Drop the spec too — a bridge left in Desired.buses is recreated by
+            // the next reconcile_buses_and_levels as a phantom idle sink.
+            desired.buses.remove(&bridge);
             desired.routes.remove(&(source.to_string(), bridge.clone()));
             desired.routes.remove(&(mon, sink.to_string()));
         }

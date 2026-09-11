@@ -15,7 +15,64 @@ use buschain_engine::{
     NodeName, NodeRole, NodeSpec, PerformanceProfile,
 };
 
-use crate::session::Session;
+use crate::session::{Session, Track};
+
+/// Session → Desired egress dests for one non-master track.
+///
+/// Order matters: bus targets first (so `primary_fx_dest` / `ChainSpec.dest`
+/// keep pointing at Master), then physical devices, then the virtual-input feed.
+/// An empty list is legal — hold-only / intermediate bus with no Master send.
+pub fn session_egress_dests(session: &Session, track: &Track) -> Vec<String> {
+    let bus = track.expected_sink_name();
+    let master_id = session.master_id();
+    let mut dests: Vec<String> = Vec::new();
+
+    let mut targets = track.output_targets.clone();
+    // Listen (AFL) always adds Master. Empty Output to… stays empty —
+    // hold-only / intermediate bus (do not force Master).
+    if track.listen {
+        if let Some(mid) = master_id {
+            if !targets.contains(&mid) {
+                targets.push(mid);
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    for tid in targets {
+        if master_id == Some(tid) {
+            dests.push("buschain_master".into());
+        } else if let Some(t) = session.tracks.iter().find(|t| t.id == tid) {
+            let dest = t.expected_sink_name();
+            if dest != bus {
+                dests.push(dest);
+            }
+        }
+    }
+
+    // Physical sinks only: a `buschain_*` name here would bypass the bus-target
+    // path and could self-link or feed a sealed helper.
+    for out in &track.output_devices {
+        let dest = out.device.trim();
+        if dest.is_empty()
+            || dest.starts_with("buschain_")
+            || dest.starts_with("shadow_")
+        {
+            continue;
+        }
+        if !dests.iter().any(|d| d == dest) {
+            dests.push(dest.to_string());
+        }
+    }
+
+    if track.virtual_input {
+        let feed = track.expected_virtual_input_feed_name();
+        if !dests.iter().any(|d| d == &feed) {
+            dests.push(feed);
+        }
+    }
+    dests
+}
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
 /// Bus → wet. Read from UI; written from worker after FX ops.
@@ -177,7 +234,6 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
         .tracks
         .iter()
         .any(|t| t.solo && !t.kind.is_master());
-    let master_id = session.master_id();
     with_engine(|eng| {
         eng.set_profile(&session.performance);
         eng.remember_master_hw(hw_sink);
@@ -246,32 +302,9 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
             );
 
             // Egress destination list for sealed arming.
-            let mut dests = Vec::new();
-            if track.kind.is_master() {
-                dests.push(hw_sink.to_string());
+            let dests = if track.kind.is_master() {
+                vec![hw_sink.to_string()]
             } else {
-                let mut targets = track.output_targets.clone();
-                // Listen (AFL) always adds Master. Empty Output to… stays empty —
-                // hold-only / intermediate bus (do not force Master).
-                if track.listen {
-                    if let Some(mid) = master_id {
-                        if !targets.contains(&mid) {
-                            targets.push(mid);
-                        }
-                    }
-                }
-                targets.sort();
-                targets.dedup();
-                for tid in targets {
-                    if master_id == Some(tid) {
-                        dests.push("buschain_master".into());
-                    } else if let Some(t) = session.tracks.iter().find(|t| t.id == tid) {
-                        let dest = t.expected_sink_name();
-                        if dest != bus {
-                            dests.push(dest);
-                        }
-                    }
-                }
                 // System virtual input: arm post/bus into feed sink (remap masters .monitor).
                 if track.virtual_input {
                     let feed = track.expected_virtual_input_feed_name();
@@ -287,11 +320,10 @@ pub fn sync_desired_from_session(session: &Session, hw_sink: &str) {
                     eng.desired_mut().set_bus_egress(&feed, Vec::new());
                     eng.desired_mut()
                         .set_virtual_input(&bus, Some(vin_desc));
-                    if !dests.iter().any(|d| d == &feed) {
-                        dests.push(feed);
-                    }
                 }
-            }
+                // Bus targets + per-track physical devices + vin feed.
+                session_egress_dests(session, track)
+            };
             eng.desired_mut().set_bus_egress(&bus, dests.clone());
 
             // Shared capture rack (unmuted rows only). Soft-bind happens in session store.
@@ -642,34 +674,7 @@ pub fn patch_bus_egress(session: &Session, track_id: uuid::Uuid) {
         return;
     }
     let bus = track.expected_sink_name();
-    let master_id = session.master_id();
-    let mut dests = Vec::new();
-    let mut targets = track.output_targets.clone();
-    if track.listen {
-        if let Some(mid) = master_id {
-            if !targets.contains(&mid) {
-                targets.push(mid);
-            }
-        }
-    }
-    targets.sort();
-    targets.dedup();
-    for tid in targets {
-        if master_id == Some(tid) {
-            dests.push("buschain_master".into());
-        } else if let Some(t) = session.tracks.iter().find(|t| t.id == tid) {
-            let dest = t.expected_sink_name();
-            if dest != bus {
-                dests.push(dest);
-            }
-        }
-    }
-    if track.virtual_input {
-        let feed = track.expected_virtual_input_feed_name();
-        if !dests.iter().any(|d| d == &feed) {
-            dests.push(feed);
-        }
-    }
+    let dests = session_egress_dests(session, track);
     let _ = with_engine_try(|eng| {
         eng.desired_mut().set_bus_egress(&bus, dests);
         if track.direct_out {

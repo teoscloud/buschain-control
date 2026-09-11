@@ -276,6 +276,17 @@ pub fn primary_fx_dest(session: &Session, track_id: uuid::Uuid, hw_sink: &str) -
             }
         }
     }
+    // Device-only stem: an empty dest makes prune_parallel_fx_routes skip the
+    // bus entirely, so the wet post→device hop would never be pruned or healed.
+    for out in &track.output_devices {
+        let dest = out.device.trim();
+        if !dest.is_empty()
+            && !dest.starts_with("buschain_")
+            && !dest.starts_with("shadow_")
+        {
+            return dest.to_string();
+        }
+    }
     String::new()
 }
 

@@ -389,6 +389,32 @@ pub fn resolve_devices(
         }
         t.inputs = kept;
         t.sync_legacy_input_fields();
+
+        // Per-track output devices — sticky like Master HW. A monitor/card that
+        // is briefly absent (unplug, late PipeWire enumeration) must keep its
+        // row; dropping it would silently retarget the stem to Master only.
+        for out in &mut t.output_devices {
+            if let Some((_, d)) = sink_names.iter().find(|(n, _)| n == &out.device) {
+                if !d.is_empty() {
+                    out.device_desc = Some(d.clone());
+                }
+                continue;
+            }
+            let desc = out.device_desc.clone().unwrap_or_default();
+            if let Some((n, d)) = find_by_desc(sink_names, &desc) {
+                report.push(format!(
+                    "output device rebound on {}: {} → {d}",
+                    t.name, out.device
+                ));
+                out.device = n;
+                out.device_desc = Some(d);
+            } else {
+                report.push(format!(
+                    "output device on {} ({}) not live yet — keeping sticky",
+                    t.name, out.device
+                ));
+            }
+        }
     }
 
     // device_clocks — drop absent keys

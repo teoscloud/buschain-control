@@ -1053,8 +1053,55 @@ fn draw_output_rack(
         state.mark_routing_dirty();
     }
 
+    // Physical device sends — additive to the bus targets above.
+    let devices = state.session.tracks[track_idx].output_devices.clone();
+    let mut remove_device: Option<String> = None;
+    for out in &devices {
+        let live = state.snapshot.sinks.iter().any(|s| s.name == out.device);
+        let name = out
+            .device_desc
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| short_device_title(&out.device));
+        let label = if live {
+            name
+        } else {
+            format!("{name}  (offline)")
+        };
+        mini_rack_row(ui, &theme, content_w, |ui| {
+            ui.label(
+                RichText::new(&label)
+                    .size(12.0)
+                    .strong()
+                    .color(if live { theme.text() } else { theme.text_muted() }),
+            )
+            .on_hover_text(&out.device);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if design::text_tool_button(ui, &theme, "×")
+                    .on_hover_text("Remove device send")
+                    .clicked()
+                {
+                    remove_device = Some(out.device.clone());
+                }
+            });
+        });
+        ui.add_space(3.0);
+    }
+
+    if let Some(device) = remove_device {
+        state.session.tracks[track_idx]
+            .output_devices
+            .retain(|d| d.device != device);
+        let tid = state.session.tracks[track_idx].id;
+        state.dirty = true;
+        crate::audio::engine_handle::patch_bus_egress(&state.session, tid);
+        state.mark_routing_dirty();
+    }
+
     let assigned_now = state.session.tracks[track_idx].output_targets.clone();
-    if assigned_now.is_empty() {
+    if assigned_now.is_empty() && state.session.tracks[track_idx].output_devices.is_empty() {
         mini_rack_row(ui, &theme, content_w, |ui| {
             ui.label(
                 RichText::new("No outputs (hold only)")
@@ -1143,6 +1190,115 @@ fn draw_output_rack(
             state.commit(crate::audio::LiveChange::VirtualInput { track_id: tid });
             crate::mixer_api::touch_mixer_tick();
         }
+    });
+
+    ui.add_space(4.0);
+    draw_output_device_picker(ui, state, track_idx, self_id);
+}
+
+/// `+ Output to device…` — send this stem straight to a physical sink, in
+/// addition to its bus targets. Engine bridges the hop when the device rate
+/// differs from GraphClock.
+fn draw_output_device_picker(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    track_idx: usize,
+    self_id: Uuid,
+) {
+    let theme = state.theme;
+    let assigned: Vec<String> = state.session.tracks[track_idx]
+        .output_devices
+        .iter()
+        .map(|d| d.device.clone())
+        .collect();
+    // Physical sinks only — BusChain buses belong to the track picker above.
+    let choices: Vec<(String, String)> = state
+        .snapshot
+        .sinks
+        .iter()
+        .filter(|s| {
+            !s.name.starts_with("buschain_")
+                && !s.name.starts_with("shadow_")
+                && !s.description.starts_with("ShadowAudio_")
+                && !assigned.contains(&s.name)
+        })
+        .map(|s| {
+            let label = if s.description.trim().is_empty() {
+                short_device_title(&s.name)
+            } else {
+                s.description.clone()
+            };
+            (s.name.clone(), label)
+        })
+        .collect();
+
+    let popup_id = ui.make_persistent_id(("output_to_device_popup", self_id));
+    ui.horizontal(|ui| {
+        let trigger = ui.add(
+            egui::Button::new(
+                RichText::new(format!(
+                    "{}  Output to device…",
+                    egui_phosphor::regular::PLUS
+                ))
+                .size(12.0)
+                .strong()
+                .color(theme.text()),
+            )
+            .fill(theme.bg_elevated())
+            .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+            .corner_radius(theme.rounding())
+            .min_size(Vec2::new(150.0, 26.0)),
+        );
+        trigger.clone().on_hover_text(
+            "Send this track straight to a hardware output, alongside its \
+             Master / track sends. Remove Master above for a device-only stem.",
+        );
+        if trigger.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup_id));
+        }
+
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &trigger,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(200.0);
+                if choices.is_empty() {
+                    ui.label(
+                        RichText::new("No other hardware outputs")
+                            .size(11.0)
+                            .color(theme.text_muted()),
+                    );
+                    return;
+                }
+                for (name, label) in &choices {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(label).size(12.0).color(theme.text()))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .min_size(Vec2::new(ui.available_width(), 22.0)),
+                        )
+                        .on_hover_text(name)
+                        .clicked()
+                    {
+                        let devices = &mut state.session.tracks[track_idx].output_devices;
+                        if !devices.iter().any(|d| &d.device == name) {
+                            devices.push(crate::session::TrackOutputDevice {
+                                device: name.clone(),
+                                device_desc: Some(label.clone()),
+                            });
+                        }
+                        let tid = state.session.tracks[track_idx].id;
+                        state.dirty = true;
+                        crate::audio::engine_handle::patch_bus_egress(&state.session, tid);
+                        state.mark_routing_dirty();
+                        ui.close_menu();
+                    }
+                }
+            },
+        );
     });
 }
 

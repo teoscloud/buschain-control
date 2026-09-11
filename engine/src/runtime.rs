@@ -7,7 +7,8 @@ use anyhow::{anyhow, Result};
 
 use crate::backend::{
     capture_hop_verified, egress_hop_live, ensure_clocked_route, ensure_clocked_route_force,
-    link_is_live, sink_exists, AudioBackend, FilterChainRuntime, PipewireNativeBackend,
+    is_physical_hw_dest, link_is_live, sink_exists, AudioBackend, FilterChainRuntime,
+    PipewireNativeBackend,
 };
 use crate::clock::{
     probe_master_hw_from_sinks, probe_sink_running_rate, resolve_profile, set_graph_force_clock,
@@ -800,8 +801,11 @@ impl Engine {
         let from = format!("{bus}.monitor");
         let post = live_post_name(bus);
         let post_mon = format!("{post}.monitor");
+        // Hop-aware so a bridged device out cannot outlive mixer mute.
         dests.iter().any(|d| {
-            !d.is_empty() && (link_is_live(&from, d) || link_is_live(&post_mon, d))
+            !d.is_empty()
+                && (egress_hop_live(&from, d, &self.desired)
+                    || egress_hop_live(&post_mon, d, &self.desired))
         })
     }
 
@@ -1235,7 +1239,20 @@ impl Engine {
             let post_mon = format!("{post}.monitor");
             let fx = live_fx_name(bus);
             let dests = self.desired.egress_dests(bus);
-            let dest_refs: Vec<&str> = dests.iter().map(|s| s.as_str()).collect();
+            // Bridge-aware allow-list: a clocked dest (per-track device out, or
+            // Master→HW at a foreign rate) is reached through the immediate
+            // `buschain_rs_out_*` hop, so allow the bridge, not the device name.
+            let allow_targets: Vec<String> = dests
+                .iter()
+                .filter(|d| !d.is_empty())
+                .map(|d| {
+                    if is_physical_hw_dest(d) {
+                        crate::backend::egress_allow_target(&post_mon, d, &self.desired)
+                    } else {
+                        d.clone()
+                    }
+                })
+                .collect();
             let allow_egress = if bus == "buschain_master" {
                 self.desired.speakers_armed
             } else {
@@ -1264,7 +1281,8 @@ impl Engine {
                 } else if allow_egress && hops_live {
                     // Dest hops already live — do not unlink-except or re-arm.
                 } else if allow_egress {
-                    let mut allow: Vec<&str> = dest_refs.clone();
+                    let mut allow: Vec<&str> =
+                        allow_targets.iter().map(|s| s.as_str()).collect();
                     allow.push("buschain_hold");
                     let n = self.backend.unlink_from_source_except(&post_mon, &allow);
                     if n > 0 {
@@ -1404,6 +1422,30 @@ impl Engine {
             let post = live_post_name(&bus);
             let post_mon = format!("{post}.monitor");
             let dests = self.desired.egress_dests(&bus);
+            // A physical dest may need a `buschain_rs_out_*` hop (per-track
+            // device out at a rate ≠ GraphClock). `ensure_link_raw` cannot build
+            // that bridge, so hand the whole bus to the arm path, which also
+            // keeps the unlink allow-list on the bridge name.
+            let src = if sink_exists(&post) {
+                post_mon.clone()
+            } else {
+                from.clone()
+            };
+            let needs_clocked = dests.iter().any(|d| {
+                !d.is_empty()
+                    && sink_exists(d)
+                    && is_physical_hw_dest(d)
+                    && !egress_hop_live(&src, d, &self.desired)
+            });
+            if needs_clocked {
+                match self.arm_track_egress(&bus, false, &dests) {
+                    Ok(()) => {
+                        Self::idle_heal(report, format!("heal dry egress {bus} (clocked dest)"))
+                    }
+                    Err(e) => report.push(format!("heal dry egress {bus}: {e:#}")),
+                }
+                continue;
+            }
             if sink_exists(&post) {
                 if self.egress_to_dests_live(&bus, false, &dests) {
                     // Fader hops already live — do not strip bus→dest "just in case".
@@ -1436,6 +1478,53 @@ impl Engine {
                     Self::idle_heal(report, format!("heal dry egress {bus}→{d}"));
                 }
             }
+        }
+    }
+
+    /// Drop egress bridges this bus recorded for a dest that is no longer
+    /// Desired (device removed from a track's Output rack).
+    ///
+    /// Strictly pair-gated on `desired.routes` — never a name-prefix sweep, so
+    /// Master's (or another track's) live `buschain_rs_out_*` is untouched. A
+    /// bridge that predates this process is not in Desired yet and is left to
+    /// the adopt path in `ensure_egress_clocked_route`.
+    fn prune_removed_egress_bridges(&mut self, bus: &str, dests: &[String]) {
+        let from = format!("{bus}.monitor");
+        let post_mon = format!("{}.monitor", live_post_name(bus));
+        let stale: Vec<(String, String, String)> = self
+            .desired
+            .bridges
+            .keys()
+            .filter(|b| b.starts_with("buschain_rs_out_"))
+            .filter_map(|bridge| {
+                let mon = format!("{bridge}.monitor");
+                let src = self
+                    .desired
+                    .routes
+                    .iter()
+                    .find(|(s, d)| d == bridge && (*s == from || *s == post_mon))
+                    .map(|(s, _)| s.clone())?;
+                let sink = self
+                    .desired
+                    .routes
+                    .iter()
+                    .find(|(s, _)| *s == mon)
+                    .map(|(_, d)| d.clone())?;
+                if dests.iter().any(|d| *d == sink) {
+                    return None;
+                }
+                Some((bridge.clone(), src, sink))
+            })
+            .collect();
+        for (bridge, src, sink) in stale {
+            let mon = format!("{bridge}.monitor");
+            let _ = self.backend.unlink_raw(&mon, &sink);
+            let _ = self.backend.unlink_raw(&src, &bridge);
+            let _ = self.backend.destroy_node(&bridge);
+            self.desired.bridges.remove(&bridge);
+            self.desired.buses.remove(&bridge);
+            self.desired.routes.remove(&(src, bridge.clone()));
+            self.desired.routes.remove(&(mon, sink));
         }
     }
 
@@ -1996,13 +2085,16 @@ impl Engine {
                         return false;
                     }
                 } else {
-                    let mut linked = false;
-                    for d in &dests {
-                        if !d.is_empty() && link_is_live(&from, d) {
-                            linked = true;
-                            break;
-                        }
-                    }
+                    // Hop-aware: a dry stem may run through the post fader stage
+                    // and/or a `buschain_rs_out_*` bridge (per-track device out).
+                    // A raw bus→dest check false-negatived those and forced a
+                    // cold ArmSession — re-arming every track on each restart.
+                    let post_mon = format!("{}.monitor", live_post_name(bus));
+                    let linked = dests.iter().any(|d| {
+                        !d.is_empty()
+                            && (egress_hop_live(&from, d, &self.desired)
+                                || egress_hop_live(&post_mon, d, &self.desired))
+                    });
                     if !linked {
                         return false;
                     }
@@ -2433,11 +2525,20 @@ impl Engine {
             }
         };
         // Master spine can be Wet before session barrier opens post→HW.
-        let require_dest = if bus == "buschain_master" {
+        let mut require_dest = if bus == "buschain_master" {
             self.desired.speakers_armed
         } else {
             true
         };
+        // probe_chain_state has no Desired and only accepts a direct
+        // post→dest link. A physical dest reached through `buschain_rs_out_*`
+        // is audible but would report Failed("wet path not audible").
+        if require_dest && is_physical_hw_dest(&dest) {
+            let post_mon = format!("{}.monitor", live_post_name(bus));
+            if egress_hop_live(&post_mon, &dest, &self.desired) {
+                require_dest = false;
+            }
+        }
         pipeline::insert::probe_chain_state(
             &mut self.fx,
             bus,
@@ -2512,6 +2613,7 @@ impl Engine {
     }
 
     pub fn arm_track_egress(&mut self, bus: &str, wet: bool, dests: &[String]) -> Result<()> {
+        self.prune_removed_egress_bridges(bus, dests);
         if self.mixer_muted(bus) {
             pipeline::arm::disarm_track_egress(&mut self.backend, bus, true);
             return Ok(());

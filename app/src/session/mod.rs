@@ -55,6 +55,14 @@ pub struct TrackInput {
     pub mute: bool,
 }
 
+/// One physical sink this track feeds directly (output rack device row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackOutputDevice {
+    pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_desc: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: Uuid,
@@ -83,6 +91,10 @@ pub struct Track {
     /// Destinations: other track IDs and/or master. Empty ⇒ master only.
     #[serde(default)]
     pub output_targets: Vec<Uuid>,
+    /// Extra physical sinks this track feeds directly, additive to
+    /// `output_targets`. Sticky by description across unplug (never dropped).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_devices: Vec<TrackOutputDevice>,
     /// Expose this track as a system virtual output (apps / default sink / Move to).
     /// Master is always exposed. When off, the bus still exists for internal routing.
     /// Missing field in old JSON ⇒ false (opt-in), matching new-track defaults.
@@ -228,6 +240,7 @@ impl Default for Session {
                     input_source: None,
                     input_source_desc: None,
                     output_targets: vec![],
+                    output_devices: vec![],
                     virtual_output: true,
                     virtual_input: false,
                     direct_out: true,
@@ -247,6 +260,7 @@ impl Default for Session {
                     input_source: None,
                     input_source_desc: None,
                     output_targets: vec![master_id],
+                    output_devices: vec![],
                     virtual_output: false,
                     virtual_input: false,
                     direct_out: true,
@@ -425,6 +439,7 @@ impl Session {
             input_source: None,
             input_source_desc: None,
             output_targets: master.into_iter().collect(),
+            output_devices: vec![],
             // Opt-in: new buses are not system virtual devices until enabled.
             virtual_output: false,
             virtual_input: false,
