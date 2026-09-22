@@ -27,6 +27,9 @@ pub use clock::{
     AudioPreset, DeviceCaps, EndpointCaps, GraphClock, PerformanceProfile, ENGINE_QUANTUMS,
     ENGINE_RATES, ENGINE_RATE_WARN_ABOVE,
 };
+pub use clock::master::{
+    graph_clock_owner, ClockMasterPolicy, ClockOwner, GraphDriver,
+};
 pub use contract::{ApplyReport, ClockProps, Intent};
 pub use domain::{
     bus_suffix, fx_name_for_bus, glc_name_for_bus, mtr_name_for_bus, normalize_ladspa_label,

@@ -169,6 +169,7 @@ Menus: **File** · **System** · **BusChain**. **Esc** closes Options; **Ctrl+S*
 - **Plugins:** VST3 under `~/.vst3` (or `VST3_PATH`); CLAP under `~/.clap`; LV2 via `LV2_PATH`. Restart after installing new plugins.
 - **Sticky default:** set **System default** on a virtual track once — after Quit/reopen, BusChain reasserts that sink and reclaims playback apps.
 - **Hollow desktop audio:** `buschain-ctl recover-audio`, or `systemctl --user restart wireplumber` as a blunt recovery.
+- **Faint periodic clicks:** a track input may have won PipeWire's clock election over your speakers (`pw-top`: driver row is a capture node with growing `ERR`). BusChain writes a WirePlumber rule ranking Master HW first and warns in the status line; it takes effect after `systemctl --user restart wireplumber`.
 - **Quiet pavucontrol lists:** helpers use `Audio/Sink/Internal`; optional WirePlumber stamp via `scripts/install-wireplumber-rules.sh`.
 
 ---

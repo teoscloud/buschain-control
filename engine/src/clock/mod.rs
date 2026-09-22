@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::DeviceNode;
 
+pub mod master;
+
 /// `pw-dump` is huge — never spawn it unboundedly (UI used to call this every frame).
 const PW_DUMP_TTL: Duration = Duration::from_millis(800);
 /// Device EnumFormat/ALSA rate lists change rarely.

@@ -223,6 +223,7 @@ windowrulev2 = float, title:( - VST3)$
 | `~/.config/buschain-control/active` | Active slug |
 | `~/.config/buschain-control/session.json` | Legacy → migrates once to `sessions/default.json` |
 | `~/.config/buschain-control/mixer-pins.json` | Mixer favorites |
+| `~/.config/wireplumber/wireplumber.conf.d/53-buschain-master-hw-clock.conf` | Generated clock-master rule (see [PIN](#pin--a-track-input-becomes-the-graph-clock)); kept across Quit |
 | `$XDG_RUNTIME_DIR/buschain-control/daemon.sock` | Embedded IPC |
 
 Settings → Session: Save / Save as… / Load / Delete.
@@ -468,6 +469,22 @@ command -v buschain-plugin-surface
 - **Output to… may omit Master.** Empty destinations mean hold-only (intermediate bus / track→track without a master send). New tracks still default to Master; Listen (AFL) still forces Master. Desired `bus_egress` empty is authoritative — it must not fall through to a Master default.
 - **Mute latch vs session unmute.** Track strip meters/scope read the FX host (pre-fader) and can move while `post→Master` is stripped. A stale mute latch after unmute / PipeWire reconnect used to re-mute DualMic in Desired every sync (`reinforce_mute_latches`), so idle heal kept the track hold-only. Session sync now aligns latches to mixer authority before reinforce; reconnect clears latches.
 - **System virtual input does not imply Master.** The vin-feed sink (`buschain_vinf_*`) is a remap-source only — its monitor must stay hold-only (plus Pulse `input.buschain_vin_*` capture). Idle heal used to default helper buses to Master (`vinf.monitor → buschain_master`), so toggling virtual input re-audibled DualMic on Master even with Output empty. Helpers never get a Master egress default; reconcile surgically unlinks feed→Master/track leaks only (never wipe-all — that stripped remap capture and silenced `buschain_vin_*`). `ensure_virtual_input` bounces the remap module if feed.monitor→input.vin hops are missing.
+
+### PIN — a track input becomes the graph clock
+
+**Status:** rule generation + live warning landed (2026-09). Activation still needs a WirePlumber restart.
+
+**Symptom:** steady, very slight clicks on the speakers (~1/s), with or without BusChain, no kernel/USB errors. `pw-top` shows the un-indented **driver** row is a capture node (e.g. a full-speed PCM2902 codec adopted as a track input) with a growing `ERR` counter, and Master HW (and everything else) indented under it as followers.
+
+**Mechanism:** PipeWire clocks the whole graph off the running node with the highest `priority.driver`. WirePlumber's ALSA defaults rank capture +1000 above playback (USB source 2109 vs USB sink 1100), so any adopted input out-ranks Master HW. Master HW becomes a resampled follower and inherits the driver's xruns; a global `clock.force-rate` (Master HW Apply) then lands on a driver that may not run that rate natively (48k-only codec forced to 96k → resamples its own clock → periodic correction ≈ periodic click).
+
+**Constraint:** `priority.driver` is a node property, not a SPA param. It cannot be changed on a live node from a client (`pw-cli s <id> Props '{ params = [ "priority.driver" N ] }'` is silently ignored on PipeWire 1.6). Only a WirePlumber rule at node creation works.
+
+**Mitigations in tree (`engine/src/clock/master.rs`):**
+
+- **Generated drop-in:** on session arm / adopt, Master HW switch, Master HW Apply and the slow idle sweep, the engine writes `~/.config/wireplumber/wireplumber.conf.d/53-buschain-master-hw-clock.conf`: Master HW card `alsa_output.*` → `priority.driver = 5000`; every adopted `alsa_input.*` card → `100`. Matched on `api.alsa.card.name` so UCM split parents (`alsa_output.hw_USB_0`) are covered. Idempotent (content compare, atomic rename). Never rewritten when `pw-dump` fails or the Master HW card cannot be resolved (offline / non-ALSA), and never removed on Teardown — WirePlumber reads drop-ins only at its own start.
+- **Live election check (`graph_clock_owner`):** resolves Master HW's `node.driver-id`; Master HW-owned when the driver is itself, its `api.alsa.split.name` parent, or any node on the same ALSA card. Otherwise `Foreign` → one warning per driver (`[buschain] graph clock is … — Master HW … is a follower …`) in the Apply report and stderr; cleared when the clock returns to Master HW. Master HW Apply additionally reports when the foreign driver cannot run the forced rate natively.
+- **Activation:** `systemctl --user restart wireplumber` (or re-plug the device), then verify with `pw-top`: driver row = Master HW card, `ERR` flat.
 
 ### Standard track wiring contract
 

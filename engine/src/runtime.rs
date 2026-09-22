@@ -42,6 +42,8 @@ pub struct Engine {
     idle_fx_ticks: u32,
     /// When wet Master is hold-only mid-build; fail-open dry after this age.
     master_wet_hold_since: Option<Instant>,
+    /// Foreign graph driver already reported (warn once per driver, not per sweep).
+    clock_owner_warned: Option<String>,
 }
 
 impl Engine {
@@ -58,6 +60,110 @@ impl Engine {
             capture_applied: false,
             idle_fx_ticks: 0,
             master_wet_hold_since: None,
+            clock_owner_warned: None,
+        }
+    }
+
+    fn master_hw_name(&self) -> Option<String> {
+        self.desired
+            .master_hw
+            .clone()
+            .or_else(|| self.master_hw.clone())
+            .filter(|h| !h.is_empty())
+    }
+
+    /// Master HW must clock the graph. `priority.driver` is only settable at node
+    /// creation, so: (1) keep the session-scoped WirePlumber drop-in current
+    /// (Master HW card wins, adopted input cards lose) and (2) inspect the live
+    /// election, warning when a foreign device drives Master HW as a follower.
+    /// `force_warn` repeats an existing warning (explicit Apply paths).
+    fn sync_clock_master_policy(&mut self, report: &mut ApplyReport, force_warn: bool) {
+        use crate::clock::master::{write_rule, ClockMasterPolicy};
+        let Some(hw) = self.master_hw_name() else {
+            return;
+        };
+        let sources: Vec<String> = self
+            .desired
+            .bus_inputs
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        // No dump → leave the file alone. Master HW offline / non-ALSA → likewise:
+        // WirePlumber only reads drop-ins at its own start, so a degraded rewrite
+        // would silently lose the Master HW rule for the next restart.
+        let Some(policy) = ClockMasterPolicy::from_graph(&hw, sources.iter().map(String::as_str))
+        else {
+            return;
+        };
+        if policy.master_hw_card.is_none() {
+            self.check_graph_clock_owner(&hw, report, force_warn, None);
+            return;
+        }
+        match write_rule(&policy) {
+            Ok(true) => {
+                let path = crate::clock::master::rule_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let msg = format!(
+                    "clock-master rule written ({path}) — applies on WirePlumber restart or device re-plug"
+                );
+                eprintln!("[buschain] {msg}");
+                report.push(msg);
+            }
+            Ok(false) => {}
+            Err(e) => report.push(format!("clock-master rule: {e}")),
+        }
+        self.check_graph_clock_owner(&hw, report, force_warn, None);
+    }
+
+    /// Warn when something other than Master HW clocks the graph. `forcing`
+    /// is the rate about to be / just forced — flags a driver that cannot run it.
+    fn check_graph_clock_owner(
+        &mut self,
+        hw: &str,
+        report: &mut ApplyReport,
+        force_warn: bool,
+        forcing: Option<u32>,
+    ) {
+        use crate::clock::master::{graph_clock_owner, ClockOwner};
+        match graph_clock_owner(hw) {
+            ClockOwner::Foreign(d) => {
+                let repeat = self.clock_owner_warned.as_deref() == Some(d.name.as_str());
+                if repeat && !force_warn {
+                    return;
+                }
+                let mut msg = format!(
+                    "graph clock is {} (priority {}) — Master HW {hw} is a follower and inherits its xruns",
+                    d.name, d.priority
+                );
+                if let Some(rate) = forcing {
+                    if d.cannot_run_natively(rate) {
+                        msg.push_str(&format!(
+                            "; it cannot run {rate} Hz natively ({}) and will resample its own clock",
+                            d.native_rates
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        ));
+                    }
+                }
+                msg.push_str(
+                    " — restart WirePlumber (systemctl --user restart wireplumber) to apply the clock-master rule",
+                );
+                eprintln!("[buschain] {msg}");
+                report.push(msg);
+                self.clock_owner_warned = Some(d.name);
+            }
+            ClockOwner::MasterHw(d) => {
+                if self.clock_owner_warned.take().is_some() {
+                    let msg = format!("graph clock back on Master HW ({})", d.name);
+                    eprintln!("[buschain] {msg}");
+                    report.push(msg);
+                }
+            }
+            ClockOwner::Unknown => {}
         }
     }
 
@@ -150,6 +256,7 @@ impl Engine {
         }
         self.reconcile_master_and_default(&mut report)?;
         crate::clock::clear_clock_mutation();
+        self.sync_clock_master_policy(&mut report, false);
         if report.messages.is_empty() {
             report.push(format!("master hw → {hw}"));
         }
@@ -315,6 +422,12 @@ impl Engine {
         if !device.is_empty() {
             self.remember_master_hw(device);
         }
+        // A global force-rate lands on whichever node drives the graph. If that is
+        // not Master HW, say so before issuing it (a 48k-only codec forced to 96k
+        // resamples its own clock — the classic periodic click).
+        if !device.is_empty() {
+            self.check_graph_clock_owner(device, &mut report, true, Some(sample_rate));
+        }
         let force_q = if soft_quantum { 0 } else { quantum };
         match set_graph_force_clock(sample_rate, force_q) {
             Ok(()) => {
@@ -356,6 +469,7 @@ impl Engine {
         // Global force-rate moves mic/source domains — inbound bridges must rebuild.
         // Without invalidate, idle SyncCapture skip leaves every In silent.
         self.invalidate_capture_apply_state();
+        self.sync_clock_master_policy(&mut report, false);
         Ok(report)
     }
 
@@ -571,6 +685,9 @@ impl Engine {
                 self.applied_monitor_mute.clear();
                 self.desired.set_preferred_default(None);
                 self.desired.speakers_armed = false;
+                // The clock-master drop-in stays: it must be present when WirePlumber
+                // next creates the nodes, which is exactly when BusChain is not running.
+                self.clock_owner_warned = None;
                 report.push(format!("engine teardown ({destroyed} linger node(s))"));
             }
             Intent::Recover => {
@@ -715,6 +832,10 @@ impl Engine {
             self.prune_parallel_fx_routes(&mut report);
             self.heal_dry_egress(&mut report);
             self.reconcile_bus_inputs(&mut report, true);
+        }
+        if slow_sweep {
+            // Inputs adopted since the last sweep may have out-ranked Master HW.
+            self.sync_clock_master_policy(&mut report, false);
         }
         if self.idle_fx_ticks % 3 == 0 {
             self.reconcile_fx(&mut report);
@@ -2124,6 +2245,7 @@ impl Engine {
             Ok(_) => {}
             Err(e) => report.push(format!("playback reclaim: {e:#}")),
         }
+        self.sync_clock_master_policy(&mut report, false);
         report.push("speakers armed (adopted)");
         Ok(report)
     }
@@ -2318,6 +2440,7 @@ impl Engine {
             Ok(_) => {}
             Err(e) => report.push(format!("playback reclaim: {e:#}")),
         }
+        self.sync_clock_master_policy(&mut report, false);
         Ok(report)
     }
 
