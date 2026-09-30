@@ -174,7 +174,7 @@ impl Engine {
     }
 
     /// True when an unmuted hop is already missing — run topology now, not on the slow sweep.
-    fn topology_heal_needed(&self) -> bool {
+    fn topology_heal_needed(&mut self) -> bool {
         if self.desired.speakers_armed {
             if let Some(hw) = self
                 .desired
@@ -204,7 +204,54 @@ impl Engine {
                 return true;
             }
         }
-        false
+        self.capture_heal_needed()
+    }
+
+    /// Capture hops die outside Desired (WirePlumber restart recreates the source
+    /// node, USB re-enumeration, a stray `pw-link -d`). The verified fingerprint in
+    /// `last_applied_bus_inputs` still matches Desired, so the idle skip in
+    /// `reconcile_bus_inputs` never looked again and the In stayed silent until a
+    /// full SyncCapture. Re-verify every unmuted source whose node exists; drop dead
+    /// ones from the fingerprint so the next reconcile force re-ensures them.
+    fn capture_heal_needed(&mut self) -> bool {
+        let mut dead: Vec<(String, String)> = Vec::new();
+        for (bus, srcs) in &self.desired.bus_inputs {
+            if !bus.starts_with("buschain_track_") {
+                continue;
+            }
+            for src in srcs {
+                if src.is_empty() || src.starts_with("buschain_") {
+                    continue;
+                }
+                // Fingerprinted as verified-live at last apply…
+                let fingerprinted = self
+                    .last_applied_bus_inputs
+                    .get(bus)
+                    .is_some_and(|v| v.iter().any(|s| s == src));
+                if !fingerprinted {
+                    continue;
+                }
+                // …but no longer live, while the device is still (or again) present.
+                if capture_hop_verified(src, bus, &self.desired) {
+                    continue;
+                }
+                let node = src.strip_suffix(".monitor").unwrap_or(src);
+                if !sink_exists(node) {
+                    continue;
+                }
+                dead.push((src.clone(), bus.clone()));
+            }
+        }
+        if dead.is_empty() {
+            return false;
+        }
+        for (src, bus) in dead {
+            eprintln!("[buschain] idle heal: capture hop dead {src}→{bus} — re-arm");
+            if let Some(v) = self.last_applied_bus_inputs.get_mut(&bus) {
+                v.retain(|s| s != &src);
+            }
+        }
+        true
     }
 
     fn mixer_muted(&self, bus: &str) -> bool {
@@ -831,6 +878,10 @@ impl Engine {
             self.prune_orphan_track_buses(&mut report);
             self.prune_parallel_fx_routes(&mut report);
             self.heal_dry_egress(&mut report);
+            if slow_sweep {
+                // `||` above short-circuits on the sweep — re-verify capture here too.
+                let _ = self.capture_heal_needed();
+            }
             self.reconcile_bus_inputs(&mut report, true);
         }
         if slow_sweep {
@@ -1169,7 +1220,7 @@ impl Engine {
         for (src, sink) in stale {
             let _ = self.backend.unlink_raw(&src, &sink);
             self.desired.routes.remove(&(src.clone(), sink.clone()));
-            report.push(format!("input unlink {src}→{sink}"));
+            Self::idle_heal(report, format!("input unlink {src}→{sink}"));
         }
 
         for bus in &dirty {
@@ -1237,7 +1288,7 @@ impl Engine {
                 bus, &allow, &keep_rs,
             );
             if n > 0 {
-                report.push(format!("purged {n} orphan capture link(s) → {bus}"));
+                Self::idle_heal(report, format!("purged {n} orphan capture link(s) → {bus}"));
             }
             let mut verified: Vec<String> = Vec::new();
             for src in &allow {
@@ -1324,7 +1375,7 @@ impl Engine {
                 .collect();
             let n = crate::backend::unload_orphan_hw_to_rs_loopbacks(&global_allow);
             if n > 0 {
-                report.push(format!("unloaded {n} orphan HW→rs mic loopback(s)"));
+                Self::idle_heal(report, format!("unloaded {n} orphan HW→rs mic loopback(s)"));
             }
             if let Ok(names) = self.backend.list_sink_names() {
                 for name in names {
@@ -1336,7 +1387,7 @@ impl Engine {
                     }
                     crate::backend::unload_legacy_loopbacks_into_sink_except(&name, &[]);
                     if self.backend.destroy_node(&name).is_ok() {
-                        report.push(format!("destroyed orphan rate-bridge {name}"));
+                        Self::idle_heal(report, format!("destroyed orphan rate-bridge {name}"));
                     }
                 }
             }

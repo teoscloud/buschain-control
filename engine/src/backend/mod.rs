@@ -683,6 +683,26 @@ fn ensure_clocked_route_inner(
         && dst_rate != 0
         && src_rate != dst_rate;
 
+    // Rate probe miss (source idle/suspended, pactl lag under load) is not
+    // "rates match". If this pair already runs through a live Desired bridge,
+    // keep it — tearing it down here and going direct was killing live Ins.
+    if inbound_to_shadow && (src_rate == 0 || dst_rate == 0) && !force {
+        let live_bridge = desired
+            .bridges
+            .keys()
+            .find(|bridge| {
+                let mon = format!("{bridge}.monitor");
+                desired.routes.contains(&(source.to_string(), (*bridge).clone()))
+                    && desired.routes.contains(&(mon.clone(), sink.to_string()))
+                    && link_is_live(source, bridge)
+                    && link_is_live(&mon, sink)
+            })
+            .cloned();
+        if live_bridge.is_some() {
+            return Ok(());
+        }
+    }
+
     if !want_bridge {
         // Rates match (or unknown): drop leftover pair-specific rate-bridge hops.
         let stale: Vec<String> = desired

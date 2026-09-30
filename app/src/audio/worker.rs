@@ -1509,23 +1509,59 @@ fn process_command_batch(
                             "Master HW → desktop default ({hw})"
                         )));
                     }
-                    if let Ok(sinks) = graph::list_sinks() {
-                        let sources = graph::list_sources().unwrap_or_default();
-                        let sink_pairs: Vec<_> = sinks
-                            .iter()
-                            .map(|s| (s.name.clone(), s.description.clone()))
-                            .collect();
-                        let source_pairs: Vec<_> = sources
-                            .iter()
-                            .map(|s| (s.name.clone(), s.description.clone()))
-                            .collect();
-                        let report = crate::session::resolve_devices(
-                            &mut session,
-                            &sink_pairs,
-                            &source_pairs,
-                        );
-                        if !report.messages.is_empty() {
-                            let _ = tx.send(Event::Status(report.join()));
+                    // Track input sources (USB mics/codecs) enumerate after the Master
+                    // HW sink. Wait for them (bounded) so cold arm links every In now
+                    // instead of on the ~32s idle sweep. Never soft-bind against a
+                    // failed/partial source list — that used to drop inputs for good.
+                    let want_sources: Vec<String> = session
+                        .tracks
+                        .iter()
+                        .flat_map(|t| t.inputs.iter().map(|i| i.source.clone()))
+                        .filter(|s| !s.is_empty() && !s.starts_with("buschain_"))
+                        .collect();
+                    let mut sources: Option<Vec<graph::DeviceNode>> = None;
+                    {
+                        let deadline = Instant::now() + Duration::from_secs(8);
+                        let mut backoff = Duration::from_millis(100);
+                        loop {
+                            let listed = graph::list_sources().ok();
+                            let all_present = listed.as_ref().is_some_and(|l| {
+                                want_sources
+                                    .iter()
+                                    .all(|w| l.iter().any(|d| d.name == *w))
+                            });
+                            if all_present || Instant::now() >= deadline {
+                                sources = listed;
+                                break;
+                            }
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(Duration::from_millis(500));
+                        }
+                    }
+                    match (graph::list_sinks(), sources) {
+                        (Ok(sinks), Some(sources)) => {
+                            let sink_pairs: Vec<_> = sinks
+                                .iter()
+                                .map(|s| (s.name.clone(), s.description.clone()))
+                                .collect();
+                            let source_pairs: Vec<_> = sources
+                                .iter()
+                                .map(|s| (s.name.clone(), s.description.clone()))
+                                .collect();
+                            let report = crate::session::resolve_devices(
+                                &mut session,
+                                &sink_pairs,
+                                &source_pairs,
+                            );
+                            if !report.messages.is_empty() {
+                                eprintln!("[buschain] reconnect soft-bind: {}", report.join());
+                                let _ = tx.send(Event::Status(report.join()));
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "[buschain] reconnect: device list unavailable — keeping session devices sticky"
+                            );
                         }
                     }
                     match buschain_engine::backend::reconnect_plane() {

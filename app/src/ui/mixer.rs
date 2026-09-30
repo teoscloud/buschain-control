@@ -1370,17 +1370,29 @@ fn draw_inputs_rack(ui: &mut egui::Ui, state: &mut AppState, track_idx: usize, i
         } else {
             short_device_title(&src)
         };
+        // Sticky: a source that is unplugged / not yet enumerated keeps its row
+        // and the hop re-arms when it returns (store::resolve_devices never drops).
+        let offline = !state.snapshot.sources.is_empty()
+            && !state.snapshot.sources.iter().any(|s| s.name == src);
         mini_rack_row(ui, &theme, content_w, |ui| {
             ui.label(
                 RichText::new(&title)
                     .size(12.0)
                     .strong()
-                    .color(if muted {
+                    .color(if muted || offline {
                         theme.text_muted()
                     } else {
                         theme.text()
                     }),
             );
+            if offline {
+                ui.label(
+                    RichText::new("(offline)")
+                        .size(10.0)
+                        .color(theme.text_muted()),
+                )
+                .on_hover_text("Device not present — hop re-arms when it reappears");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if design::text_tool_button(ui, &theme, "×")
                     .on_hover_text("Remove input")

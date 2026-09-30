@@ -366,28 +366,33 @@ pub fn resolve_devices(
                 });
             }
         }
-        let mut kept = Vec::new();
-        for inp in t.inputs.drain(..) {
-            if source_names.iter().any(|(n, _)| n == &inp.source) {
-                kept.push(inp);
-                continue;
-            }
-            let desc = inp.source_desc.clone().unwrap_or_default();
-            if let Some((n, d)) = find_by_desc(source_names, &desc) {
-                report.push(format!("input rebound on {}: {} → {d}", t.name, inp.source));
-                kept.push(crate::session::TrackInput {
-                    source: n,
-                    source_desc: Some(d),
-                    mute: inp.mute,
-                });
-            } else {
-                report.push(format!(
-                    "input missing on {} ({}) — dropped",
-                    t.name, inp.source
-                ));
+        // Inputs are sticky like Master HW / output devices. An empty source list
+        // is a partial snapshot (pactl failure, mid-restart), not "no devices" —
+        // never judge the rack against it. A source that is briefly absent
+        // (WirePlumber restart, late USB enumeration) keeps its row; the engine
+        // re-arms the hop when it reappears. Dropping here used to silently
+        // remove inputs from the session ~1 min into a run.
+        if !source_names.is_empty() {
+            for inp in &mut t.inputs {
+                if let Some((_, d)) = source_names.iter().find(|(n, _)| n == &inp.source) {
+                    if !d.is_empty() {
+                        inp.source_desc = Some(d.clone());
+                    }
+                    continue;
+                }
+                let desc = inp.source_desc.clone().unwrap_or_default();
+                if let Some((n, d)) = find_by_desc(source_names, &desc) {
+                    report.push(format!("input rebound on {}: {} → {d}", t.name, inp.source));
+                    inp.source = n;
+                    inp.source_desc = Some(d);
+                } else {
+                    report.push(format!(
+                        "input on {} ({}) not live yet — keeping sticky",
+                        t.name, inp.source
+                    ));
+                }
             }
         }
-        t.inputs = kept;
         t.sync_legacy_input_fields();
 
         // Per-track output devices — sticky like Master HW. A monitor/card that

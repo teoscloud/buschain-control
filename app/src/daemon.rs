@@ -505,6 +505,16 @@ impl DaemonState {
     }
 
     fn soft_bind(&mut self) {
+        // Partial snapshot (pactl failed / mid-restart): sinks or sources came back
+        // empty with an error status. Soft-binding the rack against that used to
+        // strip inputs from this copy, which the next IPC save persisted.
+        let partial = self.snapshot.status.contains("sinks:")
+            || self.snapshot.status.contains("sources:")
+            || self.snapshot.sinks.is_empty()
+            || self.snapshot.sources.is_empty();
+        if partial {
+            return;
+        }
         let sinks: Vec<_> = self
             .snapshot
             .sinks
@@ -519,6 +529,7 @@ impl DaemonState {
             .collect();
         let report = session::resolve_devices(&mut self.session, &sinks, &sources);
         if !report.messages.is_empty() {
+            eprintln!("[buschain] soft-bind: {}", report.join());
             self.status_msg = report.join();
         }
     }
